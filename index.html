@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Running Tracker — Полумарафон 09.08.2026</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="header">
+    <div>
+      <h1>Полумарафон 09.08.2026</h1>
+      <p class="subtitle">Цель: 1:40 · план 13 недель · aabramov77</p>
+    </div>
+    <div class="countdown-block">
+      <div class="countdown-label">До старта</div>
+      <div class="countdown" id="countdown">—</div>
+    </div>
+  </header>
+
+  <div class="metrics">
+    <div class="metric">
+      <div class="metric-label">Пробежек</div>
+      <div class="metric-val" id="m-runs">0</div>
+      <div class="metric-sub">всего записей</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Км итого</div>
+      <div class="metric-val" id="m-km">0</div>
+      <div class="metric-sub">накоплено</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Лучший темп</div>
+      <div class="metric-val" id="m-pace">—</div>
+      <div class="metric-sub">мин/км</div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Прогресс</div>
+      <div class="metric-val" id="m-progress">0%</div>
+      <div class="metric-sub" id="m-week">неделя 1 из 13</div>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <button class="nav-btn active" onclick="showTab('plan',this)">План</button>
+    <button class="nav-btn" onclick="showTab('add',this)">+ Пробежка</button>
+    <button class="nav-btn" onclick="showTab('log',this)">Журнал</button>
+    <button class="nav-btn" onclick="showTab('stats',this)">Аналитика</button>
+    <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
+  </nav>
+
+  <!-- ПЛАН -->
+  <div id="tab-plan" class="tab active">
+    <div class="card">
+      <div class="card-title">Календарный план</div>
+      <div style="overflow-x:auto">
+        <table class="plan">
+          <thead><tr>
+            <th>Нед</th><th>Даты</th><th>Акцент</th>
+            <th>Вс</th><th>Пн</th><th>Ср</th><th>Пт</th><th>Сб</th>
+          </tr></thead>
+          <tbody id="plan-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ДОБАВИТЬ ПРОБЕЖКУ -->
+  <div id="tab-add" class="tab">
+    <div class="card">
+      <div class="card-title">Записать пробежку</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Дата</label>
+          <input type="date" id="f-date">
+        </div>
+        <div class="form-group">
+          <label>Тип тренировки</label>
+          <select id="f-type">
+            <option value="easy">Лёгкий бег</option>
+            <option value="interval">Интервалы</option>
+            <option value="tempo">Темповый</option>
+            <option value="long">Длительный</option>
+            <option value="race">Соревнование</option>
+            <option value="recovery">Восстановительный</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Дистанция (км)</label>
+          <input type="number" id="f-dist" step="0.1" min="0" placeholder="10.5">
+        </div>
+        <div class="form-group">
+          <label>Общее время (чч:мм:сс)</label>
+          <input type="text" id="f-time" placeholder="55:30">
+        </div>
+        <div class="form-group">
+          <label>Средний темп (мин/км)</label>
+          <input type="text" id="f-pace" placeholder="5:10">
+        </div>
+        <div class="form-group">
+          <label>Пульс средний (уд/мин)</label>
+          <input type="number" id="f-hr" placeholder="145">
+        </div>
+        <div class="form-group full">
+          <label>Самочувствие</label>
+          <select id="f-feel">
+            <option value="great">Отлично — легко, мог бы больше</option>
+            <option value="good">Хорошо — по плану</option>
+            <option value="ok">Нормально — немного тяжело</option>
+            <option value="hard">Тяжело — не вписался в план</option>
+            <option value="bad">Плохо — усталость/боль</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>Заметки</label>
+          <textarea id="f-notes" placeholder="Например: 3×7 мин по 4:38, пауза 3:00. Последний повтор дался тяжело..."></textarea>
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+        <button class="btn-primary" onclick="saveRun()">Сохранить пробежку</button>
+        <span id="save-msg" class="save-msg">✓ Сохранено!</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ЖУРНАЛ -->
+  <div id="tab-log" class="tab">
+    <div class="card">
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Журнал пробежек</div>
+        <button class="btn-sm" onclick="clearLog()">Очистить всё</button>
+      </div>
+      <div id="run-log"><div class="empty">Пробежек пока нет. Добавьте первую!</div></div>
+    </div>
+  </div>
+
+  <!-- АНАЛИТИКА -->
+  <div id="tab-stats" class="tab">
+    <div class="card">
+      <div class="card-title">Недельный объём (км)</div>
+      <div class="chart-wrap"><canvas id="weekChart"></canvas></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="card-title">Динамика темпа (мин/км)</div>
+      <div class="chart-wrap"><canvas id="paceChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- КОРРЕКТИРОВКА -->
+  <div id="tab-adjust" class="tab">
+    <div class="card">
+      <div class="card-title">Корректировка плана</div>
+      <p class="hint">На основе ваших результатов — рекомендации по адаптации тренировок</p>
+      <div id="adjust-content"><div class="empty">Добавьте несколько пробежек для получения рекомендаций</div></div>
+    </div>
+  </div>
+
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
