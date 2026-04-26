@@ -1,7 +1,7 @@
 // ====================================================
 // НАСТРОЙКА: вставьте URL вашей Cloud Run Function
 // ====================================================
-const API_URL = 'https://REGION-PROJECT_ID.cloudfunctions.net/runs-api';
+const API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
 // Пример: 'https://europe-west1-my-project-123.cloudfunctions.net/runs-api'
 // ====================================================
 
