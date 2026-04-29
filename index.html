@@ -12,6 +12,7 @@
   <header class="header">
     <div>
       <h1>Полумарафон 09.08.2026</h1>
+      <p id="api-status" class="subtitle">Подключение к GCS…</p>
       <p class="subtitle">Цель: 1:40 · план 13 недель · aabramov77</p>
     </div>
     <div class="countdown-block">
@@ -21,26 +22,10 @@
   </header>
 
   <div class="metrics">
-    <div class="metric">
-      <div class="metric-label">Пробежек</div>
-      <div class="metric-val" id="m-runs">0</div>
-      <div class="metric-sub">всего записей</div>
-    </div>
-    <div class="metric">
-      <div class="metric-label">Км итого</div>
-      <div class="metric-val" id="m-km">0</div>
-      <div class="metric-sub">накоплено</div>
-    </div>
-    <div class="metric">
-      <div class="metric-label">Лучший темп</div>
-      <div class="metric-val" id="m-pace">—</div>
-      <div class="metric-sub">мин/км</div>
-    </div>
-    <div class="metric">
-      <div class="metric-label">Прогресс</div>
-      <div class="metric-val" id="m-progress">0%</div>
-      <div class="metric-sub" id="m-week">неделя 1 из 13</div>
-    </div>
+    <div class="metric"><div class="metric-label">Пробежек</div><div class="metric-val" id="m-runs">0</div><div class="metric-sub">всего записей</div></div>
+    <div class="metric"><div class="metric-label">Км итого</div><div class="metric-val" id="m-km">0</div><div class="metric-sub">накоплено</div></div>
+    <div class="metric"><div class="metric-label">Лучший темп</div><div class="metric-val" id="m-pace">—</div><div class="metric-sub">мин/км</div></div>
+    <div class="metric"><div class="metric-label">Прогресс</div><div class="metric-val" id="m-progress">0%</div><div class="metric-sub" id="m-week">неделя 1 из 13</div></div>
   </div>
 
   <nav class="nav">
@@ -57,10 +42,7 @@
       <div class="card-title">Календарный план</div>
       <div style="overflow-x:auto">
         <table class="plan">
-          <thead><tr>
-            <th>Нед</th><th>Даты</th><th>Акцент</th>
-            <th>Вс</th><th>Пн</th><th>Ср</th><th>Пт</th><th>Сб</th>
-          </tr></thead>
+          <thead><tr><th>Нед</th><th>Даты</th><th>Акцент</th><th>Вс</th><th>Пн</th><th>Ср</th><th>Пт</th><th>Сб</th></tr></thead>
           <tbody id="plan-body"></tbody>
         </table>
       </div>
@@ -69,6 +51,49 @@
 
   <!-- ДОБАВИТЬ ПРОБЕЖКУ -->
   <div id="tab-add" class="tab">
+
+    <!-- КАЛЬКУЛЯТОР -->
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-title">Калькулятор</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+        <button class="calc-tab-btn active" onclick="switchCalc('pace',this)">⚡ Темп → по дист. + времени</button>
+        <button class="calc-tab-btn" onclick="switchCalc('time',this)">⏱ Время → по дист. + темпу</button>
+      </div>
+
+      <!-- Режим 1: расчёт темпа -->
+      <div id="calc-pace" class="calc-mode">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Дистанция (км)</label>
+            <input type="number" id="c-dist-for-pace" step="0.1" min="0" placeholder="10.5" oninput="calcPace()">
+          </div>
+          <div class="form-group">
+            <label>Общее время (мм:сс или чч:мм:сс)</label>
+            <input type="text" id="c-time-for-pace" placeholder="54:30" oninput="calcPace()">
+          </div>
+        </div>
+        <div class="calc-result" id="calc-pace-result">— введите дистанцию и время</div>
+        <button class="btn-sm" style="margin-top:8px" onclick="applyPaceCalc()">↓ Применить к форме</button>
+      </div>
+
+      <!-- Режим 2: расчёт времени -->
+      <div id="calc-time" class="calc-mode" style="display:none">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Дистанция (км)</label>
+            <input type="number" id="c-dist-for-time" step="0.1" min="0" placeholder="10.5" oninput="calcTime()">
+          </div>
+          <div class="form-group">
+            <label>Темп (мин:сс на км)</label>
+            <input type="text" id="c-pace-for-time" placeholder="5:10" oninput="calcTime()">
+          </div>
+        </div>
+        <div class="calc-result" id="calc-time-result">— введите дистанцию и темп</div>
+        <button class="btn-sm" style="margin-top:8px" onclick="applyTimeCalc()">↓ Применить к форме</button>
+      </div>
+    </div>
+
+    <!-- ФОРМА ЗАПИСИ -->
     <div class="card">
       <div class="card-title">Записать пробежку</div>
       <div class="form-grid">
@@ -92,7 +117,7 @@
           <input type="number" id="f-dist" step="0.1" min="0" placeholder="10.5">
         </div>
         <div class="form-group">
-          <label>Общее время (чч:мм:сс)</label>
+          <label>Общее время (мм:сс или чч:мм:сс)</label>
           <input type="text" id="f-time" placeholder="55:30">
         </div>
         <div class="form-group">
@@ -115,7 +140,7 @@
         </div>
         <div class="form-group full">
           <label>Заметки</label>
-          <textarea id="f-notes" placeholder="Например: 3×7 мин по 4:38, пауза 3:00. Последний повтор дался тяжело..."></textarea>
+          <textarea id="f-notes" placeholder="Например: 3×7 мин по 4:38, пауза 3:00..."></textarea>
         </div>
       </div>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
@@ -138,14 +163,8 @@
 
   <!-- АНАЛИТИКА -->
   <div id="tab-stats" class="tab">
-    <div class="card">
-      <div class="card-title">Недельный объём (км)</div>
-      <div class="chart-wrap"><canvas id="weekChart"></canvas></div>
-    </div>
-    <div class="card" style="margin-top:12px">
-      <div class="card-title">Динамика темпа (мин/км)</div>
-      <div class="chart-wrap"><canvas id="paceChart"></canvas></div>
-    </div>
+    <div class="card"><div class="card-title">Недельный объём (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
+    <div class="card" style="margin-top:12px"><div class="card-title">Динамика темпа (мин/км)</div><div class="chart-wrap"><canvas id="paceChart"></canvas></div></div>
   </div>
 
   <!-- КОРРЕКТИРОВКА -->

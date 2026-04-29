@@ -223,3 +223,27 @@ table.plan tr:hover td { background: var(--bg-metric); }
   .header { flex-direction: column; gap: 8px; }
   .nav-btn { padding: 8px 10px; font-size: 12px; }
 }
+
+/* ── Калькулятор ── */
+.calc-tab-btn {
+  padding: 7px 14px; font-size: 12px; font-weight: 500;
+  border: 0.5px solid var(--border); border-radius: 20px;
+  background: none; color: var(--text-muted); cursor: pointer;
+  font-family: inherit; transition: all .15s;
+}
+.calc-tab-btn.active {
+  background: var(--c-accent); color: white; border-color: var(--c-accent);
+}
+.calc-tab-btn:hover:not(.active) { background: var(--bg-metric); }
+
+.calc-result {
+  margin-top: 10px; padding: 10px 14px;
+  background: var(--bg-metric); border-radius: 8px;
+  font-family: 'DM Mono', monospace; font-size: 14px;
+  color: var(--c-accent); font-weight: 500; min-height: 40px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.calc-result.empty { color: var(--text-muted); font-weight: 400; }
+.calc-result .calc-item { display: flex; flex-direction: column; gap: 1px; }
+.calc-result .calc-label { font-size: 10px; color: var(--text-muted); font-weight: 400; text-transform: uppercase; letter-spacing: .4px; }
+.calc-result .calc-val { font-size: 16px; }

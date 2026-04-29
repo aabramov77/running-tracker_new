@@ -219,3 +219,132 @@ function renderAll(){renderMetrics();renderLog();renderPlan();}
 document.getElementById('f-date').value=new Date().toISOString().slice(0,10);
 renderAll();
 loadRunsFromCloud();
+
+// ====================================================
+// КАЛЬКУЛЯТОР
+// ====================================================
+
+// Переключение режима калькулятора
+function switchCalc(mode, btn) {
+  document.querySelectorAll('.calc-mode').forEach(el => el.style.display = 'none');
+  document.querySelectorAll('.calc-tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('calc-' + mode).style.display = 'block';
+  btn.classList.add('active');
+}
+
+// Парсинг времени в секунды: "54:30" → 3270, "1:04:30" → 3870
+function parseTimeToSeconds(s) {
+  if (!s) return null;
+  const parts = s.trim().split(':').map(Number);
+  if (parts.some(isNaN)) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];       // мм:сс
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]; // чч:мм:сс
+  return null;
+}
+
+// Форматирование секунд в строку времени
+function secondsToTime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.round(sec % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
+// Режим 1: рассчитать ТЕМП по дистанции и времени
+let _calcPaceResult = null;
+function calcPace() {
+  const dist = parseFloat(document.getElementById('c-dist-for-pace').value);
+  const timeSec = parseTimeToSeconds(document.getElementById('c-time-for-pace').value);
+  const el = document.getElementById('calc-pace-result');
+  _calcPaceResult = null;
+
+  if (!dist || dist <= 0 || !timeSec || timeSec <= 0) {
+    el.className = 'calc-result empty';
+    el.innerHTML = '— введите дистанцию и время';
+    return;
+  }
+
+  const paceSec = timeSec / dist;          // секунд на км
+  const paceStr = secondsToTime(paceSec);  // мм:сс
+  const speedKmh = (dist / (timeSec / 3600)).toFixed(1); // км/ч
+
+  _calcPaceResult = { pace: paceStr, time: secondsToTime(timeSec), dist };
+
+  el.className = 'calc-result';
+  el.innerHTML = `
+    <div class="calc-item"><span class="calc-label">Темп</span><span class="calc-val">${paceStr} /км</span></div>
+    <div style="color:var(--border)">│</div>
+    <div class="calc-item"><span class="calc-label">Скорость</span><span class="calc-val">${speedKmh} км/ч</span></div>
+    <div style="color:var(--border)">│</div>
+    <div class="calc-item"><span class="calc-label">Время</span><span class="calc-val">${secondsToTime(timeSec)}</span></div>
+    <div style="color:var(--border)">│</div>
+    <div class="calc-item"><span class="calc-label">Дист.</span><span class="calc-val">${dist} км</span></div>
+  `;
+}
+
+// Применить результат расчёта темпа к форме
+function applyPaceCalc() {
+  if (!_calcPaceResult) { alert('Сначала введите данные в калькулятор'); return; }
+  const { pace, time, dist } = _calcPaceResult;
+  document.getElementById('f-pace').value = pace;
+  document.getElementById('f-time').value = time;
+  if (!document.getElementById('f-dist').value) {
+    document.getElementById('f-dist').value = dist;
+  }
+  // Подсветить поля
+  ['f-pace','f-time'].forEach(id => {
+    const el = document.getElementById(id);
+    el.style.background = 'var(--c-accent-light)';
+    setTimeout(() => el.style.background = '', 1500);
+  });
+}
+
+// Режим 2: рассчитать ВРЕМЯ по дистанции и темпу
+let _calcTimeResult = null;
+function calcTime() {
+  const dist = parseFloat(document.getElementById('c-dist-for-time').value);
+  const paceSec = parseTimeToSeconds(document.getElementById('c-pace-for-time').value);
+  const el = document.getElementById('calc-time-result');
+  _calcTimeResult = null;
+
+  if (!dist || dist <= 0 || !paceSec || paceSec <= 0) {
+    el.className = 'calc-result empty';
+    el.innerHTML = '— введите дистанцию и темп';
+    return;
+  }
+
+  const totalSec = paceSec * dist;
+  const timeStr = secondsToTime(totalSec);
+  const paceStr = secondsToTime(paceSec);
+  const speedKmh = (3600 / paceSec).toFixed(1);
+
+  _calcTimeResult = { time: timeStr, pace: paceStr, dist };
+
+  el.className = 'calc-result';
+  el.innerHTML = `
+    <div class="calc-item"><span class="calc-label">Время</span><span class="calc-val">${timeStr}</span></div>
+    <div style="color:var(--border)">│</div>
+    <div class="calc-item"><span class="calc-label">Скорость</span><span class="calc-val">${speedKmh} км/ч</span></div>
+    <div style="color:var(--border)">│</div>
+    <div class="calc-item"><span class="calc-label">Темп</span><span class="calc-val">${paceStr} /км</span></div>
+    <div style="color:var(--border)">│</div>
+    <div class="calc-item"><span class="calc-label">Дист.</span><span class="calc-val">${dist} км</span></div>
+  `;
+}
+
+// Применить результат расчёта времени к форме
+function applyTimeCalc() {
+  if (!_calcTimeResult) { alert('Сначала введите данные в калькулятор'); return; }
+  const { time, pace, dist } = _calcTimeResult;
+  document.getElementById('f-time').value = time;
+  document.getElementById('f-pace').value = pace;
+  if (!document.getElementById('f-dist').value) {
+    document.getElementById('f-dist').value = dist;
+  }
+  ['f-time','f-pace'].forEach(id => {
+    const el = document.getElementById(id);
+    el.style.background = 'var(--c-accent-light)';
+    setTimeout(() => el.style.background = '', 1500);
+  });
+}
