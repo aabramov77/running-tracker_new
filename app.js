@@ -173,10 +173,11 @@ function renderMetrics() {
 
 function renderLog() {
   const el = document.getElementById('run-log');
-  if (!runs.length) { el.innerHTML='<div class="empty">Пробежек пока нет. Добавьте первую!</div>'; return; }
+  const activeRuns = runs.filter(r => !r.deleted);
+  if (!activeRuns.length) { el.innerHTML='<div class="empty">Пробежек пока нет. Добавьте первую!</div>'; return; }
   const typeLabels = {easy:'Лёгкий',interval:'Интервалы',tempo:'Темповый',long:'Длительный',race:'Соревнование',recovery:'Восстановление'};
   const feelEmoji = {great:'😊',good:'🙂',ok:'😐',hard:'😓',bad:'😔'};
-  el.innerHTML = runs.map(r => {
+  el.innerHTML = activeRuns.map(r => {
     const pace = parsePace(r.pace);
     const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
     return `<div class="run-item">
@@ -193,9 +194,10 @@ function renderLog() {
 
 let wChart=null,pChart=null;
 function renderCharts() {
+  const activeRuns = runs.filter(r => !r.deleted);
   const weekKm={};
-  runs.forEach(r=>{const w=Math.floor((new Date(r.date)-new Date('2026-05-10'))/(7*24*3600*1000))+1;if(w>=1&&w<=13)weekKm[w]=(weekKm[w]||0)+r.dist;});
-  const sortedRuns=[...runs].sort((a,b)=>a.date.localeCompare(b.date));
+  activeRuns.forEach(r=>{const w=Math.floor((new Date(r.date)-new Date('2026-05-10'))/(7*24*3600*1000))+1;if(w>=1&&w<=13)weekKm[w]=(weekKm[w]||0)+r.dist;});
+  const sortedRuns=[...activeRuns].sort((a,b)=>a.date.localeCompare(b.date));
   if(wChart)wChart.destroy();
   wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{type:'bar',data:{labels:Array.from({length:13},(_,i)=>`Нед ${i+1}`),datasets:[{label:'км',data:Array.from({length:13},(_,i)=>+((weekKm[i+1]||0).toFixed(1))),backgroundColor:'#1D9E75',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
   if(pChart)pChart.destroy();
@@ -204,11 +206,12 @@ function renderCharts() {
 
 function renderAdjust() {
   const el=document.getElementById('adjust-content');
-  if(runs.length<2){el.innerHTML='<div class="empty">Добавьте несколько пробежек для рекомендаций</div>';return;}
-  const paces=runs.map(r=>parsePace(r.pace)).filter(Boolean);
+  const activeRuns = runs.filter(r => !r.deleted);
+  if(activeRuns.length<2){el.innerHTML='<div class="empty">Добавьте несколько пробежек для рекомендаций</div>';return;}
+  const paces=activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const avgPace=paces.length?paces.reduce((a,b)=>a+b,0)/paces.length:null;
-  const hardRuns=runs.filter(r=>r.feel==='hard'||r.feel==='bad');
-  const totalKm=runs.reduce((s,r)=>s+r.dist,0);
+  const hardRuns=activeRuns.filter(r=>r.feel==='hard'||r.feel==='bad');
+  const totalKm=activeRuns.reduce((s,r)=>s+r.dist,0);
   const target=4.74;
   let html='';
   if(avgPace&&avgPace<target-0.2)html+=`<div class="suggestion good">Ваш средний темп (${formatPace(avgPace)}/км) лучше целевого. Можно увеличить объём интервалов.</div>`;
