@@ -51,6 +51,7 @@ async function loadRunsFromCloud() {
   try {
     setStatus('Загрузка из облака…', 'warn');
     const cloudRuns = await apiGet();
+    // API уже возвращает только активные записи (бэкенд фильтрует deleted)
     runs = cloudRuns;
     localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
     isOnline = true;
@@ -58,6 +59,8 @@ async function loadRunsFromCloud() {
     renderAll();
   } catch (e) {
     isOnline = false;
+    // Из кэша тоже фильтруем — на случай если кэш старый (до soft delete)
+    runs = runs.filter(r => !r.deleted);
     setStatus('⚠ Нет связи — данные из кэша', 'warn');
   }
 }
@@ -117,11 +120,21 @@ async function saveRun() {
 }
 
 async function deleteRun(id) {
-  if (!confirm('Удалить эту пробежку?')) return;
+  if (!confirm('Скрыть эту пробежку? Данные останутся в хранилище.')) return;
   try {
-    if (isOnline) { await apiDelete(id); await loadRunsFromCloud(); }
-    else { runs = runs.filter(r => r.id !== id); localStorage.setItem('running_tracker_runs', JSON.stringify(runs)); renderAll(); }
-  } catch (e) { alert('Ошибка удаления: ' + e.message); }
+    if (isOnline) {
+      await apiDelete(id); // бэкенд ставит deleted=true, не удаляет физически
+      await loadRunsFromCloud();
+    } else {
+      // Оффлайн: помечаем локально, синхронизируется при следующем подключении
+      runs = runs.map(r => r.id === id ? {...r, deleted: true} : r);
+      const activeRuns = runs.filter(r => !r.deleted);
+      localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+      runs = activeRuns;
+      renderAll();
+      setStatus('⚠ Скрыто локально — синхронизируется при подключении', 'warn');
+    }
+  } catch (e) { alert('Ошибка: ' + e.message); }
 }
 
 function clearLog() {
@@ -144,8 +157,9 @@ function renderPlan() {
 }
 
 function renderMetrics() {
-  const totalKm = runs.reduce((s,r)=>s+r.dist,0);
-  const paces = runs.map(r=>parsePace(r.pace)).filter(Boolean);
+  const activeRuns = runs.filter(r => !r.deleted);
+  const totalKm = activeRuns.reduce((s,r)=>s+r.dist,0);
+  const paces = activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const bestPace = paces.length ? Math.min(...paces) : null;
   const cw = getCurrentWeek();
   document.getElementById('m-runs').textContent = runs.length;
