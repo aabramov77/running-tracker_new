@@ -162,7 +162,7 @@ function renderMetrics() {
   const paces = activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const bestPace = paces.length ? Math.min(...paces) : null;
   const cw = getCurrentWeek();
-  document.getElementById('m-runs').textContent = runs.length;
+  document.getElementById('m-runs').textContent = activeRuns.length;
   document.getElementById('m-km').textContent = totalKm.toFixed(1);
   document.getElementById('m-pace').textContent = bestPace ? formatPace(bestPace) : '—';
   document.getElementById('m-progress').textContent = Math.round((cw/13)*100)+'%';
