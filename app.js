@@ -1,20 +1,6 @@
 const API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
 
-const PLAN = [
-  {w:1,start:'10.05',end:'16.05',accent:'Развитие',sun:'12 км легко',mon:'6–8 км легко, пульс 130–140',wed:'3×7 мин по 4:35–4:40',fri:'8–10 км средний 5:30–5:40',sat:'8 км по 5:05–5:15',type:'dev'},
-  {w:2,start:'17.05',end:'23.05',accent:'Развитие',sun:'14–16 км легко',mon:'7–8 км легко',wed:'6×1 км по 4:30–4:35',fri:'10 км средний',sat:'4×2 км по 4:48–4:50',type:'dev'},
-  {w:3,start:'24.05',end:'30.05',accent:'Подводка + 10 км',sun:'10–12 км очень легко',mon:'8 км легко',wed:'4×1 км по 4:30–4:35',fri:'6–8 км очень легко',sat:'СТАРТ 10 км',type:'race'},
-  {w:4,start:'31.05',end:'06.06',accent:'Разгрузка',sun:'18 км легко, пульс 140–150',mon:'6 км очень легко',wed:'4×1 км по 4:35–4:40',fri:'8–10 км легко',sat:'6–8 км по 4:55–5:00',type:'load'},
-  {w:5,start:'07.06',end:'13.06',accent:'Развитие',sun:'14–16 км легко',mon:'8 км легко',wed:'4×2 км по 4:32–4:38',fri:'10–11 км средний',sat:'2×4 км по 4:48–4:50',type:'dev'},
-  {w:6,start:'14.06',end:'20.06',accent:'Развитие',sun:'18–20 км легко',mon:'8–9 км легко',wed:'3×3 км по 4:35–4:40',fri:'11–12 км средний',sat:'10 км по 4:50',type:'dev'},
-  {w:7,start:'21.06',end:'27.06',accent:'Развитие',sun:'20 км, прогрессия к 5:10',mon:'8–9 км легко',wed:'Пирамида 1+2+3+2+1 км',fri:'10–11 км средний',sat:'2×5 км по 4:48–4:50',type:'dev'},
-  {w:8,start:'28.06',end:'04.07',accent:'Подводка + 10 км',sun:'12–14 км очень легко',mon:'6–7 км легко',wed:'4×1 км по 4:30–4:35',fri:'6–8 км очень легко',sat:'СТАРТ 10 км',type:'race'},
-  {w:9,start:'05.07',end:'11.07',accent:'Пик формы',sun:'16 км легко',mon:'8 км легко',wed:'5×1 км по 4:25–4:30',fri:'11 км средний',sat:'12 км по 4:48–4:50',type:'peak'},
-  {w:10,start:'12.07',end:'18.07',accent:'Пик формы',sun:'20 км с прогрессией',mon:'8–9 км легко',wed:'3×3 км по 4:32–4:38',fri:'10–11 км средний',sat:'3×3 км по 4:44–4:48',type:'peak'},
-  {w:11,start:'19.07',end:'25.07',accent:'Пик формы',sun:'18 км легко',mon:'8 км легко',wed:'5×1 км по 4:25–4:30',fri:'10 км средний',sat:'10–12 км по 4:48–4:50',type:'peak'},
-  {w:12,start:'26.07',end:'01.08',accent:'Тейпер',sun:'14–16 км легко',mon:'6–7 км легко',wed:'6×400 м по 4:00–4:10',fri:'6–8 км легко',sat:'4–6 км по 4:44–4:48',type:'taper'},
-  {w:13,start:'02.08',end:'08.08',accent:'Тейпер + ПМ',sun:'СТАРТ 21,1 км',mon:'5–6 км легко',wed:'4×400 м бодро',fri:'4–5 км очень легко',sat:'20–25 мин + ускорения',type:'taper'},
-];
+let PLAN = null;
 
 let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
 let isOnline = false;
@@ -50,6 +36,26 @@ function setStatus(msg, type = 'ok') {
   if (!el) return;
   el.textContent = msg;
   el.style.color = type === 'ok' ? 'var(--c-accent)' : type === 'warn' ? 'var(--c-warn)' : 'var(--c-danger)';
+}
+
+async function loadPlan() {
+  const cached = localStorage.getItem('running_tracker_plan');
+  if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
+  try {
+    const res = await fetch(API_URL + 'plan');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const weeks = await res.json();
+    if (weeks?.length) {
+      PLAN = weeks;
+      localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
+      renderPlan();
+    }
+  } catch (e) {
+    if (!PLAN) {
+      document.getElementById('plan-body').innerHTML =
+        '<tr><td colspan="8" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>';
+    }
+  }
 }
 
 async function loadRunsFromCloud() {
@@ -147,6 +153,7 @@ function clearLog() {
 }
 
 function renderPlan() {
+  if (!PLAN?.length) return;
   const cw = getCurrentWeek();
   const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
   const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
@@ -239,7 +246,9 @@ function showTab(name,btn){
 
 function renderAll(){renderMetrics();renderLog();renderPlan();}
 document.getElementById('f-date').value=new Date().toISOString().slice(0,10);
-renderAll();
+renderMetrics();
+renderLog();
+loadPlan();
 loadRunsFromCloud();
 
 // ====================================================
