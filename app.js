@@ -1,9 +1,4 @@
-// ====================================================
-// НАСТРОЙКА: вставьте URL вашей Cloud Run Function
-// ====================================================
 const API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
-// Пример: 'https://europe-west1-my-project-123.cloudfunctions.net/runs-api'
-// ====================================================
 
 const PLAN = [
   {w:1,start:'10.05',end:'16.05',accent:'Развитие',sun:'12 км легко',mon:'6–8 км легко, пульс 130–140',wed:'3×7 мин по 4:35–4:40',fri:'8–10 км средний 5:30–5:40',sat:'8 км по 5:05–5:15',type:'dev'},
@@ -23,6 +18,16 @@ const PLAN = [
 
 let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
 let isOnline = false;
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 async function apiGet() {
   const res = await fetch(API_URL);
@@ -181,11 +186,11 @@ function renderLog() {
     const pace = parsePace(r.pace);
     const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
     return `<div class="run-item">
-      <div class="run-date">${r.date.slice(5)}<br><span style="opacity:.6">${getWeekLabel(r.date)}</span></div>
+      <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${getWeekLabel(r.date)}</span></div>
       <div class="run-info">
-        <div class="run-title">${typeLabels[r.type]||r.type} — ${r.dist} км ${feelEmoji[r.feel]||''}</div>
-        <div class="run-meta">${r.pace?`<span class="${pc}">${r.pace}/км</span> · `:''}${r.time?r.time+' · ':''}${r.hr?r.hr+' уд/мин':''}</div>
-        ${r.notes?`<div class="run-note">${r.notes}</div>`:''}
+        <div class="run-title">${typeLabels[r.type] || escapeHtml(r.type)} — ${escapeHtml(String(r.dist))} км ${feelEmoji[r.feel]||''}</div>
+        <div class="run-meta">${r.pace?`<span class="${pc}">${escapeHtml(r.pace)}/км</span> · `:''}${r.time?escapeHtml(r.time)+' · ':''}${r.hr?r.hr+' уд/мин':''}</div>
+        ${r.notes?`<div class="run-note">${escapeHtml(r.notes)}</div>`:''}
       </div>
       <button class="btn-sm" onclick="deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
     </div>`;
