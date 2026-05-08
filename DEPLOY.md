@@ -1,15 +1,15 @@
-# Инструкция по деплою: GCS + Cloud Run Functions
+# Инструкция по деплою: GCS + Cloud Run
 
 ## Шаг 1 — Создать GCS Bucket
 
 1. Зайдите в [Google Cloud Console](https://console.cloud.google.com)
 2. Перейдите в **Cloud Storage → Buckets → Create**
 3. Имя bucket: `running-tracker-aabramov77` (или любое уникальное)
-4. Region: `europe-central2` (Варшава) или ближайший к вам
+4. Region: `europe-west1` (Бельгия) или ближайший к вам
 5. Access control: **Uniform**
 6. Нажмите **Create**
 
-> Если хотите другое имя bucket — обновите `BUCKET_NAME` в `backend/main.py`
+> Если хотите другое имя bucket — обновите `BUCKET_NAME` в `main.py`
 
 ---
 
@@ -20,7 +20,7 @@
 3. Роль: **Storage Object Admin** (для чтения и записи объектов в bucket)
 4. Нажмите **Done**
 
-> Cloud Run Functions автоматически используют сервисный аккаунт проекта — отдельный ключ не нужен, если деплоите через Cloud Console.
+> Cloud Run автоматически использует сервисный аккаунт проекта — отдельный ключ не нужен при деплое через Cloud Console.
 
 ---
 
@@ -29,19 +29,19 @@
 1. Перейдите в **Cloud Run → Functions → Write a function**
 2. Настройки:
    - **Function name:** `runs-api`
-   - **Region:** тот же, что и bucket
+   - **Region:** тот же, что и bucket (`europe-west1`)
    - **Trigger:** HTTP
    - **Authentication:** Allow unauthenticated invocations ✓
 3. Вставьте код:
-   - В файл `main.py` — содержимое из `backend/main.py`
-   - В файл `requirements.txt` — содержимое из `backend/requirements.txt`
+   - В файл `main.py` — содержимое из `main.py`
+   - В файл `requirements.txt` — содержимое из `requirements.txt`
 4. **Entry point:** `runs_api`
 5. **Runtime:** Python 3.11
 6. Нажмите **Deploy**
 
-После деплоя скопируйте **URL функции** — он выглядит так:
+После деплоя скопируйте **URL сервиса** — он выглядит так:
 ```
-https://europe-central2-YOUR_PROJECT.cloudfunctions.net/runs-api
+https://runs-api-XXXXXXXXXX-REGION.run.app/
 ```
 
 ---
@@ -51,30 +51,27 @@ https://europe-central2-YOUR_PROJECT.cloudfunctions.net/runs-api
 Если функция выдаёт ошибку 403 при обращении к GCS:
 
 1. **IAM & Admin → IAM**
-2. Найдите сервисный аккаунт функции (обычно `PROJECT_ID@appspot.gserviceaccount.com`)
+2. Найдите сервисный аккаунт функции (вида `PROJECT_NUMBER-compute@developer.gserviceaccount.com`)
 3. Добавьте роль **Storage Object Admin**
 
 ---
 
-## Шаг 5 — Обновить app.js
+## Шаг 5 — Прописать URL в app.js
 
-Откройте `app.js` и замените в первой строке:
+Откройте `app.js` и замените первую строку на реальный URL из шага 3:
 ```js
-const API_URL = 'https://REGION-PROJECT_ID.cloudfunctions.net/runs-api';
-```
-на реальный URL из шага 3, например:
-```js
-const API_URL = 'https://europe-central2-my-project-123.cloudfunctions.net/runs-api';
+const API_URL = 'https://runs-api-XXXXXXXXXX-ew.a.run.app/';
 ```
 
 ---
 
-## Шаг 6 — Загрузить обновлённый app.js в GitHub
+## Шаг 6 — Запушить изменения на GitHub
 
-1. Зайдите в репозиторий `running-tracker_new`
-2. Откройте файл `app.js` → нажмите карандаш (Edit)
-3. Вставьте содержимое обновлённого `app.js`
-4. Commit changes
+```bash
+git add app.js
+git commit -m "Update API_URL"
+git push
+```
 
 GitHub Pages автоматически обновит сайт через ~1 минуту.
 
@@ -82,24 +79,21 @@ GitHub Pages автоматически обновит сайт через ~1 м
 
 ## Проверка
 
-Откройте в браузере URL функции напрямую:
+Откройте URL функции напрямую в браузере:
 ```
 https://YOUR_FUNCTION_URL
 ```
-Должен вернуться пустой массив `[]` — bucket пустой.
+Должен вернуться пустой массив `[]`.
 
 Добавьте пробежку в приложении — в строке статуса появится:
 ```
 ✓ Синхронизировано с GCS
 ```
 
-В GCS bucket появится файл `runs.json` с вашими данными.
-
 ---
 
 ## Структура данных в GCS
 
-Все пробежки хранятся в одном файле:
 ```
 bucket: running-tracker-aabramov77
 └── runs.json
@@ -117,7 +111,10 @@ bucket: running-tracker-aabramov77
     "pace": "5:27",
     "hr": 138,
     "feel": "good",
-    "notes": "Легко, первая неделя плана"
+    "notes": "Легко, первая неделя плана",
+    "deleted": false
   }
 ]
 ```
+
+Поле `deleted: true` означает мягкое удаление — запись остаётся в файле, но API не возвращает её в GET.

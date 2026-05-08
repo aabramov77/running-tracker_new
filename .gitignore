@@ -1,0 +1,18 @@
+# Android — отдельный репозиторий
+running-tracker-android/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
