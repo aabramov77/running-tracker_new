@@ -45,10 +45,13 @@ async function loadPlan() {
     const res = await fetch(API_URL + 'plan');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const weeks = await res.json();
-    if (weeks?.length) {
+    if (weeks?.length && weeks[0]?.w !== undefined) {
       PLAN = weeks;
       localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
       renderPlan();
+    } else if (!PLAN) {
+      document.getElementById('plan-body').innerHTML =
+        '<tr><td colspan="8" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>';
     }
   } catch (e) {
     if (!PLAN) {
