@@ -370,3 +370,10 @@ table.plan tr:hover td { background: var(--bg-metric); }
   font-size: 13px;
   flex-shrink: 0;
 }
+
+/* ── Бейджи дистанций для забегов ── */
+.badge-4k   { background: var(--bg-metric);       color: var(--text-muted); }
+.badge-5k   { background: var(--c-blue-light);    color: var(--c-blue); }
+.badge-10k  { background: var(--c-accent-light);  color: var(--c-accent-dark); }
+.badge-hm   { background: var(--c-warn-light);    color: var(--c-warn); }
+.badge-marathon { background: var(--c-danger-light); color: var(--c-danger); }

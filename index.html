@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=5">
+<link rel="stylesheet" href="style.css?v=6">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -60,6 +60,7 @@
     <button class="nav-btn" onclick="showTab('log',this)">Журнал</button>
     <button class="nav-btn" onclick="showTab('stats',this)">Аналитика</button>
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
+    <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
   </nav>
 
   <!-- ПЛАН -->
@@ -219,6 +220,45 @@
     </div>
   </div>
 
+  <!-- СТАРТЫ -->
+  <div id="tab-races" class="tab">
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-title">Записать результат забега</div>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>Название забега</label>
+          <input type="text" id="r-name" placeholder="Например: Московский полумарафон">
+        </div>
+        <div class="form-group">
+          <label>Дата</label>
+          <input type="date" id="r-date">
+        </div>
+        <div class="form-group">
+          <label>Дистанция</label>
+          <select id="r-dist">
+            <option value="4.2km">4,2 км</option>
+            <option value="5km">5 км</option>
+            <option value="10km">10 км</option>
+            <option value="HM">Полумарафон (21,1 км)</option>
+            <option value="M">Марафон (42,2 км)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Финишное время (мм:сс или чч:мм:сс)</label>
+          <input type="text" id="r-time" placeholder="1:45:30">
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+        <button class="btn-primary" onclick="saveRace()">Сохранить результат</button>
+        <span id="race-save-msg" class="save-msg">✓ Сохранено!</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Мои забеги</div>
+      <div id="races-list"><div class="empty">Забегов пока нет. Добавьте первый!</div></div>
+    </div>
+  </div>
+
   <!-- Детали тренировки -->
   <div id="run-detail-overlay" class="run-detail-overlay" onclick="closeRunDetail(event)">
     <div class="run-detail-card">
@@ -236,6 +276,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=5"></script>
+<script src="app.js?v=6"></script>
 </body>
 </html>
