@@ -96,6 +96,15 @@
     <!-- ФОРМА ЗАПИСИ -->
     <div class="card">
       <div class="card-title">Записать пробежку</div>
+      <!-- Импорт из Garmin -->
+      <div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">
+          📁 Загрузить из Garmin (.csv)
+          <input type="file" id="garmin-file" accept=".csv"
+                 onchange="importGarminCSV(this.files[0])" style="display:none">
+        </label>
+        <span id="garmin-msg" style="font-size:12px;display:none"></span>
+      </div>
       <div class="form-grid">
         <div class="form-group">
           <label>Дата</label>
