@@ -1,6 +1,7 @@
 const API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
 
 let PLAN = null;
+let planEditMode = false;
 
 let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
 let isOnline = false;
@@ -221,15 +222,65 @@ function renderPlan() {
   const cw = getCurrentWeek();
   const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
   const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
+  const dayCell = (val, day, i) => planEditMode
+    ? `<td class="editable" style="font-size:12px"><input value="${escapeHtml(val)}" data-week="${i}" data-day="${day}"></td>`
+    : `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${val}</td>`;
   document.getElementById('plan-body').innerHTML = PLAN.map((r,i) => `
     <tr class="${i===cw?'current-week':''} ${r.type==='race'?'race-week':''}">
       <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w}</td>
       <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${r.start}<br>${r.end}</td>
       <td><span class="badge ${badgeMap[r.type]}">${labelMap[r.type]}</span><br><span style="font-size:11px;opacity:.7">${r.accent}</span></td>
-      <td style="font-size:12px">${r.sun}</td><td style="font-size:12px">${r.mon}</td>
-      <td style="font-size:12px;color:var(--c-blue)">${r.wed}</td>
-      <td style="font-size:12px">${r.fri}</td><td style="font-size:12px;font-weight:500">${r.sat}</td>
+      ${dayCell(r.sun,'sun',i)}${dayCell(r.mon,'mon',i)}
+      ${dayCell(r.wed,'wed',i)}${dayCell(r.fri,'fri',i)}${dayCell(r.sat,'sat',i)}
     </tr>`).join('');
+}
+
+function togglePlanEdit() {
+  planEditMode ? cancelPlanEdit() : enterPlanEditMode();
+}
+
+function enterPlanEditMode() {
+  planEditMode = true;
+  document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
+  document.getElementById('plan-save-bar').style.display = 'flex';
+  renderPlan();
+}
+
+function cancelPlanEdit() {
+  planEditMode = false;
+  document.getElementById('plan-edit-btn').textContent = '✏ Редактировать';
+  document.getElementById('plan-save-bar').style.display = 'none';
+  renderPlan();
+}
+
+function collectPlanEdits() {
+  document.querySelectorAll('#plan-body input[data-week]').forEach(inp => {
+    const i = +inp.dataset.week;
+    const day = inp.dataset.day;
+    PLAN[i][day] = inp.value;
+  });
+}
+
+async function savePlanEdits() {
+  collectPlanEdits();
+  const btn = document.getElementById('plan-save-btn');
+  btn.disabled = true; btn.textContent = 'Сохранение…';
+  try {
+    const res = await fetch(API_URL + 'plan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit', created_by: 'aabramov77' })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
+    const msg = document.getElementById('plan-save-msg');
+    msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
+    setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
+  } catch(e) {
+    alert('Ошибка сохранения: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Сохранить изменения';
+  }
 }
 
 function renderMetrics() {

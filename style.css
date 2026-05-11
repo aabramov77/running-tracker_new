@@ -248,6 +248,30 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .calc-result .calc-label { font-size: 10px; color: var(--text-muted); font-weight: 400; text-transform: uppercase; letter-spacing: .4px; }
 .calc-result .calc-val { font-size: 16px; }
 
+/* ── Редактирование плана ── */
+.plan-save-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.plan td.editable input {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 3px 5px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  min-width: 80px;
+  box-sizing: border-box;
+}
+.plan td.editable input:focus {
+  outline: 1.5px solid var(--c-accent);
+  background: var(--bg-card);
+}
+
 /* ── Детали тренировки ── */
 .run-detail-overlay {
   display: none;

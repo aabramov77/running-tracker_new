@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 <div class="app">
@@ -39,7 +39,15 @@
   <!-- ПЛАН -->
   <div id="tab-plan" class="tab active">
     <div class="card">
-      <div class="card-title">Календарный план</div>
+      <div class="week-header" style="margin-bottom:10px">
+        <div class="card-title" style="margin:0">Календарный план</div>
+        <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
+      </div>
+      <div id="plan-save-bar" class="plan-save-bar" style="display:none">
+        <button class="btn-primary" id="plan-save-btn" onclick="savePlanEdits()">Сохранить изменения</button>
+        <button class="btn-sm" onclick="cancelPlanEdit()">Отмена</button>
+        <span id="plan-save-msg" class="save-msg"></span>
+      </div>
       <div style="overflow-x:auto">
         <table class="plan">
           <thead><tr><th>Нед</th><th>Даты</th><th>Акцент</th><th>Вс</th><th>Пн</th><th>Ср</th><th>Пт</th><th>Сб</th></tr></thead>
@@ -202,6 +210,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=3"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>
