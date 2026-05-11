@@ -217,11 +217,50 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .suggestion.good { border-color: var(--c-accent); background: var(--c-accent-light); color: var(--c-accent-dark); }
 
 @media (max-width: 600px) {
+  /* Layout */
+  .app { padding: 0.875rem 0.75rem 4rem; }
   .metrics { grid-template-columns: repeat(2, 1fr); }
   .form-grid { grid-template-columns: 1fr; }
   .form-group.full { grid-column: 1; }
-  .header { flex-direction: column; gap: 8px; }
-  .nav-btn { padding: 8px 10px; font-size: 12px; }
+  .card { padding: 0.875rem 0.875rem; }
+
+  /* Header */
+  .header { flex-direction: column; gap: 6px; }
+  .header h1 { font-size: 18px; }
+  .countdown { font-size: 18px; }
+
+  /* Nav — горизонтальный скролл без скроллбара */
+  .nav { overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav-btn { padding: 8px 12px; font-size: 12px; white-space: nowrap; flex-shrink: 0; min-height: 44px; }
+
+  /* Метрики */
+  .metric { padding: 10px 12px; }
+  .metric-val { font-size: 20px; }
+  .metric-label { font-size: 10px; }
+
+  /* Форма — font-size 16px предотвращает зум на iOS */
+  .form-group input,
+  .form-group select,
+  .form-group textarea { font-size: 16px; padding: 10px 10px; }
+
+  /* Touch targets */
+  .btn-primary { min-height: 44px; font-size: 14px; }
+  .btn-sm { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; }
+
+  /* План — горизонтальный скролл */
+  table.plan { min-width: 560px; }
+  table.plan th, table.plan td { padding: 5px 6px; font-size: 11px; }
+
+  /* Калькулятор */
+  .calc-tab-btn { font-size: 11px; padding: 6px 10px; }
+  .calc-result { font-size: 13px; }
+
+  /* Графики */
+  .chart-wrap { height: 180px; }
+
+  /* Журнал */
+  .run-meta { font-size: 11px; }
 }
 
 /* ── Калькулятор ── */
