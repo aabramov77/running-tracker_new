@@ -61,6 +61,67 @@ async function loadPlan() {
   }
 }
 
+function parseCSV(text) {
+  return text.split(/\r?\n/).filter(l => l.trim()).map(line => {
+    const fields = []; let cur = '', inQ = false;
+    for (const ch of line) {
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ',' && !inQ) { fields.push(cur.trim()); cur = ''; }
+      else { cur += ch; }
+    }
+    fields.push(cur.trim());
+    return fields;
+  });
+}
+
+function importGarminCSV(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const rows = parseCSV(e.target.result);
+      const headers = rows[0];
+      const idx = {};
+      headers.forEach((h, i) => idx[h] = i);
+
+      const summary = rows.find(r => r[1] === 'Summary');
+      if (!summary) throw new Error('Строка Summary не найдена');
+
+      const dist  = summary[idx['Distance']];
+      const time  = summary[idx['Cumulative Time']];
+      const pace  = summary[idx['Avg Pace']];
+      const hr    = summary[idx['Avg HR']];
+      const maxHr = summary[idx['Max HR']];
+      const asc   = summary[idx['Total Ascent']];
+      const cal   = summary[idx['Calories']];
+      const cad   = summary[idx['Avg Run Cadence']];
+
+      if (dist)  document.getElementById('f-dist').value = parseFloat(dist);
+      if (time)  document.getElementById('f-time').value = time;
+      if (pace)  document.getElementById('f-pace').value = pace;
+      if (hr)    document.getElementById('f-hr').value   = parseInt(hr);
+
+      const parts = [];
+      if (maxHr) parts.push(`пульс макс ${maxHr}`);
+      if (asc)   parts.push(`набор ${asc}м`);
+      if (cad)   parts.push(`каденс ${cad}`);
+      if (cal)   parts.push(`калории ${cal}`);
+      if (parts.length) document.getElementById('f-notes').value = 'Garmin: ' + parts.join(', ');
+
+      const msg = document.getElementById('garmin-msg');
+      msg.textContent = `✓ Загружено: ${dist} км, ${time}, темп ${pace}, пульс ${hr}`;
+      msg.style.cssText = 'font-size:12px;display:inline;color:var(--c-accent)';
+
+      document.getElementById('garmin-file').value = '';
+    } catch(err) {
+      const msg = document.getElementById('garmin-msg');
+      msg.textContent = '⚠ ' + err.message;
+      msg.style.cssText = 'font-size:12px;display:inline;color:var(--c-danger)';
+    }
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
 async function loadRunsFromCloud() {
   try {
     setStatus('Загрузка из облака…', 'warn');
