@@ -256,16 +256,52 @@ function renderLog() {
   el.innerHTML = activeRuns.map(r => {
     const pace = parsePace(r.pace);
     const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
-    return `<div class="run-item">
+    return `<div class="run-item" onclick="showRunDetail(${r.id})" style="cursor:pointer">
       <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${getWeekLabel(r.date)}</span></div>
       <div class="run-info">
         <div class="run-title">${typeLabels[r.type] || escapeHtml(r.type)} — ${escapeHtml(String(r.dist))} км ${feelEmoji[r.feel]||''}</div>
         <div class="run-meta">${r.pace?`<span class="${pc}">${escapeHtml(r.pace)}/км</span> · `:''}${r.time?escapeHtml(r.time)+' · ':''}${r.hr?r.hr+' уд/мин':''}</div>
         ${r.notes?`<div class="run-note">${escapeHtml(r.notes)}</div>`:''}
       </div>
-      <button class="btn-sm" onclick="deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
+      <button class="btn-sm" onclick="event.stopPropagation();deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
     </div>`;
   }).join('');
+}
+
+function showRunDetail(id) {
+  const run = runs.find(r => r.id === id);
+  if (!run) return;
+  const typeLabels = {easy:'Лёгкий бег',interval:'Интервалы',tempo:'Темповый',
+                      long:'Длительный',race:'Соревнование',recovery:'Восстановительный'};
+  const feelLabels = {great:'Отлично 😊',good:'Хорошо 🙂',ok:'Нормально 😐',
+                      hard:'Тяжело 😓',bad:'Плохо 😔'};
+  const pace = parsePace(run.pace);
+  const pc = pace ? (pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off') : '';
+  document.getElementById('rd-title').textContent =
+    `${typeLabels[run.type] || run.type} · ${run.date}`;
+  const rows = [
+    ['Дата',         escapeHtml(run.date)],
+    ['Дистанция',    `${escapeHtml(String(run.dist))} км`],
+    run.time  ? ['Время',        escapeHtml(run.time)]  : null,
+    run.pace  ? ['Темп',         `<span class="${pc}">${escapeHtml(run.pace)}/км</span>`] : null,
+    run.hr    ? ['Пульс',        `${run.hr} уд/мин`]   : null,
+    ['Самочувствие', feelLabels[run.feel] || run.feel],
+    run.notes ? ['Заметки',      `<span style="font-style:italic">${escapeHtml(run.notes)}</span>`] : null,
+  ].filter(Boolean);
+  document.getElementById('rd-body').innerHTML = rows
+    .map(([label, val]) =>
+      `<div class="detail-row">
+         <span class="detail-label">${label}</span>
+         <span style="text-align:right">${val}</span>
+       </div>`)
+    .join('');
+  document.getElementById('rd-delete-btn').onclick = () => { closeRunDetail(); deleteRun(id); };
+  document.getElementById('run-detail-overlay').classList.add('active');
+}
+
+function closeRunDetail(event) {
+  if (event && event.target !== document.getElementById('run-detail-overlay')) return;
+  document.getElementById('run-detail-overlay').classList.remove('active');
 }
 
 let wChart=null,pChart=null;
