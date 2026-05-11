@@ -247,3 +247,40 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .calc-result .calc-item { display: flex; flex-direction: column; gap: 1px; }
 .calc-result .calc-label { font-size: 10px; color: var(--text-muted); font-weight: 400; text-transform: uppercase; letter-spacing: .4px; }
 .calc-result .calc-val { font-size: 16px; }
+
+/* ── Детали тренировки ── */
+.run-detail-overlay {
+  display: none;
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;
+  background: rgba(0,0,0,0.45);
+  z-index: 100;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+.run-detail-overlay.active { display: flex; }
+.run-detail-card {
+  background: var(--bg-card);
+  border-radius: 16px 16px 12px 12px;
+  padding: 20px;
+  width: 100%;
+  max-width: 480px;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+.detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  gap: 12px;
+}
+.detail-row:last-child { border-bottom: none; }
+.detail-label {
+  color: var(--text-muted);
+  font-size: 13px;
+  flex-shrink: 0;
+}
