@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "powershell",
+            "command": "$b = git rev-parse --abbrev-ref HEAD 2>$null; if ($b -eq 'main') { $r = '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Direct changes to main are not allowed. Switch to Dev branch first: git checkout Dev\"}}'; Write-Output $r }",
+            "statusMessage": "Checking branch..."
+          }
+        ]
+      }
+    ]
+  }
+}

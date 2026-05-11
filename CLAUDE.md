@@ -1,5 +1,14 @@
 # Running Tracker — инструкции для Claude Code
 
+## Git Workflow
+
+**Все изменения кода делаются только в ветке `Dev`, никогда напрямую в `main`.**
+
+- Перед началом работы: `git checkout Dev`
+- Изменения коммитятся в `Dev`
+- В `main` попадают только через merge из `Dev`
+- Хук в `.claude/settings.json` автоматически блокирует `Write`/`Edit` на ветке `main`
+
 ## Проект
 
 Веб-трекер беговых тренировок + Cloud Run Function бэкенд.
