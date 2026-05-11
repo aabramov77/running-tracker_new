@@ -5,9 +5,32 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=3">
+<link rel="stylesheet" href="style.css?v=4">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
+
+<!-- Экран входа -->
+<div id="login-screen" class="login-screen">
+  <div class="login-card">
+    <h2>Running Tracker</h2>
+    <p>Полумарафон 09.08.2026</p>
+    <div id="g_id_onload"
+         data-client_id="YOUR_CLIENT_ID"
+         data-callback="handleCredentialResponse"
+         data-auto_select="true"
+         data-use_fedcm_for_prompt="true">
+    </div>
+    <div class="g_id_signin"
+         data-type="standard"
+         data-shape="pill"
+         data-theme="outline"
+         data-text="sign_in_with"
+         data-size="large">
+    </div>
+  </div>
+</div>
+
 <div class="app">
   <header class="header">
     <div>
@@ -15,9 +38,12 @@
       <p id="api-status" class="subtitle">Подключение к GCS…</p>
       <p class="subtitle">Цель: 1:40 · план 13 недель · aabramov77</p>
     </div>
-    <div class="countdown-block">
-      <div class="countdown-label">До старта</div>
-      <div class="countdown" id="countdown">—</div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
+      <div class="countdown-block" style="text-align:right">
+        <div class="countdown-label">До старта</div>
+        <div class="countdown" id="countdown">—</div>
+      </div>
+      <button class="btn-sm" id="signout-btn" onclick="signOut()" style="display:none;font-size:11px">Выйти</button>
     </div>
   </header>
 
@@ -210,6 +236,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=4"></script>
+<script src="app.js?v=5"></script>
 </body>
 </html>
