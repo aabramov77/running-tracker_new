@@ -320,7 +320,7 @@ async function savePlanEdits() {
   try {
     const res = await fetch(API_URL + 'plan', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: authHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit', created_by: 'aabramov77' })
     });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
