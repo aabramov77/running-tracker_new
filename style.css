@@ -248,6 +248,29 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .calc-result .calc-label { font-size: 10px; color: var(--text-muted); font-weight: 400; text-transform: uppercase; letter-spacing: .4px; }
 .calc-result .calc-val { font-size: 16px; }
 
+/* ── Экран входа ── */
+.login-screen {
+  display: none;
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;
+  background: var(--bg);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+.login-screen.active { display: flex; }
+.login-card {
+  text-align: center;
+  padding: 40px 32px;
+  background: var(--bg-card);
+  border: 0.5px solid var(--border);
+  border-radius: 16px;
+  max-width: 320px;
+  width: 100%;
+}
+.login-card h2 { font-size: 20px; font-weight: 500; margin-bottom: 6px; }
+.login-card p  { font-size: 13px; color: var(--text-muted); margin-bottom: 24px; }
+
 /* ── Редактирование плана ── */
 .plan-save-bar {
   display: flex;

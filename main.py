@@ -3,6 +3,11 @@ import json
 import functions_framework
 from google.cloud import storage
 from datetime import datetime
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+CLIENT_ID = "463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
+ALLOWED_EMAIL = "aabramov77@gmail.com"
 
 BUCKET_NAME = "running-tracker-aabramov77"
 OBJECT_NAME = "runs.json"
@@ -102,6 +107,24 @@ def write_plan_version(bucket, version, weeks, change_reason, created_by="api"):
     return {"version": version, "gcs_object_path": object_path}
 
 
+# ── Auth ───────────────────────────────────────────────────────────────────────
+
+def verify_token(request):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:]
+    try:
+        info = id_token.verify_oauth2_token(
+            token, google_requests.Request(), CLIENT_ID
+        )
+        if info.get("email") != ALLOWED_EMAIL:
+            return None
+        return info
+    except Exception:
+        return None
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 @functions_framework.http
@@ -109,11 +132,15 @@ def runs_api(request):
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
     }
 
     if request.method == "OPTIONS":
         return ("", 204, headers)
+
+    user = verify_token(request)
+    if not user:
+        return (json.dumps({"error": "Unauthorized"}), 401, headers)
 
     path = request.path.rstrip("/") or "/"
 

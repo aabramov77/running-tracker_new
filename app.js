@@ -2,6 +2,34 @@ const API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
 
 let PLAN = null;
 let planEditMode = false;
+let idToken = localStorage.getItem('g_id_token') || null;
+
+function authHeaders(extra = {}) {
+  return idToken ? { ...extra, 'Authorization': `Bearer ${idToken}` } : extra;
+}
+
+function handleCredentialResponse(response) {
+  idToken = response.credential;
+  localStorage.setItem('g_id_token', idToken);
+  document.getElementById('login-screen').classList.remove('active');
+  document.getElementById('signout-btn').style.display = 'inline-flex';
+  initApp();
+}
+
+function signOut() {
+  idToken = null;
+  localStorage.removeItem('g_id_token');
+  document.getElementById('login-screen').classList.add('active');
+  document.getElementById('signout-btn').style.display = 'none';
+  if (window.google) google.accounts.id.disableAutoSelect();
+}
+
+function handleAuthError() {
+  idToken = null;
+  localStorage.removeItem('g_id_token');
+  document.getElementById('login-screen').classList.add('active');
+  document.getElementById('signout-btn').style.display = 'none';
+}
 
 let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
 let isOnline = false;
@@ -17,17 +45,20 @@ function escapeHtml(s) {
 }
 
 async function apiGet() {
-  const res = await fetch(API_URL);
+  const res = await fetch(API_URL, { headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 async function apiPost(run) {
-  const res = await fetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(run) });
+  const res = await fetch(API_URL, { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(run) });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 async function apiDelete(id) {
-  const res = await fetch(`${API_URL}?id=${id}`, { method: 'DELETE' });
+  const res = await fetch(`${API_URL}?id=${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -43,7 +74,8 @@ async function loadPlan() {
   const cached = localStorage.getItem('running_tracker_plan');
   if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
   try {
-    const res = await fetch(API_URL + 'plan');
+    const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const weeks = await res.json();
     if (weeks?.length && weeks[0]?.w !== undefined) {
@@ -271,6 +303,7 @@ async function savePlanEdits() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit', created_by: 'aabramov77' })
     });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
     const msg = document.getElementById('plan-save-msg');
@@ -396,11 +429,22 @@ function showTab(name,btn){
 }
 
 function renderAll(){renderMetrics();renderLog();renderPlan();}
-document.getElementById('f-date').value=new Date().toISOString().slice(0,10);
-renderMetrics();
-renderLog();
-loadPlan();
-loadRunsFromCloud();
+
+function initApp() {
+  document.getElementById('f-date').value = new Date().toISOString().slice(0, 10);
+  renderMetrics();
+  renderLog();
+  loadPlan();
+  loadRunsFromCloud();
+}
+
+// ── Запуск с авторизацией ──
+document.getElementById('login-screen').classList.add('active');
+if (idToken) {
+  document.getElementById('login-screen').classList.remove('active');
+  document.getElementById('signout-btn').style.display = 'inline-flex';
+  initApp();
+}
 
 // ====================================================
 // КАЛЬКУЛЯТОР
