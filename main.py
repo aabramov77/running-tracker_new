@@ -11,6 +11,7 @@ ALLOWED_EMAIL = "aabramov77@gmail.com"
 
 BUCKET_NAME = "running-tracker-aabramov77"
 OBJECT_NAME = "runs.json"
+RACES_OBJECT = "races.json"
 PLAN_MANIFEST = "plan/manifest.json"
 
 INITIAL_PLAN = [
@@ -50,6 +51,26 @@ def write_runs(runs):
     bucket = client.bucket(BUCKET_NAME)
     bucket.blob(OBJECT_NAME).upload_from_string(
         json.dumps(runs, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+
+
+# ── Races helpers ─────────────────────────────────────────────────────────────
+
+def read_races():
+    client = get_storage_client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(RACES_OBJECT)
+    if not blob.exists():
+        return []
+    return json.loads(blob.download_as_text())
+
+
+def write_races(races):
+    client = get_storage_client()
+    bucket = client.bucket(BUCKET_NAME)
+    bucket.blob(RACES_OBJECT).upload_from_string(
+        json.dumps(races, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
 
@@ -145,6 +166,65 @@ def runs_api(request):
     path = request.path.rstrip("/") or "/"
 
     try:
+        # ── /races ───────────────────────────────────────────────────────────
+        if path == "/races":
+            if request.method == "GET":
+                all_races = read_races()
+                active_races = [r for r in all_races if not r.get("deleted", False)]
+                return (json.dumps(active_races, ensure_ascii=False), 200, {
+                    **headers, "Content-Type": "application/json"
+                })
+
+            elif request.method == "POST":
+                body = request.get_json(silent=True)
+                if not body:
+                    return (json.dumps({"error": "Invalid JSON"}), 400, headers)
+
+                for field in ["name", "date", "dist_label", "time"]:
+                    if field not in body:
+                        return (json.dumps({"error": f"Missing field: {field}"}), 400, headers)
+
+                race = {
+                    "id": body.get("id", int(datetime.now().timestamp() * 1000)),
+                    "name": body["name"],
+                    "date": body["date"],
+                    "dist_label": body["dist_label"],
+                    "time": body["time"],
+                    "deleted": False,
+                }
+
+                all_races = read_races()
+                all_races = [r for r in all_races if r.get("id") != race["id"]]
+                all_races.insert(0, race)
+                write_races(all_races)
+
+                return (json.dumps(race, ensure_ascii=False), 201, {
+                    **headers, "Content-Type": "application/json"
+                })
+
+            elif request.method == "DELETE":
+                race_id = request.args.get("id")
+                if not race_id:
+                    return (json.dumps({"error": "Missing id parameter"}), 400, headers)
+
+                all_races = read_races()
+                race_id = int(race_id)
+
+                target = next((r for r in all_races if r.get("id") == race_id), None)
+                if not target:
+                    return (json.dumps({"error": "Race not found"}), 404, headers)
+
+                target["deleted"] = True
+                target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
+                write_races(all_races)
+
+                return (json.dumps({"soft_deleted": race_id, "deleted_at": target["deleted_at"]}), 200, {
+                    **headers, "Content-Type": "application/json"
+                })
+
+            else:
+                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+
         # ── /plan ────────────────────────────────────────────────────────────
         if path == "/plan":
             client = get_storage_client()

@@ -32,6 +32,7 @@ function handleAuthError() {
 }
 
 let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
+let races = JSON.parse(localStorage.getItem('running_tracker_races') || '[]');
 let isOnline = false;
 
 function escapeHtml(s) {
@@ -58,6 +59,25 @@ async function apiPost(run) {
 }
 async function apiDelete(id) {
   const res = await fetch(`${API_URL}?id=${id}`, { method: 'DELETE', headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function apiGetRaces() {
+  const res = await fetch(API_URL + 'races', { headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+async function apiPostRace(race) {
+  const res = await fetch(API_URL + 'races', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(race) });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+async function apiDeleteRace(id) {
+  const res = await fetch(`${API_URL}races?id=${id}`, { method: 'DELETE', headers: authHeaders() });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
@@ -352,6 +372,104 @@ function renderLog() {
   }).join('');
 }
 
+// ── RACES ─────────────────────────────────────────────────────────────────────
+
+const DIST_KM = { '4.2km': 4.2, '5km': 5, '10km': 10, 'HM': 21.0975, 'M': 42.195 };
+const DIST_LABEL = { '4.2km': '4,2 км', '5km': '5 км', '10km': '10 км', 'HM': 'Полумарафон', 'M': 'Марафон' };
+const DIST_BADGE = { '4.2km': 'badge-4k', '5km': 'badge-5k', '10km': 'badge-10k', 'HM': 'badge-hm', 'M': 'badge-marathon' };
+
+async function loadRacesFromCloud() {
+  try {
+    const cloudRaces = await apiGetRaces();
+    races = cloudRaces;
+    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    renderRaces();
+  } catch (e) {
+    races = races.filter(r => !r.deleted);
+    renderRaces();
+  }
+}
+
+async function saveRace() {
+  const name = document.getElementById('r-name').value.trim();
+  const date = document.getElementById('r-date').value;
+  const dist_label = document.getElementById('r-dist').value;
+  const time = document.getElementById('r-time').value.trim();
+  if (!name) { alert('Введите название забега'); return; }
+  if (!date)  { alert('Укажите дату забега'); return; }
+  if (!time)  { alert('Введите финишное время'); return; }
+
+  const race = { id: Date.now(), name, date, dist_label, time };
+  const btn = document.querySelector('#tab-races .btn-primary');
+  btn.disabled = true; btn.textContent = 'Сохраняем…';
+  try {
+    await apiPostRace(race);
+    await loadRacesFromCloud();
+    const msg = document.getElementById('race-save-msg');
+    msg.style.display = 'inline';
+    setTimeout(() => msg.style.display = 'none', 2500);
+    document.getElementById('r-name').value = '';
+    document.getElementById('r-time').value = '';
+  } catch (e) {
+    // Офлайн: сохраняем локально
+    races.unshift(race);
+    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    renderRaces();
+    const msg = document.getElementById('race-save-msg');
+    msg.style.display = 'inline';
+    setTimeout(() => msg.style.display = 'none', 2500);
+    document.getElementById('r-name').value = '';
+    document.getElementById('r-time').value = '';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Сохранить результат';
+  }
+}
+
+async function deleteRace(id) {
+  if (!confirm('Скрыть этот забег? Данные останутся в хранилище.')) return;
+  try {
+    await apiDeleteRace(id);
+    await loadRacesFromCloud();
+  } catch (e) {
+    races = races.filter(r => r.id !== id);
+    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    renderRaces();
+  }
+}
+
+function calcRacePace(dist_label, timeStr) {
+  const km = DIST_KM[dist_label];
+  const sec = parseTimeToSeconds(timeStr);
+  if (!km || !sec) return null;
+  return secondsToTime(sec / km);
+}
+
+function renderRaces() {
+  const el = document.getElementById('races-list');
+  if (!el) return;
+  const active = races.filter(r => !r.deleted);
+  if (!active.length) {
+    el.innerHTML = '<div class="empty">Забегов пока нет. Добавьте первый!</div>';
+    return;
+  }
+  el.innerHTML = active.map(r => {
+    const pace = calcRacePace(r.dist_label, r.time);
+    const badgeClass = DIST_BADGE[r.dist_label] || 'badge-5k';
+    const label = DIST_LABEL[r.dist_label] || r.dist_label;
+    return `<div class="run-item">
+      <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${r.date.slice(0,4)}</span></div>
+      <div class="run-info">
+        <div class="run-title">${escapeHtml(r.name)}</div>
+        <div class="run-meta">
+          <span class="badge ${badgeClass}" style="margin-right:6px">${escapeHtml(label)}</span>
+          ${escapeHtml(r.time)}${pace ? ` · ${escapeHtml(pace)}/км` : ''}
+        </div>
+      </div>
+      <button class="btn-sm" onclick="deleteRace(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
+    </div>`;
+  }).join('');
+}
+
 function showRunDetail(id) {
   const run = runs.find(r => r.id === id);
   if (!run) return;
@@ -426,16 +544,20 @@ function showTab(name,btn){
   btn.classList.add('active');
   if(name==='stats')renderCharts();
   if(name==='adjust')renderAdjust();
+  if(name==='races')renderRaces();
 }
 
 function renderAll(){renderMetrics();renderLog();renderPlan();}
 
 function initApp() {
-  document.getElementById('f-date').value = new Date().toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+  document.getElementById('f-date').value = today;
+  document.getElementById('r-date').value = today;
   renderMetrics();
   renderLog();
   loadPlan();
   loadRunsFromCloud();
+  loadRacesFromCloud();
 }
 
 // ── Запуск с авторизацией ──
