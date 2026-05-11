@@ -6,7 +6,7 @@ from datetime import datetime
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
-CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_ID = "463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
 ALLOWED_EMAIL = "aabramov77@gmail.com"
 
 BUCKET_NAME = "running-tracker-aabramov77"
