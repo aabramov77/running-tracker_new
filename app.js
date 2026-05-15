@@ -114,17 +114,32 @@ async function loadPlan() {
   }
 }
 
+// CSV-парсер с поддержкой многострочных ячеек (Garmin Laps export содержит \n внутри кавычек)
 function parseCSV(text) {
-  return text.split(/\r?\n/).filter(l => l.trim()).map(line => {
-    const fields = []; let cur = '', inQ = false;
-    for (const ch of line) {
-      if (ch === '"') { inQ = !inQ; }
-      else if (ch === ',' && !inQ) { fields.push(cur.trim()); cur = ''; }
-      else { cur += ch; }
+  const rows = []; let row = []; let cur = ''; let inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (inQ && text[i+1] === '"') { cur += '"'; i++; }   // экранированная кавычка
+      else inQ = !inQ;
+    } else if (ch === ',' && !inQ) {
+      row.push(cur); cur = '';
+    } else if ((ch === '\n' || ch === '\r') && !inQ) {
+      if (ch === '\r' && text[i+1] === '\n') i++;
+      row.push(cur); cur = '';
+      if (row.length > 1 || row[0] !== '') rows.push(row);
+      row = [];
+    } else {
+      cur += ch;
     }
-    fields.push(cur.trim());
-    return fields;
-  });
+  }
+  if (cur !== '' || row.length) { row.push(cur); if (row.length > 1 || row[0] !== '') rows.push(row); }
+  return rows;
+}
+
+function normalizeHeader(h) {
+  // "Distance\nkm" → "distance", "Avg Pace\nmin/km" → "avg pace"
+  return h.split(/\r?\n/)[0].trim().toLowerCase();
 }
 
 function importGarminCSV(file) {
@@ -135,19 +150,25 @@ function importGarminCSV(file) {
       const rows = parseCSV(e.target.result);
       const headers = rows[0];
       const idx = {};
-      headers.forEach((h, i) => idx[h] = i);
+      headers.forEach((h, i) => { idx[normalizeHeader(h)] = i; });
 
-      const summary = rows.find(r => r[1] === 'Summary');
+      // Summary может быть в r[0] (Laps export) или r[1] (Splits export)
+      const summary = rows.find(r => r[0] === 'Summary' || r[1] === 'Summary');
       if (!summary) throw new Error('Строка Summary не найдена');
 
-      const dist  = summary[idx['Distance']];
-      const time  = summary[idx['Cumulative Time']];
-      const pace  = summary[idx['Avg Pace']];
-      const hr    = summary[idx['Avg HR']];
-      const maxHr = summary[idx['Max HR']];
-      const asc   = summary[idx['Total Ascent']];
-      const cal   = summary[idx['Calories']];
-      const cad   = summary[idx['Avg Run Cadence']];
+      const get = (name) => {
+        const i = idx[name.toLowerCase()];
+        return (i !== undefined && summary[i] !== undefined) ? summary[i] : null;
+      };
+
+      const dist  = get('Distance');
+      const time  = get('Cumulative Time') || get('Time');
+      const pace  = get('Avg Pace');
+      const hr    = get('Avg HR');
+      const maxHr = get('Max HR');
+      const asc   = get('Total Ascent');
+      const cal   = get('Calories');
+      const cad   = get('Avg Run Cadence');
 
       if (dist)  document.getElementById('f-dist').value = parseFloat(dist);
       if (time)  document.getElementById('f-time').value = time;
