@@ -558,14 +558,197 @@ function renderAdjust() {
   el.innerHTML=html;
 }
 
+// ── LLM Settings ──────────────────────────────────────────────────────────────
+
+const LLM_MODELS = {
+  anthropic: [
+    { id: 'claude-sonnet-4-5-20250929', label: 'Claude Sonnet 4.5' },
+    { id: 'claude-haiku-4-5-20250929', label: 'Claude Haiku 4.5' },
+    { id: 'claude-opus-4-5-20250929', label: 'Claude Opus 4.5' },
+  ],
+  openai: [
+    { id: 'gpt-4o', label: 'GPT-4o' },
+    { id: 'gpt-4o-mini', label: 'GPT-4o mini' },
+    { id: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+  ],
+  deepseek: [
+    { id: 'deepseek-chat', label: 'Deepseek Chat' },
+    { id: 'deepseek-reasoner', label: 'Deepseek Reasoner' },
+  ],
+};
+
+function updateModelOptions() {
+  const provider = document.getElementById('s-provider').value;
+  const sel = document.getElementById('s-model');
+  sel.innerHTML = LLM_MODELS[provider].map(m =>
+    `<option value="${m.id}">${m.label}</option>`).join('');
+}
+
+async function loadLlmSettings() {
+  // Дефолтно — anthropic, модели заполняем
+  updateModelOptions();
+  document.getElementById('s-api-key').value = '';
+  document.getElementById('s-key-current').textContent = '';
+  try {
+    const res = await fetch(API_URL + 'config/llm', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) return;
+    const cfg = await res.json();
+    if (cfg.configured) {
+      document.getElementById('s-provider').value = cfg.provider;
+      updateModelOptions();
+      document.getElementById('s-model').value = cfg.model;
+      document.getElementById('s-key-current').textContent = `(текущий: ${cfg.api_key_masked})`;
+      document.getElementById('s-api-key').placeholder = 'оставьте пустым чтобы не менять ключ';
+    }
+  } catch (e) {}
+}
+
+async function saveLlmConfig() {
+  const provider = document.getElementById('s-provider').value;
+  const model = document.getElementById('s-model').value;
+  const apiKeyInput = document.getElementById('s-api-key').value.trim();
+  const msg = document.getElementById('settings-msg');
+
+  // Если ключ не введён — берём текущий с бэка (нельзя — нет реального ключа на фронте).
+  // Поэтому требуем ввод ключа.
+  if (!apiKeyInput) {
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)';
+    msg.textContent = '⚠ Введите API-ключ';
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 3000);
+    return;
+  }
+
+  try {
+    const res = await fetch(API_URL + 'config/llm', {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({ provider, model, api_key: apiKeyInput }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: 'HTTP ' + res.status}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-accent)';
+    msg.textContent = '✓ Сохранено';
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 2500);
+    document.getElementById('s-api-key').value = '';
+    await loadLlmSettings();
+  } catch (e) {
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)';
+    msg.textContent = '⚠ ' + e.message;
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 5000);
+  }
+}
+
+async function testLlmKey() {
+  const msg = document.getElementById('settings-msg');
+  msg.style.display = 'inline'; msg.style.color = 'var(--text-muted)';
+  msg.textContent = '⏳ Проверяю…';
+  try {
+    const res = await fetch(API_URL + 'config/llm/test', {
+      method: 'POST',
+      headers: authHeaders(),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    const data = await res.json();
+    if (data.ok) {
+      msg.style.color = 'var(--c-accent)';
+      msg.textContent = `✓ Работает (latency ${data.latency_ms} мс, токенов ${data.input_tokens}+${data.output_tokens})`;
+    } else {
+      msg.style.color = 'var(--c-danger)';
+      msg.textContent = '⚠ ' + (data.error || 'ошибка');
+    }
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 6000);
+  } catch (e) {
+    msg.style.color = 'var(--c-danger)';
+    msg.textContent = '⚠ ' + e.message;
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 5000);
+  }
+}
+
+// ── LLM Advice ────────────────────────────────────────────────────────────────
+
+function renderLlmAdvice(rec, meta) {
+  const out = document.getElementById('llm-advice-output');
+  const metaEl = document.getElementById('llm-advice-meta');
+  let html = '';
+  if (rec.assessment) {
+    html += `<div class="suggestion good"><b>Оценка:</b> ${escapeHtml(rec.assessment)}</div>`;
+  }
+  if (Array.isArray(rec.adjustments) && rec.adjustments.length) {
+    html += '<div class="card-title" style="margin-top:14px">Корректировки</div>';
+    rec.adjustments.forEach(a => {
+      html += `<div class="suggestion"><b>${escapeHtml(a.day || '')}:</b> ${escapeHtml(a.change || '')}</div>`;
+    });
+  }
+  if (Array.isArray(rec.warnings) && rec.warnings.length) {
+    html += '<div class="card-title" style="margin-top:14px">⚠ Предупреждения</div>';
+    rec.warnings.forEach(w => {
+      html += `<div class="suggestion warn">${escapeHtml(w)}</div>`;
+    });
+  }
+  if (!html) html = '<div class="empty">Пустой ответ от LLM</div>';
+  out.innerHTML = html;
+
+  if (meta) {
+    const dt = meta.created_at ? new Date(meta.created_at).toLocaleString('ru-RU') : '';
+    metaEl.textContent = `${meta.provider}/${meta.model} · ${meta.input_tokens || 0}+${meta.output_tokens || 0} токенов · ${dt}`;
+    metaEl.style.display = 'block';
+  }
+}
+
+async function loadLatestAdvice() {
+  try {
+    const res = await fetch(API_URL + 'advise', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.available && data.recommendation) {
+      renderLlmAdvice(data.recommendation, data);
+    }
+  } catch (e) {}
+}
+
+async function requestLlmAdvice() {
+  const btn = document.getElementById('llm-advice-btn');
+  const out = document.getElementById('llm-advice-output');
+  const metaEl = document.getElementById('llm-advice-meta');
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = '⏳ Думаю…';
+  out.innerHTML = '<div class="empty">⏳ Анализирую тренировки через LLM, обычно 5-15 секунд…</div>';
+  metaEl.style.display = 'none';
+  try {
+    const res = await fetch(API_URL + 'advise', {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+    });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: 'HTTP ' + res.status}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    renderLlmAdvice(data.recommendation, data);
+  } catch (e) {
+    out.innerHTML = `<div class="suggestion warn">⚠ ${escapeHtml(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
 function showTab(name,btn){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
   btn.classList.add('active');
   if(name==='stats')renderCharts();
-  if(name==='adjust')renderAdjust();
+  if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
   if(name==='races')renderRaces();
+  if(name==='settings')loadLlmSettings();
 }
 
 function renderAll(){renderMetrics();renderLog();renderPlan();}

@@ -61,6 +61,7 @@
     <button class="nav-btn" onclick="showTab('stats',this)">Аналитика</button>
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
+    <button class="nav-btn" onclick="showTab('settings',this)">⚙ Настройки</button>
   </nav>
 
   <!-- ПЛАН -->
@@ -214,9 +215,48 @@
   <!-- КОРРЕКТИРОВКА -->
   <div id="tab-adjust" class="tab">
     <div class="card">
-      <div class="card-title">Корректировка плана</div>
-      <p class="hint">На основе ваших результатов — рекомендации по адаптации тренировок</p>
+      <div class="card-title">Эвристики</div>
+      <p class="hint">Быстрый анализ по простым правилам</p>
       <div id="adjust-content"><div class="empty">Добавьте несколько пробежек для получения рекомендаций</div></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Рекомендации ИИ</div>
+        <button class="btn-sm" id="llm-advice-btn" onclick="requestLlmAdvice()">🤖 Запросить рекомендации</button>
+      </div>
+      <div id="llm-advice-meta" class="hint" style="display:none"></div>
+      <div id="llm-advice-output"><div class="empty">Нажмите кнопку, чтобы получить рекомендации от LLM</div></div>
+    </div>
+  </div>
+
+  <!-- НАСТРОЙКИ -->
+  <div id="tab-settings" class="tab">
+    <div class="card">
+      <div class="card-title">Настройки LLM</div>
+      <p class="hint">Подключите внешнюю LLM (Anthropic / OpenAI / Deepseek) для рекомендаций по корректировке плана. Ключ хранится в приватном GCS-объекте и не передаётся обратно фронту.</p>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Провайдер</label>
+          <select id="s-provider" onchange="updateModelOptions()">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI (GPT)</option>
+            <option value="deepseek">Deepseek</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Модель</label>
+          <select id="s-model"></select>
+        </div>
+        <div class="form-group full">
+          <label>API ключ <span id="s-key-current" style="color:var(--text-muted);font-weight:400;font-size:11px"></span></label>
+          <input type="password" id="s-api-key" placeholder="введите новый ключ или оставьте пустым" autocomplete="new-password">
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn-primary" onclick="saveLlmConfig()">Сохранить</button>
+        <button class="btn-sm" onclick="testLlmKey()">Проверить ключ</button>
+        <span id="settings-msg" class="save-msg"></span>
+      </div>
     </div>
   </div>
 
@@ -276,6 +316,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=8"></script>
+<script src="app.js?v=9"></script>
 </body>
 </html>
