@@ -92,21 +92,126 @@ gs://running-tracker-aabramov77/
 
 ---
 
-## Часть Б. LLM-рекомендации
+## Часть Б. LLM-рекомендации (мульти-провайдер)
 
-### Б.1 Архитектура (ключ API на бэкенде)
+### Б.1 Архитектура
 
 ```
-┌──────────┐       ┌──────────────────┐      ┌─────────────────┐
-│ index    │ POST  │ Cloud Run        │ POST │ Anthropic API   │
-│ app.js   │ ───►  │ /advise          │ ───► │ (Claude Sonnet) │
-│          │       │ (verify_token,   │      │                 │
-│          │ ◄───  │  call Claude,    │ ◄─── │                 │
-│          │       │  store in GCS)   │      │                 │
-└──────────┘       └──────────────────┘      └─────────────────┘
+┌──────────┐       ┌──────────────────┐      ┌─────────────────────────┐
+│ index    │ POST  │ Cloud Run        │ POST │ Anthropic  / OpenAI /   │
+│ app.js   │ ───►  │ /advise          │ ───► │ Deepseek (по конфигу)   │
+│          │       │ - verify token   │      │                         │
+│          │ ◄───  │ - load llm cfg   │ ◄─── │                         │
+│          │       │ - call provider  │      │                         │
+│          │       │ - store in GCS   │      │                         │
+└──────────┘       └──────────────────┘      └─────────────────────────┘
 ```
 
-API-ключ Anthropic — secret в Cloud Run (Secret Manager), фронт его не видит.
+Все три провайдера вызываются с бэкенда. Фронт не видит ключи и не общается с LLM напрямую.
+
+### Б.1.1 Где хранить API-токен — обсуждение
+
+Рассмотрел 4 варианта:
+
+| Вариант | Плюсы | Минусы |
+|---|---|---|
+| **Cloud Run env var (Secret Manager)** | Зашифровано в KMS, стандарт GCP | Смена провайдера/ключа требует консоли GCP + redeploy. Один ключ на инстанс. |
+| **Frontend localStorage** | Просто, ключ только у пользователя | Ключ в JS-памяти браузера → доступен расширениям и XSS. Уходит в каждый запрос на бэк (или фронт сам звонит в LLM, что светит ключ ещё и в Network tab). |
+| **GCS приватный объект** ✅ | Bucket уже приватный (только Cloud Run SA читает). Смена провайдера в UI без redeploy. Версионирование как у плана. | Ключ лежит в plain в GCS (но bucket недоступен публично; доступ только у твоего SA). |
+| **Frontend → backend → Secret Manager** | Максимально безопасно | Требует прав на Secret Manager у Cloud Run + сложный код смены секрета через API. Излишне для single-user-app. |
+
+**Рекомендация: вариант 3 — GCS приватный объект, с маскированием на фронте.**
+
+Логика:
+- Bucket `running-tracker-aabramov77` уже доступен **только** Cloud Run service account
+- Пользователь вводит ключ один раз в UI «Настройки», фронт POSTит на бэк → бэк пишет в GCS
+- При чтении бэк возвращает фронту **только маску** (`sk-ant-***abc1`), сам ключ остаётся в облаке
+- Версионируем по правилу CLAUDE.md: `config/llm/v{N}/config.json` + `config/llm/manifest.json`
+
+**Альтернатива:** если хочется максимальной безопасности — вариант 1 (Secret Manager). Но тогда поддержка трёх провайдеров требует хранить 3 секрета (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) и переключать активный по env-флагу `LLM_PROVIDER`. UI выбора провайдера в приложении не получится — только через GCP.
+
+### Б.1.2 Структура конфига в GCS
+
+`config/llm/v{N}/config.json` (иммутабельный):
+```json
+{
+  "version": N,
+  "is_current": true,
+  "created_at": "ISO-8601",
+  "created_by": "aabramov77",
+  "provider": "anthropic",          // "anthropic" | "openai" | "deepseek"
+  "model": "claude-sonnet-4-5",     // зависит от provider
+  "api_key": "sk-ant-api03-...",    // полный ключ (только в GCS, не возвращается фронту)
+  "supersedes_version": N-1
+}
+```
+
+`config/llm/manifest.json` (перезаписывается при апдейте):
+```json
+{
+  "current_version": N,
+  "gcs_object_path": "config/llm/v{N}/config.json",
+  "updated_at": "..."
+}
+```
+
+### Б.1.3 Эндпоинты конфигурации
+
+| Метод | Путь | Возвращает / принимает |
+|---|---|---|
+| `GET` | `/config/llm` | Текущая конфигурация **с маскированным ключом** (`sk-ant-***abc1`), без сырого ключа |
+| `POST` | `/config/llm` | Сохранить новую конфигурацию: `{provider, model, api_key}` → создаётся новая версия в GCS |
+| `POST` | `/config/llm/test` | Делает короткий «ping»-запрос к LLM текущим ключом → `{ok: true/false, latency_ms, sample_response}` |
+
+### Б.1.4 Абстракция провайдера на бэке
+
+Единый модуль `llm_clients.py`:
+```python
+def call_llm(provider, model, api_key, system_prompt, user_prompt) -> dict:
+    """
+    Возвращает {text, input_tokens, output_tokens, model, provider}.
+    Внутри — три ветки.
+    """
+    if provider == "anthropic":
+        return _call_anthropic(model, api_key, system_prompt, user_prompt)
+    if provider == "openai":
+        return _call_openai(model, api_key, system_prompt, user_prompt)
+    if provider == "deepseek":
+        return _call_deepseek(model, api_key, system_prompt, user_prompt)
+    raise ValueError(f"Unknown provider: {provider}")
+```
+
+Реализации:
+
+| Провайдер | Endpoint | Auth header | Тело запроса | SDK |
+|---|---|---|---|---|
+| Anthropic | `https://api.anthropic.com/v1/messages` | `x-api-key: <key>` + `anthropic-version: 2023-06-01` | `{model, system, messages, max_tokens}` | `anthropic` или httpx |
+| OpenAI | `https://api.openai.com/v1/chat/completions` | `Authorization: Bearer <key>` | `{model, messages, response_format: {type:"json_object"}}` | `openai` или httpx |
+| Deepseek | `https://api.deepseek.com/v1/chat/completions` | `Authorization: Bearer <key>` | как у OpenAI (совместимый формат) | httpx (OpenAI-совместимо) |
+
+Чтобы не тянуть три SDK — можно реализовать всё через `httpx` (один лёгкий HTTP-клиент).
+
+### Б.1.5 UI «Настройки LLM»
+
+Новая модалка или вкладка «⚙ Настройки» с полями:
+
+```
+Провайдер:  [Anthropic ▾]   (выбор из 3)
+Модель:     [claude-sonnet-4-5 ▾]   (опции зависят от провайдера)
+API ключ:   [••••••••abc1]  [Изменить]  (показывает маску из бэка)
+            [Сохранить]  [Проверить ключ]
+```
+
+Дропдаун моделей зависит от провайдера:
+- **Anthropic:** `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-opus-4-5`
+- **OpenAI:** `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`
+- **Deepseek:** `deepseek-chat`, `deepseek-reasoner`
+
+Поле «API ключ» работает так:
+- При входе на страницу — GET `/config/llm` возвращает маску → отображается
+- Кнопка «Изменить» открывает поле для ввода нового ключа
+- «Сохранить» → POST `/config/llm` с новым `{provider, model, api_key}` → бэк создаёт новую версию
+- «Проверить ключ» → POST `/config/llm/test` → показывает «✓ работает (latency 800 мс)» или ошибку
 
 ### Б.2 Что слать в LLM (компактно, но богато)
 
@@ -144,6 +249,9 @@ API-ключ Anthropic — secret в Cloud Run (Secret Manager), фронт ег
 Отвечай строго в JSON: {assessment, adjustments: [{day, change}], warnings: []}
 ```
 
+Один и тот же промпт работает с любым из 3 провайдеров. Парсинг JSON-ответа также общий
+(подстраховка: если LLM вернул текст вокруг JSON, ищем первый `{` и последний `}`).
+
 ## Структура `advice/v{N}/recommendation.json`
 
 ```json
@@ -154,6 +262,8 @@ API-ключ Anthropic — secret в Cloud Run (Secret Manager), фронт ег
   "created_by": "aabramov77",
   "based_on_runs": [run IDs],
   "based_on_plan_version": M,
+  "based_on_llm_config_version": K,
+  "provider": "anthropic",
   "model": "claude-sonnet-4-5",
   "input_tokens": 0,
   "output_tokens": 0,
@@ -173,39 +283,57 @@ API-ключ Anthropic — secret в Cloud Run (Secret Manager), фронт ег
 
 | Файл | Что меняется |
 |---|---|
-| `requirements.txt` | +`anthropic`, +`fitparse` |
-| `main.py` | +парсер FIT (`parse_fit_to_details()`); +хелперы `read_run_details()`, `write_run_details_version()`; +эндпоинты `/runs/upload-fit`, `/runs/{id}/details`, `/advise` (GET+POST); +сбор контекста для LLM (`build_llm_context()`); +константа `ANTHROPIC_API_KEY` из env |
-| `app.js` | +`uploadGarminFit()` (multipart); +`loadRunDetails(id)` для модалки; в `showRunDetail()` — если `details_available` подгружаем laps + рендерим график пульса; +`requestLlmAdvice()`, `renderLlmAdvice()`, `loadLatestAdvice()` |
-| `index.html` | +input FIT-файла рядом с CSV; +кнопка и контейнер в `#tab-adjust`; cache-buster v9 |
-| `style.css` | без изменений (используем существующие `.suggestion`, `.chart-wrap`) |
+| `requirements.txt` | +`httpx`, +`fitparse` (anthropic SDK не нужен — все три провайдера через httpx) |
+| `main.py` | +парсер FIT; +хелперы для деталей пробежки; +хелперы конфига LLM (`read_llm_config()`, `write_llm_config_version()`, `mask_key()`); +модуль `llm_clients` (3 функции `_call_anthropic/openai/deepseek` + диспетчер `call_llm()`); +эндпоинты `/runs/upload-fit`, `/runs/{id}/details`, `/config/llm` (GET/POST), `/config/llm/test` (POST), `/advise` (GET/POST); +`build_llm_context()` |
+| `app.js` | +`uploadGarminFit()` (multipart); +`loadRunDetails(id)` для модалки; в `showRunDetail()` — рендер lap-деталей + график; +`requestLlmAdvice()`, `renderLlmAdvice()`, `loadLatestAdvice()`; +`openLlmSettings()`, `saveLlmConfig()`, `testLlmKey()` |
+| `index.html` | +input FIT-файла рядом с CSV; +кнопка ИИ в `#tab-adjust`; +модалка/таб «⚙ Настройки» с формой провайдер/модель/ключ; cache-buster v9 |
+| `style.css` | без изменений (используем существующие `.suggestion`, `.chart-wrap`, `.run-detail-overlay`) |
 
-**Ручные шаги в GCP (до деплоя):**
-1. Создать Secret в Secret Manager: `ANTHROPIC_API_KEY`
-2. В Cloud Run UI → Variables & Secrets → Reference secret as env var: `ANTHROPIC_API_KEY`
-3. Передеплоить функцию
+**Ручных шагов в GCP — НЕТ.** Ключ задаётся через UI приложения. Secret Manager не используется.
 
 ---
 
-## Стоимость / Rate limiting
+## Стоимость / Сравнение провайдеров (на ~5K input + 1K output / запрос)
 
-- Claude Sonnet 4.5: ~$3 / 1M input tokens, $15 / 1M output. Один запрос ~3-5K input + 1K output ≈ **$0.03**.
-- Haiku 4.5: ~10× дешевле, но менее качественные советы.
-- Защита от спама: на фронте — кнопка disable на 60 секунд после клика. На бэке — необязательно (один аутентифицированный пользователь).
+| Провайдер / модель | $ за запрос (≈) | Качество тренерских советов | Скорость |
+|---|---|---|---|
+| Claude Sonnet 4.5 | $0.03 | ⭐⭐⭐⭐⭐ | 5-10 сек |
+| Claude Haiku 4.5 | $0.003 | ⭐⭐⭐⭐ | 2-4 сек |
+| GPT-4o | $0.03 | ⭐⭐⭐⭐⭐ | 5-10 сек |
+| GPT-4o-mini | $0.002 | ⭐⭐⭐ | 2-4 сек |
+| Deepseek-chat | $0.001 | ⭐⭐⭐⭐ (часто удивляет) | 3-6 сек |
+| Deepseek-reasoner | $0.005 | ⭐⭐⭐⭐⭐ (chain-of-thought) | 10-20 сек |
+
+Можно стартовать на Deepseek (дёшево + достойно) и при необходимости переключаться без redeploy.
+
+Защита от спама: на фронте — кнопка disable на 60 секунд после клика. На бэке — необязательно (один аутентифицированный пользователь).
 
 ---
 
 ## Открытые вопросы (нужен ответ до реализации)
 
-1. **Модель:** Claude Sonnet 4.5 (качество, ~$0.03/запрос) или Haiku (быстрее, ~$0.003/запрос)?
-2. **Контекст:** сколько последних пробежек слать LLM? Предлагаю **14** (2 недели) + последние 3 забега.
-3. **Регенерация:** автоматически при новой пробежке или только по кнопке? Предлагаю **только по кнопке** (контроль стоимости).
-4. **Применение рекомендаций к плану:** LLM возвращает текстовые советы (фаза 1), или должна
+1. **Где хранить ключ — подтверждение выбора:**
+   - **(A) GCS приватный объект** + UI настроек ✅ рекомендация (удобство, безопасно для single-user)
+   - (B) Secret Manager + env vars — максимальная безопасность, но смена ключа через консоль GCP
+
+2. **UI для настроек:** отдельная модалка с шестерёнкой в header, или новый таб «⚙ Настройки» в навигации?
+
+3. **Стартовый провайдер по умолчанию:** Deepseek (дёшево) или Claude Sonnet (качество)?
+
+4. **Контекст:** сколько последних пробежек слать LLM? Предлагаю **14** (2 недели) + последние 3 забега.
+
+5. **Регенерация:** автоматически при новой пробежке или только по кнопке? Предлагаю **только по кнопке** (контроль стоимости).
+
+6. **Применение рекомендаций к плану:** LLM возвращает текстовые советы (фаза 1), или должна
    выдавать готовые правки для автоматического `POST /plan` (фаза 2 — отдельный шаг)?
-5. **FIT samples:** хранить ли поминутные сэмплы (HR, темп, высота)? Это +50-200KB на тренировку.
+
+7. **FIT samples:** хранить ли поминутные сэмплы (HR, темп, высота)? +50-200KB на тренировку.
    Альтернатива — только laps (минимум).
-6. **Существующие пробежки (без FIT):** оставить как есть (`details_available: false`) или
+
+8. **Существующие пробежки (без FIT):** оставить как есть (`details_available: false`) или
    разрешить апгрейд — отдельная кнопка «Дозагрузить FIT для этой пробежки»?
-7. **График в детали тренировки:** показывать ли HR/pace по времени, если есть samples?
+
+9. **График в детали тренировки:** показывать ли HR/pace по времени, если есть samples?
 
 ---
 
@@ -217,9 +345,13 @@ API-ключ Anthropic — secret в Cloud Run (Secret Manager), фронт ег
 3. CSV-импорт продолжает работать (регрессия)
 4. Старые пробежки (без FIT) открываются как раньше
 
-**Часть Б (LLM):**
-5. Открыть «Корректировка» → видны эвристики + кнопка ИИ
-6. Нажать «🤖 Получить рекомендации ИИ» → loading → 5-10 сек → оценка + корректировки + предупреждения
-7. Перезагрузить страницу → последняя рекомендация подтягивается из GCS без нового вызова LLM
-8. Проверить GCS: `advice/v1/recommendation.json` существует, манифест ссылается на текущую версию
-9. Удалить ключ из Secret Manager → POST /advise → 500 с понятной ошибкой
+**Часть Б (LLM настройки + рекомендации):**
+5. Открыть «⚙ Настройки» → форма пустая (никакой конфиг не задан)
+6. Выбрать провайдера Deepseek, ввести ключ, выбрать модель `deepseek-chat`, нажать «Сохранить» → в GCS появляется `config/llm/v1/config.json`
+7. Нажать «Проверить ключ» → запрос проходит, видим «✓ работает, latency 1.2с»
+8. Открыть «Корректировка» → видны эвристики + кнопка ИИ
+9. Нажать «🤖 Получить рекомендации ИИ» → loading → ответ от Deepseek
+10. Переключить провайдера на Anthropic с новым ключом, сохранить → создаётся `config/llm/v2/config.json`, manifest обновляется
+11. Снова запросить рекомендации → теперь идёт в Anthropic, в `advice/v{N+1}/recommendation.json` поле `provider="anthropic"`
+12. Ввести заведомо невалидный ключ → «Проверить ключ» → понятная ошибка `401 Unauthorized from provider`
+13. Удалить конфиг (или ввести пустой ключ) → POST /advise → 400 `LLM config not set`
