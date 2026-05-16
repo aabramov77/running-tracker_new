@@ -712,6 +712,9 @@ def runs_api(request):
             except Exception as e:
                 return (json.dumps({"error": f"FIT parse failed: {str(e)[:300]}"}), 400, headers)
 
+            if not parsed.get("summary", {}).get("dist_km"):
+                return (json.dumps({"error": "FIT file has no session/distance data — not a valid activity?"}), 400, headers)
+
             type_ = request.form.get("type", "easy")
             feel = request.form.get("feel", "good")
             notes = request.form.get("notes", "")
