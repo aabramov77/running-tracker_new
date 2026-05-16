@@ -135,12 +135,18 @@
       <!-- Импорт из Garmin -->
       <div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">
-          📁 Загрузить из Garmin (.csv)
+          📁 Загрузить .csv (только summary)
           <input type="file" id="garmin-file" accept=".csv"
                  onchange="importGarminCSV(this.files[0])" style="display:none">
         </label>
+        <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:var(--c-accent-light);color:var(--c-accent-dark)">
+          🏃 Загрузить .fit (с лапами)
+          <input type="file" id="garmin-fit-file" accept=".fit"
+                 onchange="uploadGarminFit(this.files[0])" style="display:none">
+        </label>
         <span id="garmin-msg" style="font-size:12px;display:none"></span>
       </div>
+      <p class="hint" style="margin-bottom:14px">FIT-загрузка сохраняет полные данные (лапы, пульс по времени) — поля формы заполняются и пробежка сразу попадает в журнал.</p>
       <div class="form-grid">
         <div class="form-group">
           <label>Дата</label>
@@ -316,6 +322,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=9"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>
