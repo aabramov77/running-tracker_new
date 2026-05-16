@@ -478,6 +478,42 @@ def current_plan_week_idx():
     return max(0, min(12, diff))
 
 
+def compute_hr_drift(details):
+    """Возвращает рост среднего пульса от первой половины тренировки ко второй, в %.
+    + значит пульс рос (норма для длительной, риск при коротких).
+    Использует samples; fallback — laps. None если данных мало.
+    """
+    samples = details.get("samples", {}) or {}
+    hrs = [h for h in (samples.get("hr") or []) if h]
+    if len(hrs) >= 4:
+        mid = len(hrs) // 2
+        avg1 = sum(hrs[:mid]) / mid
+        avg2 = sum(hrs[mid:]) / (len(hrs) - mid)
+        if avg1 > 0:
+            return round((avg2 - avg1) / avg1 * 100, 1)
+    # Fallback — лапы
+    laps = details.get("laps", []) or []
+    hr_laps = [l.get("avg_hr") for l in laps if l.get("avg_hr")]
+    if len(hr_laps) >= 4:
+        mid = len(hr_laps) // 2
+        avg1 = sum(hr_laps[:mid]) / mid
+        avg2 = sum(hr_laps[mid:]) / (len(hr_laps) - mid)
+        if avg1 > 0:
+            return round((avg2 - avg1) / avg1 * 100, 1)
+    return None
+
+
+def lap_paces_str(details, limit=15):
+    """Возвращает строку темпов по лапам через запятую (ограничиваем количество)."""
+    laps = details.get("laps", []) or []
+    paces = [l.get("pace") for l in laps if l.get("pace")]
+    if not paces:
+        return None
+    if len(paces) > limit:
+        return ", ".join(paces[:limit]) + f" … (+{len(paces) - limit})"
+    return ", ".join(paces)
+
+
 def build_llm_context(bucket):
     """Собирает компактный богатый контекст для LLM."""
     # Runs
@@ -486,6 +522,17 @@ def build_llm_context(bucket):
     active_runs = [r for r in all_runs if not r.get("deleted", False)]
     active_runs.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_runs = active_runs[:14]
+
+    # Для пробежек с FIT-данными подгружаем детали (лапы + HR-drift)
+    for r in last_runs:
+        if r.get("details_available"):
+            try:
+                details = read_run_details(bucket, r["id"])
+                if details:
+                    r["_lap_paces"] = lap_paces_str(details)
+                    r["_hr_drift_pct"] = compute_hr_drift(details)
+            except Exception:
+                pass
 
     # Races
     races_blob = bucket.blob(RACES_OBJECT)
@@ -563,9 +610,18 @@ def format_context_for_llm(ctx):
         parts = [r.get("date", "?"), t, f"{r.get('dist', '?')}км"]
         if r.get("time"): parts.append(r["time"])
         if r.get("pace"): parts.append(f"темп {r['pace']}/км")
-        if r.get("hr"): parts.append(f"пульс {r['hr']}")
+        if r.get("hr"): parts.append(f"пульс ср.{r['hr']}")
+        if r.get("max_hr"): parts.append(f"макс {r['max_hr']}")
+        if r.get("avg_cadence"): parts.append(f"каденс {r['avg_cadence']}")
+        if r.get("total_ascent_m"): parts.append(f"набор {r['total_ascent_m']}м")
         if feel: parts.append(f"ощ:{feel}")
         line = "  - " + " ".join(parts)
+        if r.get("_lap_paces"):
+            line += f"\n    лапы: {r['_lap_paces']}"
+        if r.get("_hr_drift_pct") is not None:
+            d = r["_hr_drift_pct"]
+            sign = "+" if d >= 0 else ""
+            line += f"\n    HR-drift: {sign}{d}% (изменение среднего пульса 1-я→2-я половина)"
         if r.get("notes"):
             line += f"\n    заметки: {r['notes']}"
         lines.append(line)
