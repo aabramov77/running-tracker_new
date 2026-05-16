@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import re
 import httpx
@@ -7,6 +8,7 @@ from google.cloud import storage
 from datetime import datetime
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from fitparse import FitFile
 
 CLIENT_ID = "463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
 ALLOWED_EMAIL = "aabramov77@gmail.com"
@@ -82,6 +84,163 @@ def write_races(races):
         json.dumps(races, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
+
+
+# ── FIT parsing + run details helpers ────────────────────────────────────────
+
+def _fmt_pace(sec_per_km):
+    if not sec_per_km or sec_per_km <= 0:
+        return None
+    return f"{int(sec_per_km) // 60}:{int(sec_per_km) % 60:02d}"
+
+
+def _fmt_duration(sec):
+    if not sec or sec <= 0:
+        return None
+    sec = int(sec)
+    if sec >= 3600:
+        return f"{sec // 3600}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def parse_fit_file(fit_bytes):
+    """Парсит FIT и возвращает {date, summary, laps, samples}."""
+    fit = FitFile(io.BytesIO(fit_bytes))
+    session = None
+    laps = []
+    records = []
+    for msg in fit.get_messages():
+        name = msg.name
+        if name == "session" and session is None:
+            session = {f.name: f.value for f in msg}
+        elif name == "lap":
+            laps.append({f.name: f.value for f in msg})
+        elif name == "record":
+            records.append({f.name: f.value for f in msg})
+
+    summary = {}
+    if session:
+        dist_m = session.get("total_distance") or 0
+        dur_sec = session.get("total_elapsed_time") or 0
+        summary = {
+            "dist_km": round(dist_m / 1000, 2) if dist_m else 0,
+            "duration_sec": int(dur_sec) if dur_sec else 0,
+            "avg_hr": session.get("avg_heart_rate"),
+            "max_hr": session.get("max_heart_rate"),
+            "avg_cadence": session.get("avg_running_cadence") or session.get("avg_cadence"),
+            "total_ascent_m": session.get("total_ascent"),
+            "total_descent_m": session.get("total_descent"),
+            "calories": session.get("total_calories"),
+            "avg_power_w": session.get("avg_power"),
+            "max_power_w": session.get("max_power"),
+        }
+        if summary["duration_sec"] and summary["dist_km"]:
+            summary["avg_pace_sec_per_km"] = int(summary["duration_sec"] / summary["dist_km"])
+
+    lap_list = []
+    for i, lap in enumerate(laps, 1):
+        dist_m = lap.get("total_distance") or 0
+        dur_sec = lap.get("total_elapsed_time") or 0
+        dist_km = round(dist_m / 1000, 3) if dist_m else 0
+        pace_sec = int(dur_sec / dist_km) if (dist_km and dur_sec) else None
+        lap_list.append({
+            "lap": i,
+            "dist_km": dist_km,
+            "duration_sec": round(dur_sec, 1) if dur_sec else 0,
+            "pace": _fmt_pace(pace_sec),
+            "avg_hr": lap.get("avg_heart_rate"),
+            "max_hr": lap.get("max_heart_rate"),
+            "cadence": lap.get("avg_running_cadence") or lap.get("avg_cadence"),
+            "ascent_m": lap.get("total_ascent"),
+        })
+
+    samples = {"t_offset_sec": [], "hr": [], "pace_sec_per_km": [], "altitude_m": []}
+    if records:
+        first_ts = next((r.get("timestamp") for r in records if r.get("timestamp")), None)
+        if first_ts:
+            last_kept = -5.0
+            for r in records:
+                ts = r.get("timestamp")
+                if ts is None:
+                    continue
+                t_offset = (ts - first_ts).total_seconds()
+                if t_offset < last_kept + 5:
+                    continue
+                last_kept = t_offset
+                samples["t_offset_sec"].append(int(t_offset))
+                samples["hr"].append(r.get("heart_rate"))
+                speed = r.get("enhanced_speed") or r.get("speed")  # м/с
+                if speed and speed > 0.1:
+                    samples["pace_sec_per_km"].append(int(1000 / speed))
+                else:
+                    samples["pace_sec_per_km"].append(None)
+                alt = r.get("enhanced_altitude") or r.get("altitude")
+                samples["altitude_m"].append(round(alt, 1) if alt is not None else None)
+
+    # Дата активности
+    start = None
+    if session and session.get("start_time"):
+        start = session["start_time"]
+    elif records:
+        start = next((r.get("timestamp") for r in records if r.get("timestamp")), None)
+    date_str = start.date().isoformat() if start and hasattr(start, "date") else None
+
+    return {
+        "date": date_str,
+        "summary": summary,
+        "laps": lap_list,
+        "samples": samples,
+    }
+
+
+def write_run_with_fit(bucket, run_id, fit_bytes, parsed):
+    """Заливает activity.fit + details.json + manifest.json в runs/{id}/v1/."""
+    now = datetime.utcnow().isoformat() + "Z"
+    fit_path = f"runs/{run_id}/v1/activity.fit"
+    details_path = f"runs/{run_id}/v1/details.json"
+    manifest_path = f"runs/{run_id}/manifest.json"
+
+    # FIT
+    bucket.blob(fit_path).upload_from_string(fit_bytes, content_type="application/octet-stream")
+
+    # details.json
+    details = {
+        "version": 1,
+        "is_current": True,
+        "created_at": now,
+        "source": "garmin_fit",
+        "fit_object_path": fit_path,
+        "date": parsed.get("date"),
+        "summary": parsed.get("summary", {}),
+        "laps": parsed.get("laps", []),
+        "samples": parsed.get("samples", {"t_offset_sec": [], "hr": [], "pace_sec_per_km": [], "altitude_m": []}),
+    }
+    bucket.blob(details_path).upload_from_string(
+        json.dumps(details, ensure_ascii=False, indent=2, default=str),
+        content_type="application/json"
+    )
+
+    # manifest
+    bucket.blob(manifest_path).upload_from_string(
+        json.dumps({
+            "current_version": 1,
+            "gcs_object_path": details_path,
+            "updated_at": now,
+        }, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return details
+
+
+def read_run_details(bucket, run_id):
+    manifest_blob = bucket.blob(f"runs/{run_id}/manifest.json")
+    if not manifest_blob.exists():
+        return None
+    manifest = json.loads(manifest_blob.download_as_text())
+    details_blob = bucket.blob(manifest["gcs_object_path"])
+    if not details_blob.exists():
+        return None
+    return json.loads(details_blob.download_as_text())
 
 
 # ── Plan helpers ──────────────────────────────────────────────────────────────
@@ -540,6 +699,74 @@ def runs_api(request):
     path = request.path.rstrip("/") or "/"
 
     try:
+        # ── /runs/upload-fit ─────────────────────────────────────────────────
+        if path == "/runs/upload-fit":
+            if request.method != "POST":
+                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+            fit_file = request.files.get("fit") if request.files else None
+            if not fit_file:
+                return (json.dumps({"error": "No 'fit' file in multipart upload"}), 400, headers)
+            try:
+                fit_bytes = fit_file.read()
+                parsed = parse_fit_file(fit_bytes)
+            except Exception as e:
+                return (json.dumps({"error": f"FIT parse failed: {str(e)[:300]}"}), 400, headers)
+
+            type_ = request.form.get("type", "easy")
+            feel = request.form.get("feel", "good")
+            notes = request.form.get("notes", "")
+
+            run_id = int(datetime.now().timestamp() * 1000)
+            summary = parsed.get("summary", {})
+
+            client = get_storage_client()
+            bucket = client.bucket(BUCKET_NAME)
+
+            # Сначала пишем FIT/details — если упадёт, не получим осиротевшую запись в runs.json
+            write_run_with_fit(bucket, run_id, fit_bytes, parsed)
+
+            run = {
+                "id": run_id,
+                "date": parsed.get("date"),
+                "dist": summary.get("dist_km"),
+                "type": type_,
+                "time": _fmt_duration(summary.get("duration_sec")),
+                "pace": _fmt_pace(summary.get("avg_pace_sec_per_km")),
+                "hr": summary.get("avg_hr"),
+                "feel": feel,
+                "notes": notes,
+                "deleted": False,
+                "details_available": True,
+                "max_hr": summary.get("max_hr"),
+                "avg_cadence": summary.get("avg_cadence"),
+                "total_ascent_m": summary.get("total_ascent_m"),
+                "calories": summary.get("calories"),
+            }
+
+            all_runs = read_runs()
+            all_runs = [r for r in all_runs if r.get("id") != run_id]
+            all_runs.insert(0, run)
+            write_runs(all_runs)
+
+            return (json.dumps(run, ensure_ascii=False), 201, {
+                **headers, "Content-Type": "application/json"
+            })
+
+        # ── /runs/{id}/details ───────────────────────────────────────────────
+        details_match = re.match(r"^/runs/(\d+)/details$", path)
+        if details_match:
+            if request.method != "GET":
+                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+            run_id = int(details_match.group(1))
+            client = get_storage_client()
+            bucket = client.bucket(BUCKET_NAME)
+            details = read_run_details(bucket, run_id)
+            if not details:
+                return (json.dumps({"error": "Run details not found"}), 404, headers)
+            return (json.dumps(details, ensure_ascii=False, default=str), 200, {
+                **headers, "Content-Type": "application/json"
+            })
+
         # ── /config/llm and /config/llm/test ─────────────────────────────────
         if path == "/config/llm":
             client = get_storage_client()

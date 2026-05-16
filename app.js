@@ -142,6 +142,60 @@ function normalizeHeader(h) {
   return h.split(/\r?\n/)[0].trim().toLowerCase();
 }
 
+async function uploadGarminFit(file) {
+  if (!file) return;
+  const msg = document.getElementById('garmin-msg');
+  const fitInput = document.getElementById('garmin-fit-file');
+  msg.style.cssText = 'font-size:12px;display:inline;color:var(--text-muted)';
+  msg.textContent = '⏳ Парсю FIT и загружаю…';
+
+  const fd = new FormData();
+  fd.append('fit', file);
+  fd.append('type', document.getElementById('f-type').value);
+  fd.append('feel', document.getElementById('f-feel').value);
+  fd.append('notes', document.getElementById('f-notes').value);
+
+  try {
+    const res = await fetch(API_URL + 'runs/upload-fit', {
+      method: 'POST',
+      headers: authHeaders(),  // Content-Type ставит браузер для multipart
+      body: fd,
+    });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({error: 'HTTP ' + res.status}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const run = await res.json();
+
+    // Заполняем форму, чтобы пользователь видел что попало в журнал
+    if (run.date) document.getElementById('f-date').value = run.date;
+    if (run.dist != null) document.getElementById('f-dist').value = run.dist;
+    if (run.time) document.getElementById('f-time').value = run.time;
+    if (run.pace) document.getElementById('f-pace').value = run.pace;
+    if (run.hr != null) document.getElementById('f-hr').value = run.hr;
+
+    const extras = [];
+    if (run.max_hr) extras.push(`пульс макс ${run.max_hr}`);
+    if (run.total_ascent_m) extras.push(`набор ${run.total_ascent_m}м`);
+    if (run.avg_cadence) extras.push(`каденс ${run.avg_cadence}`);
+    if (run.calories) extras.push(`калории ${run.calories}`);
+    if (extras.length && !document.getElementById('f-notes').value) {
+      document.getElementById('f-notes').value = 'Garmin: ' + extras.join(', ');
+    }
+
+    msg.style.color = 'var(--c-accent)';
+    msg.textContent = `✓ Сохранено в журнал: ${run.dist}км, ${run.time}, темп ${run.pace}`;
+
+    await loadRunsFromCloud();
+    fitInput.value = '';
+  } catch (e) {
+    msg.style.color = 'var(--c-danger)';
+    msg.textContent = '⚠ ' + e.message;
+    fitInput.value = '';
+  }
+}
+
 function importGarminCSV(file) {
   if (!file) return;
   const reader = new FileReader();
