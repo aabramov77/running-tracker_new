@@ -88,6 +88,15 @@ def write_races(races):
 
 # ── FIT parsing + run details helpers ────────────────────────────────────────
 
+def _spm(rec):
+    """FIT хранит каденс как cycles/min (одна нога). Возвращаем шаги/мин."""
+    base = rec.get("avg_running_cadence") or rec.get("avg_cadence")
+    if base is None:
+        return None
+    frac = rec.get("avg_fractional_cadence") or 0
+    return int(round((base + frac) * 2))
+
+
 def _fmt_pace(sec_per_km):
     if not sec_per_km or sec_per_km <= 0:
         return None
@@ -127,7 +136,7 @@ def parse_fit_file(fit_bytes):
             "duration_sec": int(dur_sec) if dur_sec else 0,
             "avg_hr": session.get("avg_heart_rate"),
             "max_hr": session.get("max_heart_rate"),
-            "avg_cadence": session.get("avg_running_cadence") or session.get("avg_cadence"),
+            "avg_cadence": _spm(session),
             "total_ascent_m": session.get("total_ascent"),
             "total_descent_m": session.get("total_descent"),
             "calories": session.get("total_calories"),
@@ -150,7 +159,7 @@ def parse_fit_file(fit_bytes):
             "pace": _fmt_pace(pace_sec),
             "avg_hr": lap.get("avg_heart_rate"),
             "max_hr": lap.get("max_heart_rate"),
-            "cadence": lap.get("avg_running_cadence") or lap.get("avg_cadence"),
+            "cadence": _spm(lap),
             "ascent_m": lap.get("total_ascent"),
         })
 

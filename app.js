@@ -168,24 +168,12 @@ async function uploadGarminFit(file) {
     }
     const run = await res.json();
 
-    // Заполняем форму, чтобы пользователь видел что попало в журнал
-    if (run.date) document.getElementById('f-date').value = run.date;
-    if (run.dist != null) document.getElementById('f-dist').value = run.dist;
-    if (run.time) document.getElementById('f-time').value = run.time;
-    if (run.pace) document.getElementById('f-pace').value = run.pace;
-    if (run.hr != null) document.getElementById('f-hr').value = run.hr;
-
-    const extras = [];
-    if (run.max_hr) extras.push(`пульс макс ${run.max_hr}`);
-    if (run.total_ascent_m) extras.push(`набор ${run.total_ascent_m}м`);
-    if (run.avg_cadence) extras.push(`каденс ${run.avg_cadence}`);
-    if (run.calories) extras.push(`калории ${run.calories}`);
-    if (extras.length && !document.getElementById('f-notes').value) {
-      document.getElementById('f-notes').value = 'Garmin: ' + extras.join(', ');
-    }
+    // Пробежка уже сохранена в облако. Форму НЕ заполняем — иначе пользователь
+    // может случайно нажать "Сохранить" и создать дубликат через POST /runs.
+    // Видимая обратная связь — запись в журнале и success-сообщение ниже.
 
     msg.style.color = 'var(--c-accent)';
-    msg.textContent = `✓ Сохранено в журнал: ${run.dist}км, ${run.time}, темп ${run.pace}`;
+    msg.textContent = `✓ Сохранено: ${run.date} · ${run.dist}км · ${run.time} · темп ${run.pace}/км`;
 
     await loadRunsFromCloud();
     fitInput.value = '';
