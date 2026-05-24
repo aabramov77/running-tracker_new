@@ -142,21 +142,20 @@ function normalizeHeader(h) {
   return h.split(/\r?\n/)[0].trim().toLowerCase();
 }
 
-async function uploadGarminFit(file) {
+let _pendingFitToken = null;  // токен запаршеной но не сохранённой FIT-загрузки
+
+async function parseGarminFit(file) {
   if (!file) return;
   const msg = document.getElementById('garmin-msg');
   const fitInput = document.getElementById('garmin-fit-file');
   msg.style.cssText = 'font-size:12px;display:inline;color:var(--text-muted)';
-  msg.textContent = '⏳ Парсю FIT и загружаю…';
+  msg.textContent = '⏳ Парсю FIT...';
 
   const fd = new FormData();
   fd.append('fit', file);
-  fd.append('type', document.getElementById('f-type').value);
-  fd.append('feel', document.getElementById('f-feel').value);
-  fd.append('notes', document.getElementById('f-notes').value);
 
   try {
-    const res = await fetch(API_URL + 'runs/upload-fit', {
+    const res = await fetch(API_URL + 'runs/parse-fit', {
       method: 'POST',
       headers: authHeaders(),  // Content-Type ставит браузер для multipart
       body: fd,
@@ -166,21 +165,33 @@ async function uploadGarminFit(file) {
       const err = await res.json().catch(() => ({error: 'HTTP ' + res.status}));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
-    const run = await res.json();
+    const data = await res.json();
+    _pendingFitToken = data.fit_token;
 
-    // Пробежка уже сохранена в облако. Форму НЕ заполняем — иначе пользователь
-    // может случайно нажать "Сохранить" и создать дубликат через POST /runs.
-    // Видимая обратная связь — запись в журнале и success-сообщение ниже.
+    // Заполняем форму — пользователь проверит и нажмёт "Сохранить пробежку"
+    if (data.date) document.getElementById('f-date').value = data.date;
+    if (data.dist != null) document.getElementById('f-dist').value = data.dist;
+    if (data.time) document.getElementById('f-time').value = data.time;
+    if (data.pace) document.getElementById('f-pace').value = data.pace;
+    if (data.hr != null) document.getElementById('f-hr').value = data.hr;
+
+    const extras = [];
+    if (data.max_hr) extras.push(`пульс макс ${data.max_hr}`);
+    if (data.total_ascent_m) extras.push(`набор ${data.total_ascent_m}м`);
+    if (data.avg_cadence) extras.push(`каденс ${data.avg_cadence}`);
+    if (data.calories) extras.push(`калории ${data.calories}`);
+    if (extras.length && !document.getElementById('f-notes').value) {
+      document.getElementById('f-notes').value = 'Garmin: ' + extras.join(', ');
+    }
 
     msg.style.color = 'var(--c-accent)';
-    msg.textContent = `✓ Сохранено: ${run.date} · ${run.dist}км · ${run.time} · темп ${run.pace}/км`;
-
-    await loadRunsFromCloud();
+    msg.textContent = '✓ FIT распарсен. Проверьте поля и нажмите «Сохранить пробежку».';
     fitInput.value = '';
   } catch (e) {
     msg.style.color = 'var(--c-danger)';
     msg.textContent = '⚠ ' + e.message;
     fitInput.value = '';
+    _pendingFitToken = null;
   }
 }
 
@@ -287,6 +298,8 @@ async function saveRun() {
     feel: document.getElementById('f-feel').value,
     notes: document.getElementById('f-notes').value,
   };
+  if (_pendingFitToken) run.fit_token = _pendingFitToken;
+
   const btn = document.querySelector('#tab-add .btn-primary');
   btn.disabled = true; btn.textContent = 'Сохраняем…';
   try {
@@ -294,11 +307,16 @@ async function saveRun() {
       await apiPost(run);
       await loadRunsFromCloud();
     } else {
+      if (_pendingFitToken) {
+        alert('FIT-данные нельзя сохранить офлайн — нужно подключение к серверу');
+        return;
+      }
       runs.unshift(run);
       localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
       setStatus('⚠ Сохранено локально (нет связи)', 'warn');
       renderAll();
     }
+    _pendingFitToken = null;  // очищаем токен после успешного сохранения
     const msg = document.getElementById('save-msg');
     msg.style.display = 'inline';
     setTimeout(() => msg.style.display = 'none', 2500);

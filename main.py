@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import re
+import secrets as secrets_mod
 import httpx
 import functions_framework
 from google.cloud import storage
@@ -250,6 +251,107 @@ def read_run_details(bucket, run_id):
     if not details_blob.exists():
         return None
     return json.loads(details_blob.download_as_text())
+
+
+def cleanup_old_tmp(bucket, max_age_hours=24):
+    """Удаляет объекты под tmp/{token}/* где token-timestamp старше max_age_hours.
+    Это ephemeral temp data (промежуточная стадия парсинга), не business records —
+    удаление допустимо по правилу CLAUDE.md.
+    """
+    cutoff = int(datetime.utcnow().timestamp()) - max_age_hours * 3600
+    deleted = 0
+    for blob in bucket.list_blobs(prefix="tmp/"):
+        parts = blob.name.split("/")
+        if len(parts) < 2:
+            continue
+        token = parts[1]
+        try:
+            ts = int(token.split("-")[0])
+            if ts < cutoff:
+                blob.delete()
+                deleted += 1
+        except (ValueError, IndexError):
+            continue
+    return deleted
+
+
+def write_parsed_fit_to_tmp(bucket, fit_bytes, parsed):
+    """Кладёт FIT и parsed details во временный префикс. Возвращает token."""
+    token = f"{int(datetime.utcnow().timestamp())}-{secrets_mod.token_hex(4)}"
+    bucket.blob(f"tmp/{token}/activity.fit").upload_from_string(
+        fit_bytes, content_type="application/octet-stream"
+    )
+    details_payload = {
+        "source": "garmin_fit",
+        "date": parsed.get("date"),
+        "summary": parsed.get("summary", {}),
+        "laps": parsed.get("laps", []),
+        "samples": parsed.get("samples", {"t_offset_sec": [], "hr": [], "pace_sec_per_km": [], "altitude_m": []}),
+    }
+    bucket.blob(f"tmp/{token}/details.json").upload_from_string(
+        json.dumps(details_payload, ensure_ascii=False, indent=2, default=str),
+        content_type="application/json"
+    )
+    return token
+
+
+def attach_fit_details_to_run(bucket, run, fit_token):
+    """Переносит tmp/{token}/* → runs/{id}/v1/* и обновляет run dict.
+    Удаление tmp-объектов после копирования — допустимо как ephemeral cleanup.
+    Бизнес-записи (runs/{id}/v1/*) пишутся как иммутабельные версии.
+    """
+    run_id = run["id"]
+    tmp_fit = bucket.blob(f"tmp/{fit_token}/activity.fit")
+    tmp_details = bucket.blob(f"tmp/{fit_token}/details.json")
+    if not tmp_fit.exists() or not tmp_details.exists():
+        raise ValueError(f"FIT token expired or invalid: {fit_token}")
+
+    raw_details = json.loads(tmp_details.download_as_text())
+    summary = raw_details.get("summary", {}) or {}
+
+    now = datetime.utcnow().isoformat() + "Z"
+    fit_path = f"runs/{run_id}/v1/activity.fit"
+    details_path = f"runs/{run_id}/v1/details.json"
+    manifest_path = f"runs/{run_id}/manifest.json"
+
+    # Копируем в постоянное место (rewrite, не overwrite — пути новые)
+    bucket.copy_blob(tmp_fit, bucket, fit_path)
+
+    # Финальный details.json с версионной мета-информацией
+    final_details = {
+        "version": 1,
+        "is_current": True,
+        "created_at": now,
+        "source": "garmin_fit",
+        "fit_object_path": fit_path,
+        "date": raw_details.get("date"),
+        "summary": summary,
+        "laps": raw_details.get("laps", []),
+        "samples": raw_details.get("samples", {}),
+    }
+    bucket.blob(details_path).upload_from_string(
+        json.dumps(final_details, ensure_ascii=False, indent=2, default=str),
+        content_type="application/json"
+    )
+    bucket.blob(manifest_path).upload_from_string(
+        json.dumps({
+            "current_version": 1,
+            "gcs_object_path": details_path,
+            "updated_at": now,
+        }, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+
+    # Удаляем tmp (ephemeral, разрешено)
+    tmp_fit.delete()
+    tmp_details.delete()
+
+    # Обогащаем run dict
+    run["details_available"] = True
+    run["max_hr"] = summary.get("max_hr")
+    run["avg_cadence"] = summary.get("avg_cadence")
+    run["total_ascent_m"] = summary.get("total_ascent_m")
+    run["calories"] = summary.get("calories")
 
 
 # ── Plan helpers ──────────────────────────────────────────────────────────────
@@ -764,8 +866,8 @@ def runs_api(request):
     path = request.path.rstrip("/") or "/"
 
     try:
-        # ── /runs/upload-fit ─────────────────────────────────────────────────
-        if path == "/runs/upload-fit":
+        # ── /runs/parse-fit ──────────────────────────────────────────────────
+        if path == "/runs/parse-fit":
             if request.method != "POST":
                 return (json.dumps({"error": "Method not allowed"}), 405, headers)
             fit_file = request.files.get("fit") if request.files else None
@@ -780,45 +882,30 @@ def runs_api(request):
             if not parsed.get("summary", {}).get("dist_km"):
                 return (json.dumps({"error": "FIT file has no session/distance data — not a valid activity?"}), 400, headers)
 
-            type_ = request.form.get("type", "easy")
-            feel = request.form.get("feel", "good")
-            notes = request.form.get("notes", "")
-
-            run_id = int(datetime.now().timestamp() * 1000)
-            summary = parsed.get("summary", {})
-
             client = get_storage_client()
             bucket = client.bucket(BUCKET_NAME)
 
-            # Сначала пишем FIT/details — если упадёт, не получим осиротевшую запись в runs.json
-            write_run_with_fit(bucket, run_id, fit_bytes, parsed)
+            # Чистим осиротевшие tmp-объекты старше 24ч
+            try:
+                cleanup_old_tmp(bucket, max_age_hours=24)
+            except Exception:
+                pass  # cleanup — best-effort, не блокируем основной поток
 
-            run = {
-                "id": run_id,
+            token = write_parsed_fit_to_tmp(bucket, fit_bytes, parsed)
+            summary = parsed.get("summary", {})
+
+            return (json.dumps({
+                "fit_token": token,
                 "date": parsed.get("date"),
                 "dist": summary.get("dist_km"),
-                "type": type_,
                 "time": _fmt_duration(summary.get("duration_sec")),
                 "pace": _fmt_pace(summary.get("avg_pace_sec_per_km")),
                 "hr": summary.get("avg_hr"),
-                "feel": feel,
-                "notes": notes,
-                "deleted": False,
-                "details_available": True,
                 "max_hr": summary.get("max_hr"),
                 "avg_cadence": summary.get("avg_cadence"),
                 "total_ascent_m": summary.get("total_ascent_m"),
                 "calories": summary.get("calories"),
-            }
-
-            all_runs = read_runs()
-            all_runs = [r for r in all_runs if r.get("id") != run_id]
-            all_runs.insert(0, run)
-            write_runs(all_runs)
-
-            return (json.dumps(run, ensure_ascii=False), 201, {
-                **headers, "Content-Type": "application/json"
-            })
+            }, ensure_ascii=False), 200, {**headers, "Content-Type": "application/json"})
 
         # ── /runs/{id}/details ───────────────────────────────────────────────
         details_match = re.match(r"^/runs/(\d+)/details$", path)
@@ -1084,6 +1171,16 @@ def runs_api(request):
                     "notes": body.get("notes", ""),
                     "deleted": False,
                 }
+
+                # Если пришёл fit_token — переносим tmp-данные и обогащаем run
+                fit_token = body.get("fit_token")
+                if fit_token:
+                    try:
+                        client = get_storage_client()
+                        bucket = client.bucket(BUCKET_NAME)
+                        attach_fit_details_to_run(bucket, run, fit_token)
+                    except Exception as e:
+                        return (json.dumps({"error": f"Failed to attach FIT details: {str(e)[:300]}"}), 400, headers)
 
                 all_runs = read_runs()
                 all_runs = [r for r in all_runs if r.get("id") != run["id"]]
