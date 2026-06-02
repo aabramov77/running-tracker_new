@@ -96,19 +96,20 @@ gcloud iam workload-identity-pools providers create-oidc github-provider \
 # Service account для деплоя
 gcloud iam service-accounts create gh-deployer --project=<project-id>
 
-# Роли SA: деплой Cloud Run + чтение Artifact Registry + запись в GCS (для tmp/cleanup)
-gcloud projects add-iam-policy-binding <project-id> \
-  --member="serviceAccount:gh-deployer@<project-id>.iam.gserviceaccount.com" \
-  --role="roles/run.admin"
-gcloud projects add-iam-policy-binding <project-id> \
-  --member="serviceAccount:gh-deployer@<project-id>.iam.gserviceaccount.com" \
-  --role="roles/iam.serviceAccountUser"
-gcloud projects add-iam-policy-binding <project-id> \
-  --member="serviceAccount:gh-deployer@<project-id>.iam.gserviceaccount.com" \
-  --role="roles/cloudbuild.builds.editor"
-gcloud projects add-iam-policy-binding <project-id> \
-  --member="serviceAccount:gh-deployer@<project-id>.iam.gserviceaccount.com" \
-  --role="roles/storage.objectAdmin"
+# Роли SA — полный набор для `gcloud run deploy --source=.`
+# (триггерит Cloud Build → push в Artifact Registry → deploy Cloud Run)
+for role in \
+  roles/run.admin \
+  roles/iam.serviceAccountUser \
+  roles/cloudbuild.builds.editor \
+  roles/artifactregistry.writer \
+  roles/storage.admin \
+  roles/logging.logWriter \
+; do
+  gcloud projects add-iam-policy-binding <project-id> \
+    --member="serviceAccount:gh-deployer@<project-id>.iam.gserviceaccount.com" \
+    --role="$role"
+done
 
 # Привязка WIF → SA
 gcloud iam service-accounts add-iam-policy-binding \
