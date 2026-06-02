@@ -1,0 +1,62 @@
+name: Deploy Cloud Run
+
+on:
+  push:
+    branches: [Dev, main]
+    paths:
+      - 'main.py'
+      - 'requirements.txt'
+      - '.github/workflows/deploy-cloudrun.yml'
+  workflow_dispatch:  # ручной запуск из UI на случай если нужно передеплоить без изменений
+
+permissions:
+  contents: read
+  id-token: write   # для Workload Identity Federation
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: env
+        name: Resolve target environment
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "service=runs-api"                          >> $GITHUB_OUTPUT
+            echo "bucket=running-tracker-aabramov77"         >> $GITHUB_OUTPUT
+            echo "env=prod"                                  >> $GITHUB_OUTPUT
+          else
+            echo "service=runs-api-dev"                      >> $GITHUB_OUTPUT
+            echo "bucket=running-tracker-aabramov77-dev"     >> $GITHUB_OUTPUT
+            echo "env=dev"                                   >> $GITHUB_OUTPUT
+          fi
+
+      - id: auth
+        name: Auth to GCP via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_PATH }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ steps.env.outputs.service }}" \
+            --source=. \
+            --function=runs_api \
+            --region=europe-west1 \
+            --allow-unauthenticated \
+            --set-env-vars="BUCKET_NAME=${{ steps.env.outputs.bucket }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}"
+
+      - name: Print service URL
+        run: |
+          URL=$(gcloud run services describe "${{ steps.env.outputs.service }}" \
+            --region=europe-west1 \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --format='value(status.url)')
+          echo "🚀 ${{ steps.env.outputs.env }} deployed: $URL"
+          echo "$URL" >> $GITHUB_STEP_SUMMARY

@@ -1,4 +1,16 @@
-const API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
+const PROD_API_URL = 'https://runs-api-463368957110.europe-west1.run.app/';
+const DEV_API_URL  = 'https://runs-api-dev-463368957110.europe-west1.run.app/';
+
+const IS_PROD = (window.location.hostname === 'aabramov77.github.io');
+const API_URL = IS_PROD ? PROD_API_URL : DEV_API_URL;
+
+if (!IS_PROD) {
+  // DEV-бейдж в углу, чтобы случайно не путать с prod
+  const badge = document.createElement('span');
+  badge.textContent = 'DEV';
+  badge.style.cssText = 'position:fixed;top:8px;left:8px;background:var(--c-warn);color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;z-index:300;font-family:DM Mono,monospace';
+  document.addEventListener('DOMContentLoaded', () => document.body.appendChild(badge));
+}
 
 let PLAN = null;
 let planEditMode = false;

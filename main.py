@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import re
 import secrets as secrets_mod
 import httpx
@@ -14,7 +15,7 @@ from fitparse import FitFile
 CLIENT_ID = "463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
 ALLOWED_EMAIL = "aabramov77@gmail.com"
 
-BUCKET_NAME = "running-tracker-aabramov77"
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "running-tracker-aabramov77")
 OBJECT_NAME = "runs.json"
 RACES_OBJECT = "races.json"
 PLAN_MANIFEST = "plan/manifest.json"
