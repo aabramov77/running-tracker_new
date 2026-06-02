@@ -58,6 +58,21 @@ gsutil -m cp -r gs://running-tracker-aabramov77/* gs://running-tracker-aabramov7
 ```
 Достаточно одного раза. Дальше окружения расходятся.
 
+### 0.2a. Выдать runtime SA Cloud Run доступ к dev-бакету
+**Критический шаг — без него API возвращает 500 при попытке записи**, при этом чтение
+тихо отдаёт пустой список (т.к. `read_runs()` ловит отсутствие blob и возвращает `[]`).
+
+Cloud Run использует **default compute SA** (`<project-number>-compute@developer.gserviceaccount.com`)
+в качестве runtime identity. Этой SA нужно явно дать `storage.objectAdmin` на новом бакете:
+
+```bash
+gcloud storage buckets add-iam-policy-binding gs://running-tracker-aabramov77-dev \
+  --member="serviceAccount:<project-number>-compute@developer.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+```
+
+На prod-бакете эта привязка уже исторически есть (когда впервые подняли `runs-api`).
+
 ### 0.3. Создать dev Cloud Run сервис (первый ручной деплой)
 Из того же `main.py`, но с env var `BUCKET_NAME` указывающей на dev-bucket:
 ```bash
