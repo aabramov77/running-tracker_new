@@ -16,3 +16,11 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test fixtures — local activity files (personal GPS data, not committed)
+tests/fixtures/*.fit
+# …except the synthetic, GPS-free fixture used by CI (committed on purpose)
+!tests/fixtures/synthetic_activity.fit
+
+# pytest
+.pytest_cache/

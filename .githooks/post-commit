@@ -1,0 +1,32 @@
+#!/bin/sh
+# Post-commit hook: run the test suite after every commit (non-blocking).
+#
+# Activated per-clone with:
+#     git config core.hooksPath .githooks
+#
+# post-commit runs AFTER the commit object is created, so it cannot (and does
+# not) abort the commit. It only reports pass/fail. Fast pure-function tests.
+
+if command -v python >/dev/null 2>&1; then
+  PY=python
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  echo "[post-commit] python not found — skipping tests"
+  exit 0
+fi
+
+if ! "$PY" -c "import pytest" >/dev/null 2>&1; then
+  echo "[post-commit] pytest not installed — skipping tests"
+  exit 0
+fi
+
+echo "[post-commit] running tests…"
+"$PY" -m pytest -q
+if [ $? -eq 0 ]; then
+  echo "[post-commit] tests passed"
+else
+  echo "[post-commit] tests FAILED — commit was created; fix and commit again"
+fi
+
+exit 0   # never block the workflow; post-commit cannot abort the commit anyway
