@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FIT_FIXTURE
+from conftest import FIT_FIXTURE, SYNTHETIC_FIT
 
 
 # ── Cadence (_spm) ────────────────────────────────────────────────────────────
@@ -122,17 +122,31 @@ def test_format_context_smoke(main_module):
     assert "14.2" in text
 
 
-# ── FIT parsing (needs local fixture; skipped if absent) ──────────────────────
+# ── FIT parsing ───────────────────────────────────────────────────────────────
 
-@pytest.mark.skipif(not FIT_FIXTURE.exists(),
-                    reason="no FIT fixture at tests/fixtures/sample_activity.fit")
-def test_parse_fit_summary_and_cadence(main_module):
-    parsed = main_module.parse_fit_file(FIT_FIXTURE.read_bytes())
+def test_parse_synthetic_fit_summary_and_cadence(main_module):
+    """Runs everywhere (incl. CI) — uses the committed synthetic GPS-free fixture.
+    Guards the cadence regression: per-leg cadence must be doubled to steps/min."""
+    assert SYNTHETIC_FIT.exists(), (
+        "synthetic_activity.fit missing — regenerate via "
+        "python tests/fixtures/make_synthetic_fit.py")
+    parsed = main_module.parse_fit_file(SYNTHETIC_FIT.read_bytes())
     summary = parsed["summary"]
     assert summary["dist_km"] > 0
-    # Cadence fix: real running cadence is ~150-190 spm, not the per-leg ~88.
+    # Cadence fix: running cadence is ~150-190 spm, not the per-leg ~88.
     assert summary["avg_cadence"] is not None and summary["avg_cadence"] > 150
     assert len(parsed["laps"]) > 1
     assert len(parsed["samples"]["t_offset_sec"]) > 0
     # Lap paces formatted as m:ss
     assert all(":" in lap["pace"] for lap in parsed["laps"] if lap.get("pace"))
+
+
+@pytest.mark.skipif(not FIT_FIXTURE.exists(),
+                    reason="no real FIT fixture (local-only, gitignored)")
+def test_parse_real_fit_if_present(main_module):
+    """Extra confidence on a real Garmin export when available locally."""
+    parsed = main_module.parse_fit_file(FIT_FIXTURE.read_bytes())
+    summary = parsed["summary"]
+    assert summary["dist_km"] > 0
+    assert summary["avg_cadence"] is not None and summary["avg_cadence"] > 150
+    assert len(parsed["laps"]) > 1
