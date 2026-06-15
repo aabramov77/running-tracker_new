@@ -16,3 +16,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test fixtures — local activity files (personal GPS data, not committed)
+tests/fixtures/*.fit
+
+# pytest
+.pytest_cache/
