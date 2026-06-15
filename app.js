@@ -592,11 +592,139 @@ function showRunDetail(id) {
     .join('');
   document.getElementById('rd-delete-btn').onclick = () => { closeRunDetail(); deleteRun(id); };
   document.getElementById('run-detail-overlay').classList.add('active');
+
+  // Графики из FIT-данных (если есть)
+  destroyDetailCharts();
+  const chartsEl = document.getElementById('rd-charts');
+  if (run.details_available) {
+    chartsEl.innerHTML = '<div class="empty" style="padding:1rem">⏳ Загружаю детали тренировки…</div>';
+    loadRunDetailCharts(id);
+  } else {
+    chartsEl.innerHTML = '';
+  }
+}
+
+let detailCharts = [];
+function destroyDetailCharts() {
+  detailCharts.forEach(c => { try { c.destroy(); } catch (e) {} });
+  detailCharts = [];
+}
+
+async function loadRunDetailCharts(id) {
+  const chartsEl = document.getElementById('rd-charts');
+  try {
+    const res = await fetch(`${API_URL}runs/${id}/details`, { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const details = await res.json();
+    // Модалку могли закрыть/переключить пока грузилось
+    if (!document.getElementById('run-detail-overlay').classList.contains('active')) return;
+    renderDetailCharts(details);
+  } catch (e) {
+    chartsEl.innerHTML = `<div class="empty" style="padding:1rem;color:var(--c-danger)">⚠ Не удалось загрузить детали: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// Прореживание параллельных массивов до maxPoints точек
+function downsample(arrays, maxPoints) {
+  const n = arrays[0].length;
+  if (n <= maxPoints) return arrays;
+  const step = Math.ceil(n / maxPoints);
+  return arrays.map(arr => arr.filter((_, i) => i % step === 0));
+}
+
+function renderDetailCharts(details) {
+  const chartsEl = document.getElementById('rd-charts');
+  const s = details.samples || {};
+  const laps = details.laps || [];
+  const t = s.t_offset_sec || [];
+
+  if (!t.length && !laps.length) {
+    chartsEl.innerHTML = '<div class="empty" style="padding:1rem">Нет детальных данных по этой тренировке</div>';
+    return;
+  }
+
+  let html = '';
+  if (t.length) {
+    html += '<div class="card-title" style="margin-top:18px">Пульс по времени</div><div class="chart-wrap" style="height:160px"><canvas id="rd-hr-chart"></canvas></div>';
+    html += '<div class="card-title" style="margin-top:14px">Темп по времени</div><div class="chart-wrap" style="height:160px"><canvas id="rd-pace-chart"></canvas></div>';
+    if ((s.altitude_m || []).some(v => v != null)) {
+      html += '<div class="card-title" style="margin-top:14px">Высота</div><div class="chart-wrap" style="height:120px"><canvas id="rd-alt-chart"></canvas></div>';
+    }
+  }
+  if (laps.length > 1) {
+    html += '<div class="card-title" style="margin-top:14px">Темп по кругам</div><div class="chart-wrap" style="height:150px"><canvas id="rd-laps-chart"></canvas></div>';
+  }
+  chartsEl.innerHTML = html;
+
+  // Прореживаем сэмплы для лёгкости рендера (до ~200 точек)
+  const [td, hrd, pacd, altd] = downsample(
+    [t, s.hr || [], s.pace_sec_per_km || [], s.altitude_m || []], 200);
+  const timeLabels = td.map(sec => secondsToTime(sec));
+
+  const baseOpts = {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+    elements: { point: { radius: 0 } },
+    scales: { x: { ticks: { font: { size: 9 }, maxTicksLimit: 8 } } },
+  };
+
+  if (t.length) {
+    // Пульс
+    detailCharts.push(new Chart(document.getElementById('rd-hr-chart'), {
+      type: 'line',
+      data: { labels: timeLabels, datasets: [{
+        data: hrd, borderColor: '#A32D2D', backgroundColor: 'rgba(163,45,45,0.08)',
+        borderWidth: 1.5, fill: true, tension: 0.2, spanGaps: true }] },
+      options: { ...baseOpts, scales: { ...baseOpts.scales,
+        y: { beginAtZero: false, ticks: { font: { size: 10 } } } } },
+    }));
+
+    // Темп (мин/км, ось перевёрнута — быстрее сверху)
+    const paceMin = pacd.map(v => v ? +(v / 60).toFixed(2) : null);
+    detailCharts.push(new Chart(document.getElementById('rd-pace-chart'), {
+      type: 'line',
+      data: { labels: timeLabels, datasets: [{
+        data: paceMin, borderColor: '#185FA5', backgroundColor: 'rgba(24,95,165,0.08)',
+        borderWidth: 1.5, fill: true, tension: 0.2, spanGaps: true }] },
+      options: { ...baseOpts, scales: { ...baseOpts.scales,
+        y: { reverse: true, ticks: { font: { size: 10 }, callback: v => v ? formatPace(v) : '' } } } },
+    }));
+
+    // Высота
+    if ((s.altitude_m || []).some(v => v != null)) {
+      detailCharts.push(new Chart(document.getElementById('rd-alt-chart'), {
+        type: 'line',
+        data: { labels: timeLabels, datasets: [{
+          data: altd, borderColor: '#6b6a65', backgroundColor: 'rgba(107,106,101,0.12)',
+          borderWidth: 1, fill: true, tension: 0.2, spanGaps: true }] },
+        options: { ...baseOpts, scales: { ...baseOpts.scales,
+          y: { ticks: { font: { size: 10 } } } } },
+      }));
+    }
+  }
+
+  // Темп по кругам — столбики
+  if (laps.length > 1) {
+    const lapPaceMin = laps.map(l => {
+      const p = parsePace(l.pace);
+      return p ? +p.toFixed(2) : null;
+    });
+    detailCharts.push(new Chart(document.getElementById('rd-laps-chart'), {
+      type: 'bar',
+      data: { labels: laps.map(l => l.lap), datasets: [{
+        data: lapPaceMin, backgroundColor: '#1D9E75', borderRadius: 3 }] },
+      options: { ...baseOpts, elements: {}, scales: {
+        x: { ticks: { font: { size: 9 } } },
+        y: { reverse: true, ticks: { font: { size: 10 }, callback: v => v ? formatPace(v) : '' } } } },
+    }));
+  }
 }
 
 function closeRunDetail(event) {
   if (event && event.target !== document.getElementById('run-detail-overlay')) return;
   document.getElementById('run-detail-overlay').classList.remove('active');
+  destroyDetailCharts();
 }
 
 let wChart=null,pChart=null;
