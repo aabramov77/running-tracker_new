@@ -31,6 +31,24 @@
   </div>
 </div>
 
+<!-- Экран: заявка на рассмотрении -->
+<div id="pending-screen" class="login-screen">
+  <div class="login-card">
+    <h2>⏳ Заявка на рассмотрении</h2>
+    <p>Ваш доступ ожидает одобрения администратором. Загляните позже.</p>
+    <button class="btn-sm" onclick="signOut()">Выйти</button>
+  </div>
+</div>
+
+<!-- Экран: доступ отклонён -->
+<div id="rejected-screen" class="login-screen">
+  <div class="login-card">
+    <h2>⛔ Доступ отклонён</h2>
+    <p>Администратор отклонил вашу заявку. Если это ошибка — свяжитесь с ним.</p>
+    <button class="btn-sm" onclick="signOut()">Выйти</button>
+  </div>
+</div>
+
 <div class="app">
   <header class="header">
     <div>
@@ -62,6 +80,7 @@
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
     <button class="nav-btn" onclick="showTab('settings',this)">⚙ Настройки</button>
+    <button class="nav-btn" id="nav-users-btn" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
   </nav>
 
   <!-- ПЛАН -->
@@ -237,7 +256,11 @@
 
   <!-- НАСТРОЙКИ -->
   <div id="tab-settings" class="tab">
-    <div class="card">
+    <div class="card" id="llm-settings-note" style="display:none">
+      <div class="card-title">Настройки ИИ</div>
+      <p class="hint">Рекомендации ИИ настроены администратором приложения. Кнопка «Запросить рекомендации» в разделе «Корректировка» работает для всех пользователей.</p>
+    </div>
+    <div class="card" id="llm-settings-card">
       <div class="card-title">Настройки LLM</div>
       <p class="hint">Подключите внешнюю LLM (Anthropic / OpenAI / Deepseek) для рекомендаций по корректировке плана. Ключ хранится в приватном GCS-объекте и не передаётся обратно фронту.</p>
       <div class="form-grid">
@@ -263,6 +286,18 @@
         <button class="btn-sm" onclick="testLlmKey()">Проверить ключ</button>
         <span id="settings-msg" class="save-msg"></span>
       </div>
+    </div>
+  </div>
+
+  <!-- ПОЛЬЗОВАТЕЛИ (только админ) -->
+  <div id="tab-users" class="tab">
+    <div class="card">
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Пользователи</div>
+        <button class="btn-sm" onclick="loadUsers()">↻ Обновить</button>
+      </div>
+      <p class="hint">Новые пользователи попадают в статус «на рассмотрении». Одобрите, чтобы дать доступ.</p>
+      <div id="users-list"><div class="empty">Загрузка…</div></div>
     </div>
   </div>
 
@@ -323,6 +358,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=14"></script>
+<script src="app.js?v=15"></script>
 </body>
 </html>

@@ -15,36 +15,91 @@ if (!IS_PROD) {
 let PLAN = null;
 let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
+let currentRole = null;
+
+// Google sub из JWT — только для namespace кэша (не для безопасности; сервер
+// сам проверяет подпись). Декодируем payload без верификации.
+function jwtSub(token) {
+  try {
+    const p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(decodeURIComponent(escape(atob(p)))).sub || null;
+  } catch (e) { return null; }
+}
+let userSub = idToken ? jwtSub(idToken) : null;
+// Ключ кэша с namespace по пользователю (на общем браузере данные не смешиваются)
+function ck(base) { return userSub ? `${base}__${userSub}` : base; }
 
 function authHeaders(extra = {}) {
   return idToken ? { ...extra, 'Authorization': `Bearer ${idToken}` } : extra;
 }
 
+// ── Экраны доступа ──
+function hideAccessScreens() {
+  ['login-screen', 'pending-screen', 'rejected-screen'].forEach(id =>
+    document.getElementById(id).classList.remove('active'));
+}
+function showAccessScreen(id) {
+  hideAccessScreens();
+  document.getElementById(id).classList.add('active');
+  document.getElementById('signout-btn').style.display = 'none';
+}
+
+function applyRole(role) {
+  const isAdmin = role === 'admin';
+  document.getElementById('nav-users-btn').style.display = isAdmin ? '' : 'none';
+  document.getElementById('llm-settings-card').style.display = isAdmin ? '' : 'none';
+  document.getElementById('llm-settings-note').style.display = isAdmin ? 'none' : '';
+}
+
+// Проверяем статус через /me и решаем что показать
+async function checkAccessAndInit() {
+  try {
+    const res = await fetch(API_URL + 'me', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const me = await res.json();
+    if (me.status === 'approved') {
+      currentRole = me.role;
+      hideAccessScreens();
+      document.getElementById('signout-btn').style.display = 'inline-flex';
+      applyRole(me.role);
+      initApp();
+    } else if (me.status === 'pending') {
+      showAccessScreen('pending-screen');
+    } else {
+      showAccessScreen('rejected-screen');
+    }
+  } catch (e) {
+    handleAuthError();
+  }
+}
+
 function handleCredentialResponse(response) {
   idToken = response.credential;
+  userSub = jwtSub(idToken);
   localStorage.setItem('g_id_token', idToken);
-  document.getElementById('login-screen').classList.remove('active');
-  document.getElementById('signout-btn').style.display = 'inline-flex';
-  initApp();
+  checkAccessAndInit();
 }
 
 function signOut() {
-  idToken = null;
+  idToken = null; userSub = null; currentRole = null;
   localStorage.removeItem('g_id_token');
+  hideAccessScreens();
   document.getElementById('login-screen').classList.add('active');
   document.getElementById('signout-btn').style.display = 'none';
   if (window.google) google.accounts.id.disableAutoSelect();
 }
 
 function handleAuthError() {
-  idToken = null;
+  idToken = null; currentRole = null;
   localStorage.removeItem('g_id_token');
+  hideAccessScreens();
   document.getElementById('login-screen').classList.add('active');
   document.getElementById('signout-btn').style.display = 'none';
 }
 
-let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
-let races = JSON.parse(localStorage.getItem('running_tracker_races') || '[]');
+let runs = JSON.parse(localStorage.getItem(ck('running_tracker_runs')) || '[]');
+let races = JSON.parse(localStorage.getItem(ck('running_tracker_races')) || '[]');
 let isOnline = false;
 
 function escapeHtml(s) {
@@ -103,7 +158,7 @@ function setStatus(msg, type = 'ok') {
 }
 
 async function loadPlan() {
-  const cached = localStorage.getItem('running_tracker_plan');
+  const cached = localStorage.getItem(ck('running_tracker_plan'));
   if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
   try {
     const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
@@ -112,7 +167,7 @@ async function loadPlan() {
     const weeks = await res.json();
     if (weeks?.length && weeks[0]?.w !== undefined) {
       PLAN = weeks;
-      localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
+      localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
       renderPlan();
     } else if (!PLAN) {
       document.getElementById('plan-body').innerHTML =
@@ -267,7 +322,7 @@ async function loadRunsFromCloud() {
     const cloudRuns = await apiGet();
     // API уже возвращает только активные записи (бэкенд фильтрует deleted)
     runs = cloudRuns;
-    localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+    localStorage.setItem(ck('running_tracker_runs'), JSON.stringify(runs));
     isOnline = true;
     setStatus('✓ Синхронизировано с GCS');
     renderAll();
@@ -324,7 +379,7 @@ async function saveRun() {
         return;
       }
       runs.unshift(run);
-      localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+      localStorage.setItem(ck('running_tracker_runs'), JSON.stringify(runs));
       setStatus('⚠ Сохранено локально (нет связи)', 'warn');
       renderAll();
     }
@@ -350,7 +405,7 @@ async function deleteRun(id) {
       // Оффлайн: помечаем локально, синхронизируется при следующем подключении
       runs = runs.map(r => r.id === id ? {...r, deleted: true} : r);
       const activeRuns = runs.filter(r => !r.deleted);
-      localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+      localStorage.setItem(ck('running_tracker_runs'), JSON.stringify(runs));
       runs = activeRuns;
       renderAll();
       setStatus('⚠ Скрыто локально — синхронизируется при подключении', 'warn');
@@ -418,7 +473,7 @@ async function savePlanEdits() {
     });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
+    localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
     const msg = document.getElementById('plan-save-msg');
     msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
@@ -475,7 +530,7 @@ async function loadRacesFromCloud() {
   try {
     const cloudRaces = await apiGetRaces();
     races = cloudRaces;
-    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
     renderRaces();
   } catch (e) {
     races = races.filter(r => !r.deleted);
@@ -506,7 +561,7 @@ async function saveRace() {
   } catch (e) {
     // Офлайн: сохраняем локально
     races.unshift(race);
-    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
     renderRaces();
     const msg = document.getElementById('race-save-msg');
     msg.style.display = 'inline';
@@ -525,7 +580,7 @@ async function deleteRace(id) {
     await loadRacesFromCloud();
   } catch (e) {
     races = races.filter(r => r.id !== id);
-    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
     renderRaces();
   }
 }
@@ -785,6 +840,7 @@ function updateModelOptions() {
 }
 
 async function loadLlmSettings() {
+  if (currentRole !== 'admin') return;  // не-админ не дёргает admin-only /config/llm
   // Дефолтно — anthropic, модели заполняем
   updateModelOptions();
   document.getElementById('s-api-key').value = '';
@@ -949,6 +1005,59 @@ function showTab(name,btn){
   if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
   if(name==='races')renderRaces();
   if(name==='settings')loadLlmSettings();
+  if(name==='users')loadUsers();
+}
+
+// ── Admin: управление пользователями ──
+async function loadUsers() {
+  const el = document.getElementById('users-list');
+  if (currentRole !== 'admin') { el.innerHTML = '<div class="empty">Нет доступа</div>'; return; }
+  el.innerHTML = '<div class="empty">Загрузка…</div>';
+  try {
+    const res = await fetch(API_URL + 'admin/users', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { el.innerHTML = `<div class="empty">Ошибка ${res.status}</div>`; return; }
+    const data = await res.json();
+    renderUsers(data.users || []);
+  } catch (e) {
+    el.innerHTML = '<div class="empty">Ошибка загрузки</div>';
+  }
+}
+
+function renderUsers(users) {
+  const el = document.getElementById('users-list');
+  if (!users.length) { el.innerHTML = '<div class="empty">Пользователей пока нет</div>'; return; }
+  const statusLabel = { pending: '⏳ На рассмотрении', approved: '✅ Одобрен', rejected: '⛔ Отклонён' };
+  const order = { pending: 0, approved: 1, rejected: 2 };
+  users.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+  el.innerHTML = users.map(u => {
+    const sub = escapeHtml(u.sub);
+    const approveBtn = u.status !== 'approved'
+      ? `<button class="btn-sm" onclick="userAction('approve','${sub}')" style="color:var(--c-accent)">Одобрить</button>` : '';
+    const rejectBtn = (u.status !== 'rejected' && u.role !== 'admin')
+      ? `<button class="btn-sm" onclick="userAction('reject','${sub}')" style="color:var(--c-danger)">Отклонить</button>` : '';
+    return `<div class="run-item">
+      <div class="run-info">
+        <div class="run-title">${escapeHtml(u.name || u.email || u.sub)} ${u.role === 'admin' ? '<span class="badge badge-load">админ</span>' : ''}</div>
+        <div class="run-meta">${escapeHtml(u.email || '')} · ${statusLabel[u.status] || escapeHtml(u.status)}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0">${approveBtn}${rejectBtn}</div>
+    </div>`;
+  }).join('');
+}
+
+async function userAction(action, sub) {
+  if (action === 'reject' && !confirm('Отклонить доступ этому пользователю?')) return;
+  try {
+    const res = await fetch(API_URL + 'admin/users/' + action, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ sub }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { alert('Ошибка: ' + res.status); return; }
+    loadUsers();
+  } catch (e) { alert('Ошибка: ' + e.message); }
 }
 
 function renderAll(){renderMetrics();renderLog();renderPlan();}
@@ -967,9 +1076,8 @@ function initApp() {
 // ── Запуск с авторизацией ──
 document.getElementById('login-screen').classList.add('active');
 if (idToken) {
-  document.getElementById('login-screen').classList.remove('active');
-  document.getElementById('signout-btn').style.display = 'inline-flex';
-  initApp();
+  // Токен есть — проверяем статус через /me (approved/pending/rejected)
+  checkAccessAndInit();
 }
 
 // ====================================================
