@@ -67,6 +67,7 @@ def p_plan_ver(sub, v):        return f"{upfx(sub)}plan/v{v}/plan.json"
 def p_advice_manifest(sub):    return f"{upfx(sub)}advice/manifest.json"
 def p_advice_ver(sub, v):      return f"{upfx(sub)}advice/v{v}/recommendation.json"
 def p_advice_usage(sub):       return f"{upfx(sub)}advice/usage.json"
+def p_profile(sub):            return f"{upfx(sub)}profile.json"
 def p_run_manifest(sub, rid):  return f"{upfx(sub)}runs/{rid}/manifest.json"
 def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
 def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
@@ -96,6 +97,29 @@ def write_runs(bucket, sub, runs):
         json.dumps(runs, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
+
+
+# ── Profile helpers (per-user: гонка, цель, старт плана) ──────────────────────
+
+PROFILE_DEFAULT = {"race_name": "", "race_date": "", "target_time": "", "plan_start": ""}
+PROFILE_FIELDS = ("race_name", "race_date", "target_time", "plan_start")
+
+
+def read_profile(bucket, sub):
+    blob = bucket.blob(p_profile(sub))
+    if not blob.exists():
+        return dict(PROFILE_DEFAULT)
+    data = json.loads(blob.download_as_text())
+    return {**PROFILE_DEFAULT, **{k: data.get(k, "") for k in PROFILE_FIELDS}}
+
+
+def write_profile(bucket, sub, profile):
+    clean = {k: (profile.get(k) or "") for k in PROFILE_FIELDS}
+    bucket.blob(p_profile(sub)).upload_from_string(
+        json.dumps(clean, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return clean
 
 
 # ── Races helpers ─────────────────────────────────────────────────────────────
@@ -1001,6 +1025,15 @@ def migrate_legacy_to_user(bucket, sub):
 
     copy_obj(LEGACY_RUNS, p_runs(sub))
     copy_obj(LEGACY_RACES, p_races(sub))
+    # Сид профиля Alexander'а (исторические константы приложения)
+    if bucket.blob(p_profile(sub)).exists():
+        report["skipped"].append(f"{p_profile(sub)} (уже есть)")
+    else:
+        write_profile(bucket, sub, {
+            "race_name": "Полумарафон", "race_date": "2026-08-09",
+            "target_time": "1:40", "plan_start": "2026-05-10",
+        })
+        report["copied"].append(p_profile(sub))
     migrate_versioned(
         LEGACY_PLAN_MANIFEST,
         lambda v: f"plan/v{v}/plan.json", lambda v: p_plan_ver(sub, v),
@@ -1249,6 +1282,16 @@ def runs_api(request):
                     cfg["version"], created_by=user.get("email", "api"))
                 increment_advice_usage(bucket, sub)
                 return jresp({"available": True, **payload}, 201)
+            else:
+                return jresp({"error": "Method not allowed"}, 405)
+
+        # ── /profile — per-user (гонка, цель, старт плана) ────────────────────
+        if path == "/profile":
+            if request.method == "GET":
+                return jresp(read_profile(bucket, sub), 200)
+            elif request.method == "POST":
+                body = request.get_json(silent=True) or {}
+                return jresp(write_profile(bucket, sub, body), 200)
             else:
                 return jresp({"error": "Method not allowed"}, 405)
 

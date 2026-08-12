@@ -37,6 +37,23 @@ def test_runs_namespaced_paths(main_module, fake_bucket):
     assert "runs.json" not in fake_bucket._store   # no global write
 
 
+# ── profile (per-user race config) ────────────────────────────────────────────
+
+def test_profile_defaults_and_roundtrip(main_module, fake_bucket):
+    # no profile yet → defaults (all empty)
+    p = main_module.read_profile(fake_bucket, SUB)
+    assert p == {"race_name": "", "race_date": "", "target_time": "", "plan_start": ""}
+
+    main_module.write_profile(fake_bucket, SUB, {
+        "race_name": "Берлин", "race_date": "2026-09-27",
+        "target_time": "3:30", "plan_start": "2026-06-01", "junk": "ignored"})
+    p2 = main_module.read_profile(fake_bucket, SUB)
+    assert p2["race_name"] == "Берлин" and p2["target_time"] == "3:30"
+    assert "junk" not in p2                       # only known fields kept
+    # isolation
+    assert main_module.read_profile(fake_bucket, SUB2)["race_name"] == ""
+
+
 # ── plan versioning (per-user, immutable versions) ────────────────────────────
 
 def test_plan_versioning(main_module, fake_bucket):

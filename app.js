@@ -16,6 +16,8 @@ let PLAN = null;
 let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
 let currentRole = null;
+let currentUser = {};
+let PROFILE = { race_name: '', race_date: '', target_time: '', plan_start: '' };
 
 // Google sub из JWT — только для namespace кэша (не для безопасности; сервер
 // сам проверяет подпись). Декодируем payload без верификации.
@@ -60,6 +62,7 @@ async function checkAccessAndInit() {
     const me = await res.json();
     if (me.status === 'approved') {
       currentRole = me.role;
+      currentUser = { name: me.name, email: me.email };
       hideAccessScreens();
       document.getElementById('signout-btn').style.display = 'inline-flex';
       applyRole(me.role);
@@ -101,6 +104,66 @@ function handleAuthError() {
 let runs = JSON.parse(localStorage.getItem(ck('running_tracker_runs')) || '[]');
 let races = JSON.parse(localStorage.getItem(ck('running_tracker_races')) || '[]');
 let isOnline = false;
+
+// ── Профиль гонки (per-user) ──
+function planWeeks() { return (PLAN && PLAN.length) ? PLAN.length : 13; }
+function planStartDate() { return PROFILE.plan_start ? new Date(PROFILE.plan_start) : new Date('2026-05-10'); }
+
+function applyProfileToHeader() {
+  document.getElementById('app-title').textContent =
+    PROFILE.race_name || (PROFILE.race_date ? `Забег ${PROFILE.race_date}` : 'Running Tracker');
+  const bits = [];
+  if (PROFILE.target_time) bits.push(`Цель: ${PROFILE.target_time}`);
+  if (PLAN && PLAN.length) bits.push(`план ${PLAN.length} недель`);
+  if (currentUser.name || currentUser.email) bits.push(currentUser.name || currentUser.email);
+  document.getElementById('header-subtitle').textContent = bits.join(' · ');
+}
+
+function fillProfileForm() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+  set('p-race-name', PROFILE.race_name);
+  set('p-race-date', PROFILE.race_date);
+  set('p-target-time', PROFILE.target_time);
+  set('p-plan-start', PROFILE.plan_start);
+}
+
+async function loadProfile() {
+  try {
+    const res = await fetch(API_URL + 'profile', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (res.ok) PROFILE = await res.json();
+  } catch (e) {}
+  applyProfileToHeader();
+  fillProfileForm();
+  renderMetrics();
+}
+
+async function saveProfile() {
+  const body = {
+    race_name: document.getElementById('p-race-name').value.trim(),
+    race_date: document.getElementById('p-race-date').value,
+    target_time: document.getElementById('p-target-time').value.trim(),
+    plan_start: document.getElementById('p-plan-start').value,
+  };
+  const msg = document.getElementById('profile-msg');
+  try {
+    const res = await fetch(API_URL + 'profile', {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    PROFILE = await res.json();
+    applyProfileToHeader();
+    renderMetrics();
+    renderLog();  // week labels зависят от plan_start
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-accent)'; msg.textContent = '✓ Сохранено';
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 2000);
+  } catch (e) {
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)'; msg.textContent = '⚠ ' + e.message;
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 4000);
+  }
+}
 
 function escapeHtml(s) {
   if (s == null) return '';
@@ -170,6 +233,7 @@ async function loadPlan() {
       PLAN = weeks;
       localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
       renderPlan();
+      applyProfileToHeader();  // «план N недель» зависит от длины плана
     } else if (!PLAN) {
       document.getElementById('plan-body').innerHTML =
         '<tr><td colspan="8" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>';
@@ -336,8 +400,8 @@ async function loadRunsFromCloud() {
 }
 
 function getCurrentWeek() {
-  const diff = Math.floor((new Date() - new Date('2026-05-10')) / (7 * 24 * 3600 * 1000));
-  return Math.max(0, Math.min(12, diff));
+  const diff = Math.floor((new Date() - planStartDate()) / (7 * 24 * 3600 * 1000));
+  return Math.max(0, Math.min(planWeeks() - 1, diff));
 }
 function parsePace(s) {
   if (!s) return null;
@@ -349,8 +413,8 @@ function formatPace(v) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 function getWeekLabel(dateStr) {
-  const w = Math.floor((new Date(dateStr) - new Date('2026-05-10')) / (7 * 24 * 3600 * 1000)) + 1;
-  return (w >= 1 && w <= 13) ? `Нед ${w}` : '';
+  const w = Math.floor((new Date(dateStr) - planStartDate()) / (7 * 24 * 3600 * 1000)) + 1;
+  return (w >= 1 && w <= planWeeks()) ? `Нед ${w}` : '';
 }
 
 async function saveRun() {
@@ -545,13 +609,22 @@ function renderMetrics() {
   const paces = activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const bestPace = paces.length ? Math.min(...paces) : null;
   const cw = getCurrentWeek();
+  const n = planWeeks();
   document.getElementById('m-runs').textContent = activeRuns.length;
   document.getElementById('m-km').textContent = totalKm.toFixed(1);
   document.getElementById('m-pace').textContent = bestPace ? formatPace(bestPace) : '—';
-  document.getElementById('m-progress').textContent = Math.round((cw/13)*100)+'%';
-  document.getElementById('m-week').textContent = `неделя ${cw+1} из 13`;
-  const days = Math.ceil((new Date('2026-08-09')-new Date())/(24*3600*1000));
-  document.getElementById('countdown').textContent = days>0 ? days+' дн' : 'Старт!';
+  document.getElementById('m-progress').textContent = Math.round((cw/n)*100)+'%';
+  document.getElementById('m-week').textContent = `неделя ${Math.min(cw+1, n)} из ${n}`;
+  // Обратный отсчёт — только если задана дата гонки в профиле
+  const block = document.getElementById('countdown-block');
+  const rd = PROFILE.race_date ? new Date(PROFILE.race_date) : null;
+  if (rd && !isNaN(rd)) {
+    const days = Math.ceil((rd - new Date())/(24*3600*1000));
+    document.getElementById('countdown').textContent = days>0 ? days+' дн' : 'Старт!';
+    block.style.display = '';
+  } else {
+    block.style.display = 'none';
+  }
 }
 
 function renderLog() {
@@ -840,11 +913,13 @@ function closeRunDetail(event) {
 let wChart=null,pChart=null;
 function renderCharts() {
   const activeRuns = runs.filter(r => !r.deleted);
+  const n = planWeeks();
+  const start = planStartDate();
   const weekKm={};
-  activeRuns.forEach(r=>{const w=Math.floor((new Date(r.date)-new Date('2026-05-10'))/(7*24*3600*1000))+1;if(w>=1&&w<=13)weekKm[w]=(weekKm[w]||0)+r.dist;});
+  activeRuns.forEach(r=>{const w=Math.floor((new Date(r.date)-start)/(7*24*3600*1000))+1;if(w>=1&&w<=n)weekKm[w]=(weekKm[w]||0)+r.dist;});
   const sortedRuns=[...activeRuns].sort((a,b)=>a.date.localeCompare(b.date));
   if(wChart)wChart.destroy();
-  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{type:'bar',data:{labels:Array.from({length:13},(_,i)=>`Нед ${i+1}`),datasets:[{label:'км',data:Array.from({length:13},(_,i)=>+((weekKm[i+1]||0).toFixed(1))),backgroundColor:'#1D9E75',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
+  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{type:'bar',data:{labels:Array.from({length:n},(_,i)=>`Нед ${i+1}`),datasets:[{label:'км',data:Array.from({length:n},(_,i)=>+((weekKm[i+1]||0).toFixed(1))),backgroundColor:'#1D9E75',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
   if(pChart)pChart.destroy();
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>r.date.slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
 }
@@ -1123,6 +1198,7 @@ function initApp() {
   document.getElementById('r-date').value = today;
   renderMetrics();
   renderLog();
+  loadProfile();
   loadPlan();
   loadRunsFromCloud();
   loadRacesFromCloud();

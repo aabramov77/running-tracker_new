@@ -108,6 +108,10 @@ def test_migrate_legacy_copies_and_is_idempotent(main_module, fake_bucket):
     assert fake_bucket.blob("users/admin-sub/races.json").exists()
     assert fake_bucket.blob("users/admin-sub/plan/v1/plan.json").exists()
 
+    # profile seeded with Alexander's historical race constants
+    prof = main_module.read_profile(fake_bucket, "admin-sub")
+    assert prof["race_date"] == "2026-08-09" and prof["target_time"] == "1:40"
+
     # per-user plan manifest points INTO the user namespace (not the legacy path)
     import json
     man = json.loads(fake_bucket.blob("users/admin-sub/plan/manifest.json").download_as_text())
