@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets as secrets_mod
+import time
 import httpx
 import functions_framework
 from google.cloud import storage
@@ -13,14 +14,21 @@ from google.auth.transport import requests as google_requests
 from fitparse import FitFile
 
 CLIENT_ID = "463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
-ALLOWED_EMAIL = "aabramov77@gmail.com"
+
+# Кто получает role=admin при первом логине. Остальные — pending до одобрения.
+ADMIN_EMAILS = {"aabramov77@gmail.com"}
 
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "running-tracker-aabramov77")
-OBJECT_NAME = "runs.json"
-RACES_OBJECT = "races.json"
-PLAN_MANIFEST = "plan/manifest.json"
-LLM_CONFIG_MANIFEST = "config/llm/manifest.json"
-ADVICE_MANIFEST = "advice/manifest.json"
+
+# Глобальные (не per-user) объекты
+USERS_REGISTRY = "users/registry.json"
+LLM_CONFIG_MANIFEST = "config/llm/manifest.json"   # общий ключ LLM (управляет админ)
+
+# Лимиты
+REGISTRY_TTL_SEC = 30       # кэш реестра в памяти тёплого инстанса
+MAX_PENDING = 50            # защита от наполнения реестра неодобренными
+DAILY_ADVISE_LIMIT = 10     # вызовов /advise на пользователя в сутки (общий ключ)
+ADMIN_DAILY_ADVISE_LIMIT = 100
 
 RACE_DATE = "2026-08-09"
 RACE_TARGET_TIME = "1:40"
@@ -48,21 +56,43 @@ def get_storage_client():
     return storage.Client()
 
 
+# ── Per-user path builders (единственная точка построения путей) ──────────────
+# Правило: ни одна data-функция не обращается к bucket без sub. Все пути — через p_*.
+
+def upfx(sub):                 return f"users/{sub}/"
+def p_runs(sub):               return f"{upfx(sub)}runs.json"
+def p_races(sub):              return f"{upfx(sub)}races.json"
+def p_plan_manifest(sub):      return f"{upfx(sub)}plan/manifest.json"
+def p_plan_ver(sub, v):        return f"{upfx(sub)}plan/v{v}/plan.json"
+def p_advice_manifest(sub):    return f"{upfx(sub)}advice/manifest.json"
+def p_advice_ver(sub, v):      return f"{upfx(sub)}advice/v{v}/recommendation.json"
+def p_advice_usage(sub):       return f"{upfx(sub)}advice/usage.json"
+def p_run_manifest(sub, rid):  return f"{upfx(sub)}runs/{rid}/manifest.json"
+def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
+def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
+def p_tmp_fit(sub, token):     return f"tmp/{sub}/{token}/activity.fit"
+def p_tmp_details(sub, token): return f"tmp/{sub}/{token}/details.json"
+
+# Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
+LEGACY_RUNS = "runs.json"
+LEGACY_RACES = "races.json"
+LEGACY_PLAN_MANIFEST = "plan/manifest.json"
+LEGACY_ADVICE_MANIFEST = "advice/manifest.json"
+def legacy_run_manifest(rid): return f"runs/{rid}/manifest.json"
+def legacy_run_fit(rid):      return f"runs/{rid}/v1/activity.fit"
+
+
 # ── Runs helpers ──────────────────────────────────────────────────────────────
 
-def read_runs():
-    client = get_storage_client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(OBJECT_NAME)
+def read_runs(bucket, sub):
+    blob = bucket.blob(p_runs(sub))
     if not blob.exists():
         return []
     return json.loads(blob.download_as_text())
 
 
-def write_runs(runs):
-    client = get_storage_client()
-    bucket = client.bucket(BUCKET_NAME)
-    bucket.blob(OBJECT_NAME).upload_from_string(
+def write_runs(bucket, sub, runs):
+    bucket.blob(p_runs(sub)).upload_from_string(
         json.dumps(runs, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
@@ -70,19 +100,15 @@ def write_runs(runs):
 
 # ── Races helpers ─────────────────────────────────────────────────────────────
 
-def read_races():
-    client = get_storage_client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(RACES_OBJECT)
+def read_races(bucket, sub):
+    blob = bucket.blob(p_races(sub))
     if not blob.exists():
         return []
     return json.loads(blob.download_as_text())
 
 
-def write_races(races):
-    client = get_storage_client()
-    bucket = client.bucket(BUCKET_NAME)
-    bucket.blob(RACES_OBJECT).upload_from_string(
+def write_races(bucket, sub, races):
+    bucket.blob(p_races(sub)).upload_from_string(
         json.dumps(races, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
@@ -204,68 +230,54 @@ def parse_fit_file(fit_bytes):
     }
 
 
-def write_run_with_fit(bucket, run_id, fit_bytes, parsed):
-    """Заливает activity.fit + details.json + manifest.json в runs/{id}/v1/."""
-    now = datetime.utcnow().isoformat() + "Z"
-    fit_path = f"runs/{run_id}/v1/activity.fit"
-    details_path = f"runs/{run_id}/v1/details.json"
-    manifest_path = f"runs/{run_id}/manifest.json"
+def read_run_details(bucket, sub, run_id):
+    """Читает детали пробежки из namespace пользователя.
+    Ленивый fallback: если в per-user namespace деталей нет, но есть legacy
+    (глобальные) — копирует их в namespace и возвращает. Вызывающий обязан
+    заранее убедиться, что run_id принадлежит этому пользователю (есть в его
+    runs.json) — иначе ленивый fallback мог бы утащить чужие данные.
+    """
+    man_blob = bucket.blob(p_run_manifest(sub, run_id))
+    if man_blob.exists():
+        manifest = json.loads(man_blob.download_as_text())
+        details_blob = bucket.blob(manifest["gcs_object_path"])
+        return json.loads(details_blob.download_as_text()) if details_blob.exists() else None
 
-    # FIT
-    bucket.blob(fit_path).upload_from_string(fit_bytes, content_type="application/octet-stream")
+    # Ленивый перенос legacy (только данные Alexander'а до multi-user)
+    legacy_man = bucket.blob(legacy_run_manifest(run_id))
+    if not legacy_man.exists():
+        return None
+    lman = json.loads(legacy_man.download_as_text())
+    legacy_details = bucket.blob(lman["gcs_object_path"])
+    if not legacy_details.exists():
+        return None
 
-    # details.json
-    details = {
-        "version": 1,
-        "is_current": True,
-        "created_at": now,
-        "source": "garmin_fit",
-        "fit_object_path": fit_path,
-        "date": parsed.get("date"),
-        "summary": parsed.get("summary", {}),
-        "laps": parsed.get("laps", []),
-        "samples": parsed.get("samples", {"t_offset_sec": [], "hr": [], "pace_sec_per_km": [], "altitude_m": []}),
-    }
-    bucket.blob(details_path).upload_from_string(
-        json.dumps(details, ensure_ascii=False, indent=2, default=str),
-        content_type="application/json"
-    )
-
-    # manifest
-    bucket.blob(manifest_path).upload_from_string(
+    legacy_fit = bucket.blob(legacy_run_fit(run_id))
+    if legacy_fit.exists():
+        bucket.copy_blob(legacy_fit, bucket, p_run_fit(sub, run_id))
+    bucket.copy_blob(legacy_details, bucket, p_run_details(sub, run_id))
+    bucket.blob(p_run_manifest(sub, run_id)).upload_from_string(
         json.dumps({
             "current_version": 1,
-            "gcs_object_path": details_path,
-            "updated_at": now,
+            "gcs_object_path": p_run_details(sub, run_id),
+            "updated_at": datetime.utcnow().isoformat() + "Z",
         }, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
-    return details
+    return json.loads(bucket.blob(p_run_details(sub, run_id)).download_as_text())
 
 
-def read_run_details(bucket, run_id):
-    manifest_blob = bucket.blob(f"runs/{run_id}/manifest.json")
-    if not manifest_blob.exists():
-        return None
-    manifest = json.loads(manifest_blob.download_as_text())
-    details_blob = bucket.blob(manifest["gcs_object_path"])
-    if not details_blob.exists():
-        return None
-    return json.loads(details_blob.download_as_text())
-
-
-def cleanup_old_tmp(bucket, max_age_hours=24):
-    """Удаляет объекты под tmp/{token}/* где token-timestamp старше max_age_hours.
-    Это ephemeral temp data (промежуточная стадия парсинга), не business records —
-    удаление допустимо по правилу CLAUDE.md.
+def cleanup_old_tmp(bucket, sub, max_age_hours=24):
+    """Удаляет tmp/{sub}/{token}/* старше max_age_hours (ephemeral temp data —
+    удаление допустимо по CLAUDE.md). Ограничено namespace пользователя.
     """
     cutoff = int(datetime.utcnow().timestamp()) - max_age_hours * 3600
     deleted = 0
-    for blob in bucket.list_blobs(prefix="tmp/"):
-        parts = blob.name.split("/")
-        if len(parts) < 2:
+    for blob in bucket.list_blobs(prefix=f"tmp/{sub}/"):
+        parts = blob.name.split("/")   # ["tmp", sub, token, filename]
+        if len(parts) < 3:
             continue
-        token = parts[1]
+        token = parts[2]
         try:
             ts = int(token.split("-")[0])
             if ts < cutoff:
@@ -276,10 +288,10 @@ def cleanup_old_tmp(bucket, max_age_hours=24):
     return deleted
 
 
-def write_parsed_fit_to_tmp(bucket, fit_bytes, parsed):
-    """Кладёт FIT и parsed details во временный префикс. Возвращает token."""
+def write_parsed_fit_to_tmp(bucket, sub, fit_bytes, parsed):
+    """Кладёт FIT и parsed details во временный per-user префикс. Возвращает token."""
     token = f"{int(datetime.utcnow().timestamp())}-{secrets_mod.token_hex(4)}"
-    bucket.blob(f"tmp/{token}/activity.fit").upload_from_string(
+    bucket.blob(p_tmp_fit(sub, token)).upload_from_string(
         fit_bytes, content_type="application/octet-stream"
     )
     details_payload = {
@@ -289,21 +301,20 @@ def write_parsed_fit_to_tmp(bucket, fit_bytes, parsed):
         "laps": parsed.get("laps", []),
         "samples": parsed.get("samples", {"t_offset_sec": [], "hr": [], "pace_sec_per_km": [], "altitude_m": []}),
     }
-    bucket.blob(f"tmp/{token}/details.json").upload_from_string(
+    bucket.blob(p_tmp_details(sub, token)).upload_from_string(
         json.dumps(details_payload, ensure_ascii=False, indent=2, default=str),
         content_type="application/json"
     )
     return token
 
 
-def attach_fit_details_to_run(bucket, run, fit_token):
-    """Переносит tmp/{token}/* → runs/{id}/v1/* и обновляет run dict.
-    Удаление tmp-объектов после копирования — допустимо как ephemeral cleanup.
-    Бизнес-записи (runs/{id}/v1/*) пишутся как иммутабельные версии.
+def attach_fit_details_to_run(bucket, sub, run, fit_token):
+    """Переносит tmp/{sub}/{token}/* → users/{sub}/runs/{id}/v1/* и обновляет run.
+    Бизнес-записи пишутся как иммутабельные версии; tmp — ephemeral cleanup.
     """
     run_id = run["id"]
-    tmp_fit = bucket.blob(f"tmp/{fit_token}/activity.fit")
-    tmp_details = bucket.blob(f"tmp/{fit_token}/details.json")
+    tmp_fit = bucket.blob(p_tmp_fit(sub, fit_token))
+    tmp_details = bucket.blob(p_tmp_details(sub, fit_token))
     if not tmp_fit.exists() or not tmp_details.exists():
         raise ValueError(f"FIT token expired or invalid: {fit_token}")
 
@@ -311,14 +322,11 @@ def attach_fit_details_to_run(bucket, run, fit_token):
     summary = raw_details.get("summary", {}) or {}
 
     now = datetime.utcnow().isoformat() + "Z"
-    fit_path = f"runs/{run_id}/v1/activity.fit"
-    details_path = f"runs/{run_id}/v1/details.json"
-    manifest_path = f"runs/{run_id}/manifest.json"
+    fit_path = p_run_fit(sub, run_id)
+    details_path = p_run_details(sub, run_id)
 
-    # Копируем в постоянное место (rewrite, не overwrite — пути новые)
     bucket.copy_blob(tmp_fit, bucket, fit_path)
 
-    # Финальный details.json с версионной мета-информацией
     final_details = {
         "version": 1,
         "is_current": True,
@@ -334,7 +342,7 @@ def attach_fit_details_to_run(bucket, run, fit_token):
         json.dumps(final_details, ensure_ascii=False, indent=2, default=str),
         content_type="application/json"
     )
-    bucket.blob(manifest_path).upload_from_string(
+    bucket.blob(p_run_manifest(sub, run_id)).upload_from_string(
         json.dumps({
             "current_version": 1,
             "gcs_object_path": details_path,
@@ -343,11 +351,9 @@ def attach_fit_details_to_run(bucket, run, fit_token):
         content_type="application/json"
     )
 
-    # Удаляем tmp (ephemeral, разрешено)
     tmp_fit.delete()
     tmp_details.delete()
 
-    # Обогащаем run dict
     run["details_available"] = True
     run["max_hr"] = summary.get("max_hr")
     run["avg_cadence"] = summary.get("avg_cadence")
@@ -357,8 +363,8 @@ def attach_fit_details_to_run(bucket, run, fit_token):
 
 # ── Plan helpers ──────────────────────────────────────────────────────────────
 
-def read_plan_manifest(bucket):
-    blob = bucket.blob(PLAN_MANIFEST)
+def read_plan_manifest(bucket, sub):
+    blob = bucket.blob(p_plan_manifest(sub))
     if not blob.exists():
         return None
     return json.loads(blob.download_as_text())
@@ -371,8 +377,8 @@ def read_plan_version(bucket, object_path):
     return json.loads(blob.download_as_text())
 
 
-def write_plan_version(bucket, version, weeks, change_reason, created_by="api"):
-    object_path = f"plan/v{version}/plan.json"
+def write_plan_version(bucket, sub, version, weeks, change_reason, created_by="api"):
+    object_path = p_plan_ver(sub, version)
     now = datetime.utcnow().isoformat() + "Z"
 
     payload = {
@@ -401,7 +407,7 @@ def write_plan_version(bucket, version, weeks, change_reason, created_by="api"):
         "change_reason": payload["change_reason"],
         "checksum": checksum,
     }
-    bucket.blob(PLAN_MANIFEST).upload_from_string(
+    bucket.blob(p_plan_manifest(sub)).upload_from_string(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
@@ -626,11 +632,10 @@ def lap_paces_str(details, limit=15):
     return ", ".join(paces)
 
 
-def build_llm_context(bucket):
-    """Собирает компактный богатый контекст для LLM."""
+def build_llm_context(bucket, sub):
+    """Собирает компактный богатый контекст для LLM (данные пользователя sub)."""
     # Runs
-    runs_blob = bucket.blob(OBJECT_NAME)
-    all_runs = json.loads(runs_blob.download_as_text()) if runs_blob.exists() else []
+    all_runs = read_runs(bucket, sub)
     active_runs = [r for r in all_runs if not r.get("deleted", False)]
     active_runs.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_runs = active_runs[:14]
@@ -639,7 +644,7 @@ def build_llm_context(bucket):
     for r in last_runs:
         if r.get("details_available"):
             try:
-                details = read_run_details(bucket, r["id"])
+                details = read_run_details(bucket, sub, r["id"])
                 if details:
                     r["_lap_paces"] = lap_paces_str(details)
                     r["_hr_drift_pct"] = compute_hr_drift(details)
@@ -647,14 +652,13 @@ def build_llm_context(bucket):
                 pass
 
     # Races
-    races_blob = bucket.blob(RACES_OBJECT)
-    all_races = json.loads(races_blob.download_as_text()) if races_blob.exists() else []
+    all_races = read_races(bucket, sub)
     active_races = [r for r in all_races if not r.get("deleted", False)]
     active_races.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_races = active_races[:3]
 
     # Plan
-    plan_manifest = read_plan_manifest(bucket)
+    plan_manifest = read_plan_manifest(bucket, sub)
     plan = None
     plan_version = None
     if plan_manifest:
@@ -774,15 +778,15 @@ SYSTEM_PROMPT = """Ты опытный беговой тренер. Анализ
 Отвечай на русском языке."""
 
 
-def read_advice_manifest(bucket):
-    blob = bucket.blob(ADVICE_MANIFEST)
+def read_advice_manifest(bucket, sub):
+    blob = bucket.blob(p_advice_manifest(sub))
     if not blob.exists():
         return None
     return json.loads(blob.download_as_text())
 
 
-def read_latest_advice(bucket):
-    manifest = read_advice_manifest(bucket)
+def read_latest_advice(bucket, sub):
+    manifest = read_advice_manifest(bucket, sub)
     if not manifest:
         return None
     blob = bucket.blob(manifest["gcs_object_path"])
@@ -791,10 +795,31 @@ def read_latest_advice(bucket):
     return json.loads(blob.download_as_text())
 
 
-def write_advice_version(bucket, recommendation, ctx, provider, model, input_tokens, output_tokens, llm_config_version, created_by="aabramov77"):
-    manifest = read_advice_manifest(bucket)
+def read_advice_usage(bucket, sub):
+    """Дневной счётчик вызовов /advise. Сбрасывается при смене даты."""
+    today = datetime.utcnow().date().isoformat()
+    blob = bucket.blob(p_advice_usage(sub))
+    if not blob.exists():
+        return {"date": today, "count": 0}
+    data = json.loads(blob.download_as_text())
+    if data.get("date") != today:
+        return {"date": today, "count": 0}
+    return data
+
+
+def increment_advice_usage(bucket, sub):
+    usage = read_advice_usage(bucket, sub)
+    usage["count"] = usage.get("count", 0) + 1
+    bucket.blob(p_advice_usage(sub)).upload_from_string(
+        json.dumps(usage, ensure_ascii=False), content_type="application/json"
+    )
+    return usage
+
+
+def write_advice_version(bucket, sub, recommendation, ctx, provider, model, input_tokens, output_tokens, llm_config_version, created_by="api"):
+    manifest = read_advice_manifest(bucket, sub)
     next_version = (manifest["current_version"] + 1) if manifest else 1
-    object_path = f"advice/v{next_version}/recommendation.json"
+    object_path = p_advice_ver(sub, next_version)
     now = datetime.utcnow().isoformat() + "Z"
 
     payload = {
@@ -822,27 +847,183 @@ def write_advice_version(bucket, recommendation, ctx, provider, model, input_tok
         "gcs_object_path": object_path,
         "updated_at": now,
     }
-    bucket.blob(ADVICE_MANIFEST).upload_from_string(
+    bucket.blob(p_advice_manifest(sub)).upload_from_string(
         json.dumps(new_manifest, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
     return payload
 
 
+# ── User registry (мульти-пользователь) ──────────────────────────────────────
+
+_registry_cache = {"data": None, "ts": 0.0}
+
+
+def _load_registry(bucket):
+    blob = bucket.blob(USERS_REGISTRY)
+    if not blob.exists():
+        return {"users": {}}
+    data = json.loads(blob.download_as_text())
+    data.setdefault("users", {})
+    return data
+
+
+def read_registry(bucket):
+    """Реестр с in-memory кэшем (TTL). Cloud Run держит инстанс тёплым."""
+    now = time.time()
+    if _registry_cache["data"] is not None and now - _registry_cache["ts"] < REGISTRY_TTL_SEC:
+        return _registry_cache["data"]
+    data = _load_registry(bucket)
+    _registry_cache["data"] = data
+    _registry_cache["ts"] = now
+    return data
+
+
+def write_registry(bucket, registry):
+    bucket.blob(USERS_REGISTRY).upload_from_string(
+        json.dumps(registry, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    _registry_cache["data"] = registry
+    _registry_cache["ts"] = time.time()
+
+
+def append_user_event(bucket, sub, event, actor):
+    """Append-only аудит переходов (register/approve/reject)."""
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+    bucket.blob(f"users/events/{ts}-{sub}-{event}.json").upload_from_string(
+        json.dumps({
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "sub": sub, "event": event, "actor": actor,
+        }, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+
+
+class RegistrationClosed(Exception):
+    """Поднимается, когда лимит pending достигнут — новых не регистрируем."""
+
+
+def resolve_user(bucket, token_info):
+    """Находит/создаёт запись пользователя по Google sub. Возвращает запись реестра.
+    Новый sub → pending (или approved+admin если email в ADMIN_EMAILS).
+    Поднимает RegistrationClosed при переполнении pending.
+    """
+    sub = token_info.get("sub")
+    email = token_info.get("email", "")
+    name = token_info.get("name", "")
+    registry = read_registry(bucket)
+    users = registry.setdefault("users", {})
+
+    if sub in users:
+        return users[sub]
+
+    now = datetime.utcnow().isoformat() + "Z"
+    is_admin = email in ADMIN_EMAILS
+    if not is_admin:
+        pending = sum(1 for u in users.values() if u.get("status") == "pending")
+        if pending >= MAX_PENDING:
+            raise RegistrationClosed()
+
+    rec = {
+        "sub": sub, "email": email, "name": name,
+        "status": "approved" if is_admin else "pending",
+        "role": "admin" if is_admin else "user",
+        "created_at": now, "updated_at": now,
+        "approved_by": sub if is_admin else None,
+    }
+    users[sub] = rec
+    write_registry(bucket, registry)
+    append_user_event(bucket, sub, "register", sub)
+    return rec
+
+
+def set_user_status(bucket, target_sub, status, actor_sub):
+    """Меняет статус пользователя (lifecycle-метаданные). Возвращает запись или None."""
+    registry = read_registry(bucket)
+    users = registry.get("users", {})
+    if target_sub not in users:
+        return None
+    rec = users[target_sub]
+    rec["status"] = status
+    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    if status == "approved":
+        rec["approved_by"] = actor_sub
+    write_registry(bucket, registry)
+    append_user_event(bucket, target_sub, status, actor_sub)
+    return rec
+
+
+# ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────
+
+def migrate_legacy_to_user(bucket, sub):
+    """Копирует глобальные (до multi-user) объекты в namespace админа.
+    Пер-объектная идемпотентность: каждый объект проверяется независимо.
+    FIT-детали (runs/{id}/*) НЕ копируются здесь — переезжают лениво при
+    первом GET /runs/{id}/details (см. read_run_details).
+    """
+    report = {"copied": [], "skipped": [], "errors": []}
+
+    def copy_obj(src, dst):
+        try:
+            src_blob = bucket.blob(src)
+            if not src_blob.exists():
+                report["skipped"].append(f"{src} (нет источника)")
+                return
+            if bucket.blob(dst).exists():
+                report["skipped"].append(f"{dst} (уже есть)")
+                return
+            bucket.copy_blob(src_blob, bucket, dst)
+            report["copied"].append(dst)
+        except Exception as e:
+            report["errors"].append(f"{src}->{dst}: {str(e)[:120]}")
+
+    def migrate_versioned(legacy_manifest_path, ver_src, ver_dst, dst_manifest_path):
+        man_blob = bucket.blob(legacy_manifest_path)
+        if not man_blob.exists():
+            report["skipped"].append(f"{legacy_manifest_path} (нет источника)")
+            return
+        man = json.loads(man_blob.download_as_text())
+        cur = man.get("current_version", 1)
+        for v in range(1, cur + 1):
+            copy_obj(ver_src(v), ver_dst(v))
+        # Манифест не копируем как есть — пишем свежий с per-user gcs_object_path
+        if bucket.blob(dst_manifest_path).exists():
+            report["skipped"].append(f"{dst_manifest_path} (уже есть)")
+        else:
+            new_man = dict(man)
+            new_man["gcs_object_path"] = ver_dst(cur)
+            bucket.blob(dst_manifest_path).upload_from_string(
+                json.dumps(new_man, ensure_ascii=False, indent=2),
+                content_type="application/json"
+            )
+            report["copied"].append(dst_manifest_path)
+
+    copy_obj(LEGACY_RUNS, p_runs(sub))
+    copy_obj(LEGACY_RACES, p_races(sub))
+    migrate_versioned(
+        LEGACY_PLAN_MANIFEST,
+        lambda v: f"plan/v{v}/plan.json", lambda v: p_plan_ver(sub, v),
+        p_plan_manifest(sub))
+    migrate_versioned(
+        LEGACY_ADVICE_MANIFEST,
+        lambda v: f"advice/v{v}/recommendation.json", lambda v: p_advice_ver(sub, v),
+        p_advice_manifest(sub))
+    return report
+
+
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
 def verify_token(request):
+    """Проверяет подпись Google ID-токена. Возвращает info (sub/email/name) или None.
+    Авторизация (кто допущен) решается отдельно через реестр — resolve_user.
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
     token = auth[7:]
     try:
-        info = id_token.verify_oauth2_token(
-            token, google_requests.Request(), CLIENT_ID
-        )
-        if info.get("email") != ALLOWED_EMAIL:
-            return None
-        return info
+        return id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
     except Exception:
         return None
 
@@ -856,46 +1037,92 @@ def runs_api(request):
         "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
     }
+    jhead = {**headers, "Content-Type": "application/json"}
+
+    def jresp(obj, code):
+        return (json.dumps(obj, ensure_ascii=False, default=str), code, jhead)
 
     if request.method == "OPTIONS":
         return ("", 204, headers)
 
-    user = verify_token(request)
-    if not user:
-        return (json.dumps({"error": "Unauthorized"}), 401, headers)
+    token_info = verify_token(request)
+    if not token_info:
+        return jresp({"error": "Unauthorized"}, 401)
+
+    client = get_storage_client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    try:
+        user = resolve_user(bucket, token_info)
+    except RegistrationClosed:
+        return jresp({"error": "registration_closed"}, 403)
+    sub = user["sub"]
+    is_admin = user["role"] == "admin"
 
     path = request.path.rstrip("/") or "/"
 
+    # /me — доступен любому валидному токену (даже pending/rejected)
+    if path == "/me":
+        return jresp({"status": user["status"], "role": user["role"],
+                      "email": user.get("email"), "name": user.get("name")}, 200)
+
+    # Не одобрен → 403 на всё остальное
+    if user["status"] != "approved":
+        return jresp({
+            "error": "pending_approval" if user["status"] == "pending" else "rejected",
+            "status": user["status"],
+        }, 403)
+
     try:
+        # ── admin эндпоинты ──────────────────────────────────────────────────
+        if path.startswith("/admin/"):
+            if not is_admin:
+                return jresp({"error": "forbidden"}, 403)
+
+            if path == "/admin/users" and request.method == "GET":
+                reg = read_registry(bucket)
+                return jresp({"users": list(reg.get("users", {}).values())}, 200)
+
+            if path in ("/admin/users/approve", "/admin/users/reject") and request.method == "POST":
+                body = request.get_json(silent=True) or {}
+                target = body.get("sub")
+                if not target:
+                    return jresp({"error": "Missing sub"}, 400)
+                status = "approved" if path.endswith("approve") else "rejected"
+                rec = set_user_status(bucket, target, status, sub)
+                if not rec:
+                    return jresp({"error": "user not found"}, 404)
+                return jresp({"ok": True, "user": rec}, 200)
+
+            if path == "/admin/migrate-legacy" and request.method == "POST":
+                return jresp(migrate_legacy_to_user(bucket, sub), 200)
+
+            return jresp({"error": "Not found"}, 404)
+
         # ── /runs/parse-fit ──────────────────────────────────────────────────
         if path == "/runs/parse-fit":
             if request.method != "POST":
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
             fit_file = request.files.get("fit") if request.files else None
             if not fit_file:
-                return (json.dumps({"error": "No 'fit' file in multipart upload"}), 400, headers)
+                return jresp({"error": "No 'fit' file in multipart upload"}, 400)
             try:
                 fit_bytes = fit_file.read()
                 parsed = parse_fit_file(fit_bytes)
             except Exception as e:
-                return (json.dumps({"error": f"FIT parse failed: {str(e)[:300]}"}), 400, headers)
+                return jresp({"error": f"FIT parse failed: {str(e)[:300]}"}, 400)
 
             if not parsed.get("summary", {}).get("dist_km"):
-                return (json.dumps({"error": "FIT file has no session/distance data — not a valid activity?"}), 400, headers)
+                return jresp({"error": "FIT file has no session/distance data — not a valid activity?"}, 400)
 
-            client = get_storage_client()
-            bucket = client.bucket(BUCKET_NAME)
-
-            # Чистим осиротевшие tmp-объекты старше 24ч
             try:
-                cleanup_old_tmp(bucket, max_age_hours=24)
+                cleanup_old_tmp(bucket, sub, max_age_hours=24)
             except Exception:
-                pass  # cleanup — best-effort, не блокируем основной поток
+                pass  # best-effort
 
-            token = write_parsed_fit_to_tmp(bucket, fit_bytes, parsed)
+            token = write_parsed_fit_to_tmp(bucket, sub, fit_bytes, parsed)
             summary = parsed.get("summary", {})
-
-            return (json.dumps({
+            return jresp({
                 "fit_token": token,
                 "date": parsed.get("date"),
                 "dist": summary.get("dist_km"),
@@ -906,68 +1133,64 @@ def runs_api(request):
                 "avg_cadence": summary.get("avg_cadence"),
                 "total_ascent_m": summary.get("total_ascent_m"),
                 "calories": summary.get("calories"),
-            }, ensure_ascii=False), 200, {**headers, "Content-Type": "application/json"})
+            }, 200)
 
         # ── /runs/{id}/details ───────────────────────────────────────────────
         details_match = re.match(r"^/runs/(\d+)/details$", path)
         if details_match:
             if request.method != "GET":
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
             run_id = int(details_match.group(1))
-            client = get_storage_client()
-            bucket = client.bucket(BUCKET_NAME)
-            details = read_run_details(bucket, run_id)
+            # Ownership: run_id должен быть в runs.json пользователя (иначе ленивый
+            # fallback мог бы утащить чужие/legacy данные в чужой namespace).
+            own_ids = {r.get("id") for r in read_runs(bucket, sub)}
+            if run_id not in own_ids:
+                return jresp({"error": "Run details not found"}, 404)
+            details = read_run_details(bucket, sub, run_id)
             if not details:
-                return (json.dumps({"error": "Run details not found"}), 404, headers)
-            return (json.dumps(details, ensure_ascii=False, default=str), 200, {
-                **headers, "Content-Type": "application/json"
-            })
+                return jresp({"error": "Run details not found"}, 404)
+            return jresp(details, 200)
 
-        # ── /config/llm and /config/llm/test ─────────────────────────────────
+        # ── /config/llm — только админ (общий ключ) ──────────────────────────
         if path == "/config/llm":
-            client = get_storage_client()
-            bucket = client.bucket(BUCKET_NAME)
+            if not is_admin:
+                return jresp({"error": "forbidden"}, 403)
             if request.method == "GET":
                 cfg = read_llm_config_full(bucket)
                 if not cfg:
-                    return (json.dumps({"configured": False}, ensure_ascii=False), 200, {
-                        **headers, "Content-Type": "application/json"
-                    })
-                return (json.dumps({
+                    return jresp({"configured": False}, 200)
+                return jresp({
                     "configured": True,
                     "version": cfg["version"],
                     "provider": cfg["provider"],
                     "model": cfg["model"],
                     "api_key_masked": mask_key(cfg.get("api_key", "")),
                     "updated_at": cfg.get("created_at"),
-                }, ensure_ascii=False), 200, {**headers, "Content-Type": "application/json"})
-
+                }, 200)
             elif request.method == "POST":
                 body = request.get_json(silent=True) or {}
                 provider = body.get("provider")
                 model = body.get("model")
                 api_key = body.get("api_key", "").strip()
                 if provider not in ("anthropic", "openai", "deepseek"):
-                    return (json.dumps({"error": "Invalid provider"}), 400, headers)
+                    return jresp({"error": "Invalid provider"}, 400)
                 if not model:
-                    return (json.dumps({"error": "Missing model"}), 400, headers)
+                    return jresp({"error": "Missing model"}, 400)
                 if not api_key:
-                    return (json.dumps({"error": "Missing api_key"}), 400, headers)
+                    return jresp({"error": "Missing api_key"}, 400)
                 result = write_llm_config_version(bucket, provider, model, api_key, created_by=user.get("email", "api"))
-                return (json.dumps(result, ensure_ascii=False), 201, {
-                    **headers, "Content-Type": "application/json"
-                })
+                return jresp(result, 201)
             else:
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
 
         if path == "/config/llm/test":
+            if not is_admin:
+                return jresp({"error": "forbidden"}, 403)
             if request.method != "POST":
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
-            client = get_storage_client()
-            bucket = client.bucket(BUCKET_NAME)
+                return jresp({"error": "Method not allowed"}, 405)
             cfg = read_llm_config_full(bucket)
             if not cfg:
-                return (json.dumps({"ok": False, "error": "LLM config not set"}), 400, headers)
+                return jresp({"ok": False, "error": "LLM config not set"}, 400)
             try:
                 t0 = datetime.utcnow()
                 res = call_llm(
@@ -976,246 +1199,176 @@ def runs_api(request):
                     "Верни строго JSON {\"ok\":true}"
                 )
                 latency_ms = int((datetime.utcnow() - t0).total_seconds() * 1000)
-                return (json.dumps({
-                    "ok": True,
-                    "latency_ms": latency_ms,
+                return jresp({
+                    "ok": True, "latency_ms": latency_ms,
                     "input_tokens": res["input_tokens"],
                     "output_tokens": res["output_tokens"],
                     "sample_response": res["text"][:200],
-                }, ensure_ascii=False), 200, {**headers, "Content-Type": "application/json"})
+                }, 200)
             except httpx.HTTPStatusError as e:
-                return (json.dumps({
-                    "ok": False,
-                    "error": f"Provider {e.response.status_code}: {e.response.text[:200]}"
-                }, ensure_ascii=False), 200, {**headers, "Content-Type": "application/json"})
+                return jresp({"ok": False, "error": f"Provider {e.response.status_code}: {e.response.text[:200]}"}, 200)
             except Exception as e:
-                return (json.dumps({"ok": False, "error": str(e)[:200]}, ensure_ascii=False), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                return jresp({"ok": False, "error": str(e)[:200]}, 200)
 
-        # ── /advise ──────────────────────────────────────────────────────────
+        # ── /advise — все approved; общий ключ; дневной лимит; per-user данные ─
         if path == "/advise":
-            client = get_storage_client()
-            bucket = client.bucket(BUCKET_NAME)
             if request.method == "GET":
-                latest = read_latest_advice(bucket)
+                latest = read_latest_advice(bucket, sub)
                 if not latest:
-                    return (json.dumps({"available": False}, ensure_ascii=False), 200, {
-                        **headers, "Content-Type": "application/json"
-                    })
-                return (json.dumps({"available": True, **latest}, ensure_ascii=False), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                    return jresp({"available": False}, 200)
+                return jresp({"available": True, **latest}, 200)
 
             elif request.method == "POST":
                 cfg = read_llm_config_full(bucket)
                 if not cfg or not cfg.get("api_key"):
-                    return (json.dumps({"error": "LLM config not set. Откройте Настройки и задайте провайдера и ключ."}), 400, headers)
-                ctx = build_llm_context(bucket)
+                    return jresp({"error": "LLM config not set. Обратитесь к администратору."}, 400)
+                limit = ADMIN_DAILY_ADVISE_LIMIT if is_admin else DAILY_ADVISE_LIMIT
+                usage = read_advice_usage(bucket, sub)
+                if usage.get("count", 0) >= limit:
+                    return jresp({"error": "daily_limit_reached", "limit": limit}, 429)
+                ctx = build_llm_context(bucket, sub)
                 if not ctx["last_runs"]:
-                    return (json.dumps({"error": "Нужна хотя бы одна пробежка для рекомендаций"}), 400, headers)
+                    return jresp({"error": "Нужна хотя бы одна пробежка для рекомендаций"}, 400)
                 user_prompt = format_context_for_llm(ctx)
                 try:
                     llm_res = call_llm(cfg["provider"], cfg["model"], cfg["api_key"], SYSTEM_PROMPT, user_prompt)
                 except httpx.HTTPStatusError as e:
-                    return (json.dumps({"error": f"Provider {e.response.status_code}: {e.response.text[:300]}"}), 502, headers)
+                    return jresp({"error": f"Provider {e.response.status_code}: {e.response.text[:300]}"}, 502)
                 except Exception as e:
-                    return (json.dumps({"error": f"LLM call failed: {str(e)[:300]}"}), 502, headers)
-
+                    return jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
                 try:
                     recommendation = parse_llm_json(llm_res["text"])
                 except Exception as e:
-                    return (json.dumps({
-                        "error": f"Cannot parse LLM response as JSON: {str(e)[:200]}",
-                        "raw_text": llm_res["text"][:500]
-                    }), 502, headers)
+                    return jresp({"error": f"Cannot parse LLM response as JSON: {str(e)[:200]}",
+                                  "raw_text": llm_res["text"][:500]}, 502)
 
                 payload = write_advice_version(
-                    bucket, recommendation, ctx,
+                    bucket, sub, recommendation, ctx,
                     cfg["provider"], cfg["model"],
                     llm_res["input_tokens"], llm_res["output_tokens"],
-                    cfg["version"],
-                    created_by=user.get("email", "api")
-                )
-                return (json.dumps({"available": True, **payload}, ensure_ascii=False), 201, {
-                    **headers, "Content-Type": "application/json"
-                })
+                    cfg["version"], created_by=user.get("email", "api"))
+                increment_advice_usage(bucket, sub)
+                return jresp({"available": True, **payload}, 201)
             else:
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
 
         # ── /races ───────────────────────────────────────────────────────────
         if path == "/races":
             if request.method == "GET":
-                all_races = read_races()
-                active_races = [r for r in all_races if not r.get("deleted", False)]
-                return (json.dumps(active_races, ensure_ascii=False), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                active = [r for r in read_races(bucket, sub) if not r.get("deleted", False)]
+                return jresp(active, 200)
 
             elif request.method == "POST":
                 body = request.get_json(silent=True)
                 if not body:
-                    return (json.dumps({"error": "Invalid JSON"}), 400, headers)
-
+                    return jresp({"error": "Invalid JSON"}, 400)
                 for field in ["name", "date", "dist_label", "time"]:
                     if field not in body:
-                        return (json.dumps({"error": f"Missing field: {field}"}), 400, headers)
-
+                        return jresp({"error": f"Missing field: {field}"}, 400)
                 race = {
                     "id": body.get("id", int(datetime.now().timestamp() * 1000)),
-                    "name": body["name"],
-                    "date": body["date"],
-                    "dist_label": body["dist_label"],
-                    "time": body["time"],
+                    "name": body["name"], "date": body["date"],
+                    "dist_label": body["dist_label"], "time": body["time"],
                     "deleted": False,
                 }
-
-                all_races = read_races()
+                all_races = read_races(bucket, sub)
                 all_races = [r for r in all_races if r.get("id") != race["id"]]
                 all_races.insert(0, race)
-                write_races(all_races)
-
-                return (json.dumps(race, ensure_ascii=False), 201, {
-                    **headers, "Content-Type": "application/json"
-                })
+                write_races(bucket, sub, all_races)
+                return jresp(race, 201)
 
             elif request.method == "DELETE":
                 race_id = request.args.get("id")
                 if not race_id:
-                    return (json.dumps({"error": "Missing id parameter"}), 400, headers)
-
-                all_races = read_races()
+                    return jresp({"error": "Missing id parameter"}, 400)
+                all_races = read_races(bucket, sub)
                 race_id = int(race_id)
-
                 target = next((r for r in all_races if r.get("id") == race_id), None)
                 if not target:
-                    return (json.dumps({"error": "Race not found"}), 404, headers)
-
+                    return jresp({"error": "Race not found"}, 404)
                 target["deleted"] = True
                 target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
-                write_races(all_races)
-
-                return (json.dumps({"soft_deleted": race_id, "deleted_at": target["deleted_at"]}), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                write_races(bucket, sub, all_races)
+                return jresp({"soft_deleted": race_id, "deleted_at": target["deleted_at"]}, 200)
 
             else:
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
 
-        # ── /plan ────────────────────────────────────────────────────────────
+        # ── /plan — per-user; новый пользователь → пустой план (без авто-сида) ─
         if path == "/plan":
-            client = get_storage_client()
-            bucket = client.bucket(BUCKET_NAME)
-
             if request.method == "GET":
-                manifest = read_plan_manifest(bucket)
+                manifest = read_plan_manifest(bucket, sub)
                 if not manifest:
-                    # Авто-seed: первый запрос создаёт v1 из INITIAL_PLAN
-                    write_plan_version(bucket, 1, INITIAL_PLAN, "initial seed", "auto-seed")
-                    return (json.dumps(INITIAL_PLAN, ensure_ascii=False), 200, {
-                        **headers, "Content-Type": "application/json"
-                    })
+                    return jresp([], 200)   # пустой план — строится через конструктор
                 plan_data = read_plan_version(bucket, manifest["gcs_object_path"])
                 if not plan_data:
-                    return (json.dumps({"error": "plan version missing"}), 500, headers)
-                return (json.dumps(plan_data["weeks"], ensure_ascii=False), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                    return jresp({"error": "plan version missing"}, 500)
+                return jresp(plan_data["weeks"], 200)
 
             elif request.method == "POST":
                 body = request.get_json(silent=True)
                 if not body or "weeks" not in body:
-                    return (json.dumps({"error": "Missing weeks"}), 400, headers)
-                manifest = read_plan_manifest(bucket)
+                    return jresp({"error": "Missing weeks"}, 400)
+                manifest = read_plan_manifest(bucket, sub)
                 next_version = (manifest["current_version"] + 1) if manifest else 1
                 result = write_plan_version(
-                    bucket,
-                    next_version,
-                    body["weeks"],
-                    body.get("change_reason", ""),
-                    body.get("created_by", "api"),
-                )
-                return (json.dumps(result, ensure_ascii=False), 201, {
-                    **headers, "Content-Type": "application/json"
-                })
+                    bucket, sub, next_version, body["weeks"],
+                    body.get("change_reason", ""), body.get("created_by", user.get("email", "api")))
+                return jresp(result, 201)
 
             else:
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
 
         # ── / (runs) ─────────────────────────────────────────────────────────
         else:
             if request.method == "GET":
-                all_runs = read_runs()
-                active_runs = [r for r in all_runs if not r.get("deleted", False)]
-                return (json.dumps(active_runs, ensure_ascii=False), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                active = [r for r in read_runs(bucket, sub) if not r.get("deleted", False)]
+                return jresp(active, 200)
 
             elif request.method == "POST":
                 body = request.get_json(silent=True)
                 if not body:
-                    return (json.dumps({"error": "Invalid JSON"}), 400, headers)
-
+                    return jresp({"error": "Invalid JSON"}, 400)
                 for field in ["date", "dist"]:
                     if field not in body:
-                        return (json.dumps({"error": f"Missing field: {field}"}), 400, headers)
-
+                        return jresp({"error": f"Missing field: {field}"}, 400)
                 run = {
                     "id": body.get("id", int(datetime.now().timestamp() * 1000)),
-                    "date": body["date"],
-                    "dist": float(body["dist"]),
-                    "type": body.get("type", "easy"),
-                    "time": body.get("time", ""),
-                    "pace": body.get("pace", ""),
-                    "hr": body.get("hr"),
-                    "feel": body.get("feel", "good"),
-                    "notes": body.get("notes", ""),
+                    "date": body["date"], "dist": float(body["dist"]),
+                    "type": body.get("type", "easy"), "time": body.get("time", ""),
+                    "pace": body.get("pace", ""), "hr": body.get("hr"),
+                    "feel": body.get("feel", "good"), "notes": body.get("notes", ""),
                     "deleted": False,
                 }
-
-                # Если пришёл fit_token — переносим tmp-данные и обогащаем run
                 fit_token = body.get("fit_token")
                 if fit_token:
                     try:
-                        client = get_storage_client()
-                        bucket = client.bucket(BUCKET_NAME)
-                        attach_fit_details_to_run(bucket, run, fit_token)
+                        attach_fit_details_to_run(bucket, sub, run, fit_token)
                     except Exception as e:
-                        return (json.dumps({"error": f"Failed to attach FIT details: {str(e)[:300]}"}), 400, headers)
+                        return jresp({"error": f"Failed to attach FIT details: {str(e)[:300]}"}, 400)
 
-                all_runs = read_runs()
+                all_runs = read_runs(bucket, sub)
                 all_runs = [r for r in all_runs if r.get("id") != run["id"]]
                 all_runs.insert(0, run)
-                write_runs(all_runs)
-
-                return (json.dumps(run, ensure_ascii=False), 201, {
-                    **headers, "Content-Type": "application/json"
-                })
+                write_runs(bucket, sub, all_runs)
+                return jresp(run, 201)
 
             elif request.method == "DELETE":
                 run_id = request.args.get("id")
                 if not run_id:
-                    return (json.dumps({"error": "Missing id parameter"}), 400, headers)
-
-                all_runs = read_runs()
+                    return jresp({"error": "Missing id parameter"}, 400)
+                all_runs = read_runs(bucket, sub)
                 run_id = int(run_id)
-
                 target = next((r for r in all_runs if r.get("id") == run_id), None)
                 if not target:
-                    return (json.dumps({"error": "Run not found"}), 404, headers)
-
+                    return jresp({"error": "Run not found"}, 404)
                 target["deleted"] = True
                 target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
-                write_runs(all_runs)
-
-                return (json.dumps({"soft_deleted": run_id, "deleted_at": target["deleted_at"]}), 200, {
-                    **headers, "Content-Type": "application/json"
-                })
+                write_runs(bucket, sub, all_runs)
+                return jresp({"soft_deleted": run_id, "deleted_at": target["deleted_at"]}, 200)
 
             else:
-                return (json.dumps({"error": "Method not allowed"}), 405, headers)
+                return jresp({"error": "Method not allowed"}, 405)
 
     except Exception as e:
-        return (json.dumps({"error": str(e)}), 500, {
-            **headers, "Content-Type": "application/json"
-        })
+        return jresp({"error": str(e)}, 500)
