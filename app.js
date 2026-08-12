@@ -165,7 +165,8 @@ async function loadPlan() {
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const weeks = await res.json();
-    if (weeks?.length && weeks[0]?.w !== undefined) {
+    if (Array.isArray(weeks)) {
+      // [] — новый пользователь без плана (покажем пустое состояние + «Создать план»)
       PLAN = weeks;
       localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
       renderPlan();
@@ -417,21 +418,57 @@ function clearLog() {
   alert('Для удаления всех данных удалите файл runs.json в GCS bucket.');
 }
 
+const PLAN_TYPES = [['dev','Развитие'],['peak','Пик'],['taper','Тейпер'],['load','Разгрузка'],['race','Старт']];
+
 function renderPlan() {
-  if (!PLAN?.length) return;
-  const cw = getCurrentWeek();
+  const body = document.getElementById('plan-body');
   const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
   const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
-  const dayCell = (val, day, i) => planEditMode
-    ? `<td class="editable" style="font-size:12px"><input value="${escapeHtml(val)}" data-week="${i}" data-day="${day}"></td>`
-    : `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${val}</td>`;
-  document.getElementById('plan-body').innerHTML = PLAN.map((r,i) => `
+
+  // ── Режим конструктора (может быть 0 строк) ──
+  if (planEditMode) {
+    const rows = (PLAN || []);
+    const inp = (i, field, val) =>
+      `<input data-week="${i}" data-field="${field}" value="${escapeHtml(val ?? '')}" style="width:100%;box-sizing:border-box">`;
+    const typeSel = (i, val) =>
+      `<select data-week="${i}" data-field="type" style="width:100%;box-sizing:border-box">${
+        PLAN_TYPES.map(([v,l]) => `<option value="${v}"${val===v?' selected':''}>${l}</option>`).join('')}</select>`;
+    const dayCell = (i, field, val) => `<td class="editable" style="font-size:12px">${inp(i, field, val)}</td>`;
+    body.innerHTML = rows.map((r,i) => `
+      <tr>
+        <td style="white-space:nowrap;font-family:'DM Mono',monospace">
+          ${r.w ?? i+1}
+          <button class="btn-sm" onclick="deletePlanWeek(${i})" style="color:var(--c-danger);padding:2px 6px;margin-left:4px" title="Удалить неделю">✕</button>
+        </td>
+        <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
+        <td class="editable" style="min-width:96px">${inp(i,'accent',r.accent)}${typeSel(i,r.type)}</td>
+        ${dayCell(i,'sun',r.sun)}${dayCell(i,'mon',r.mon)}${dayCell(i,'wed',r.wed)}${dayCell(i,'fri',r.fri)}${dayCell(i,'sat',r.sat)}
+      </tr>`).join('') +
+      `<tr><td colspan="8" style="text-align:center;padding:10px">
+        <button class="btn-sm" onclick="addPlanWeek()">+ Неделя</button>
+      </td></tr>`;
+    return;
+  }
+
+  // ── Пустое состояние (не в режиме редактирования) ──
+  if (!PLAN?.length) {
+    body.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:2rem">
+      <div class="empty" style="padding:0 0 12px">План пуст</div>
+      <button class="btn-primary" onclick="enterPlanEditMode()">Создать план</button>
+    </td></tr>`;
+    return;
+  }
+
+  // ── Обычный просмотр ──
+  const cw = getCurrentWeek();
+  const dayCell = (val, day) =>
+    `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${escapeHtml(val ?? '')}</td>`;
+  body.innerHTML = PLAN.map((r,i) => `
     <tr class="${i===cw?'current-week':''} ${r.type==='race'?'race-week':''}">
-      <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w}</td>
-      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${r.start}<br>${r.end}</td>
-      <td><span class="badge ${badgeMap[r.type]}">${labelMap[r.type]}</span><br><span style="font-size:11px;opacity:.7">${r.accent}</span></td>
-      ${dayCell(r.sun,'sun',i)}${dayCell(r.mon,'mon',i)}
-      ${dayCell(r.wed,'wed',i)}${dayCell(r.fri,'fri',i)}${dayCell(r.sat,'sat',i)}
+      <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w ?? i+1}</td>
+      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${escapeHtml(r.start ?? '')}<br>${escapeHtml(r.end ?? '')}</td>
+      <td><span class="badge ${badgeMap[r.type]||''}">${labelMap[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
+      ${dayCell(r.sun,'sun')}${dayCell(r.mon,'mon')}${dayCell(r.wed,'wed')}${dayCell(r.fri,'fri')}${dayCell(r.sat,'sat')}
     </tr>`).join('');
 }
 
@@ -441,6 +478,7 @@ function togglePlanEdit() {
 
 function enterPlanEditMode() {
   planEditMode = true;
+  if (!Array.isArray(PLAN)) PLAN = [];
   document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
   document.getElementById('plan-save-bar').style.display = 'flex';
   renderPlan();
@@ -453,23 +491,40 @@ function cancelPlanEdit() {
   renderPlan();
 }
 
+// Считывает все поля строк (даты/акцент/тип/дни) обратно в PLAN
 function collectPlanEdits() {
-  document.querySelectorAll('#plan-body input[data-week]').forEach(inp => {
-    const i = +inp.dataset.week;
-    const day = inp.dataset.day;
-    PLAN[i][day] = inp.value;
+  document.querySelectorAll('#plan-body [data-week][data-field]').forEach(el => {
+    const i = +el.dataset.week;
+    if (PLAN[i]) PLAN[i][el.dataset.field] = el.value;
   });
+}
+
+function addPlanWeek() {
+  collectPlanEdits();
+  if (!Array.isArray(PLAN)) PLAN = [];
+  PLAN.push({ w: PLAN.length + 1, start:'', end:'', accent:'', type:'dev',
+              sun:'', mon:'', wed:'', fri:'', sat:'' });
+  renderPlan();
+}
+
+function deletePlanWeek(i) {
+  collectPlanEdits();
+  PLAN.splice(i, 1);
+  PLAN.forEach((r, idx) => { r.w = idx + 1; });   // перенумерация
+  renderPlan();
 }
 
 async function savePlanEdits() {
   collectPlanEdits();
+  if (!Array.isArray(PLAN)) PLAN = [];
+  PLAN.forEach((r, i) => { r.w = i + 1; });   // консистентная нумерация недель
   const btn = document.getElementById('plan-save-btn');
   btn.disabled = true; btn.textContent = 'Сохранение…';
   try {
     const res = await fetch(API_URL + 'plan', {
       method: 'POST',
       headers: authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit', created_by: 'aabramov77' })
+      body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit' })
     });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
