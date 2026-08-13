@@ -31,15 +31,33 @@
   </div>
 </div>
 
+<!-- Экран: заявка на рассмотрении -->
+<div id="pending-screen" class="login-screen">
+  <div class="login-card">
+    <h2>⏳ Заявка на рассмотрении</h2>
+    <p>Ваш доступ ожидает одобрения администратором. Загляните позже.</p>
+    <button class="btn-sm" onclick="signOut()">Выйти</button>
+  </div>
+</div>
+
+<!-- Экран: доступ отклонён -->
+<div id="rejected-screen" class="login-screen">
+  <div class="login-card">
+    <h2>⛔ Доступ отклонён</h2>
+    <p>Администратор отклонил вашу заявку. Если это ошибка — свяжитесь с ним.</p>
+    <button class="btn-sm" onclick="signOut()">Выйти</button>
+  </div>
+</div>
+
 <div class="app">
   <header class="header">
     <div>
-      <h1>Полумарафон 09.08.2026</h1>
+      <h1 id="app-title">Running Tracker</h1>
       <p id="api-status" class="subtitle">Подключение к GCS…</p>
-      <p class="subtitle">Цель: 1:40 · план 13 недель · aabramov77</p>
+      <p id="header-subtitle" class="subtitle"></p>
     </div>
     <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px">
-      <div class="countdown-block" style="text-align:right">
+      <div class="countdown-block" id="countdown-block" style="text-align:right;display:none">
         <div class="countdown-label">До старта</div>
         <div class="countdown" id="countdown">—</div>
       </div>
@@ -62,6 +80,7 @@
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
     <button class="nav-btn" onclick="showTab('settings',this)">⚙ Настройки</button>
+    <button class="nav-btn" id="nav-users-btn" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
   </nav>
 
   <!-- ПЛАН -->
@@ -237,7 +256,37 @@
 
   <!-- НАСТРОЙКИ -->
   <div id="tab-settings" class="tab">
-    <div class="card">
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-title">Моя гонка</div>
+      <p class="hint">Название, дата и цель вашего забега. Управляют заголовком, обратным отсчётом и прогрессом плана.</p>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>Название гонки</label>
+          <input type="text" id="p-race-name" placeholder="Например: Московский полумарафон">
+        </div>
+        <div class="form-group">
+          <label>Дата старта</label>
+          <input type="date" id="p-race-date">
+        </div>
+        <div class="form-group">
+          <label>Целевое время (чч:мм)</label>
+          <input type="text" id="p-target-time" placeholder="1:40">
+        </div>
+        <div class="form-group">
+          <label>Старт плана (для расчёта недели)</label>
+          <input type="date" id="p-plan-start">
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+        <button class="btn-primary" onclick="saveProfile()">Сохранить</button>
+        <span id="profile-msg" class="save-msg"></span>
+      </div>
+    </div>
+    <div class="card" id="llm-settings-note" style="display:none">
+      <div class="card-title">Настройки ИИ</div>
+      <p class="hint">Рекомендации ИИ настроены администратором приложения. Кнопка «Запросить рекомендации» в разделе «Корректировка» работает для всех пользователей.</p>
+    </div>
+    <div class="card" id="llm-settings-card">
       <div class="card-title">Настройки LLM</div>
       <p class="hint">Подключите внешнюю LLM (Anthropic / OpenAI / Deepseek) для рекомендаций по корректировке плана. Ключ хранится в приватном GCS-объекте и не передаётся обратно фронту.</p>
       <div class="form-grid">
@@ -263,6 +312,18 @@
         <button class="btn-sm" onclick="testLlmKey()">Проверить ключ</button>
         <span id="settings-msg" class="save-msg"></span>
       </div>
+    </div>
+  </div>
+
+  <!-- ПОЛЬЗОВАТЕЛИ (только админ) -->
+  <div id="tab-users" class="tab">
+    <div class="card">
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Пользователи</div>
+        <button class="btn-sm" onclick="loadUsers()">↻ Обновить</button>
+      </div>
+      <p class="hint">Новые пользователи попадают в статус «на рассмотрении». Одобрите, чтобы дать доступ.</p>
+      <div id="users-list"><div class="empty">Загрузка…</div></div>
     </div>
   </div>
 
@@ -323,6 +384,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=14"></script>
+<script src="app.js?v=17"></script>
 </body>
 </html>

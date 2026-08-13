@@ -15,37 +15,155 @@ if (!IS_PROD) {
 let PLAN = null;
 let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
+let currentRole = null;
+let currentUser = {};
+let PROFILE = { race_name: '', race_date: '', target_time: '', plan_start: '' };
+
+// Google sub из JWT — только для namespace кэша (не для безопасности; сервер
+// сам проверяет подпись). Декодируем payload без верификации.
+function jwtSub(token) {
+  try {
+    const p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(decodeURIComponent(escape(atob(p)))).sub || null;
+  } catch (e) { return null; }
+}
+let userSub = idToken ? jwtSub(idToken) : null;
+// Ключ кэша с namespace по пользователю (на общем браузере данные не смешиваются)
+function ck(base) { return userSub ? `${base}__${userSub}` : base; }
 
 function authHeaders(extra = {}) {
   return idToken ? { ...extra, 'Authorization': `Bearer ${idToken}` } : extra;
 }
 
+// ── Экраны доступа ──
+function hideAccessScreens() {
+  ['login-screen', 'pending-screen', 'rejected-screen'].forEach(id =>
+    document.getElementById(id).classList.remove('active'));
+}
+function showAccessScreen(id) {
+  hideAccessScreens();
+  document.getElementById(id).classList.add('active');
+  document.getElementById('signout-btn').style.display = 'none';
+}
+
+function applyRole(role) {
+  const isAdmin = role === 'admin';
+  document.getElementById('nav-users-btn').style.display = isAdmin ? '' : 'none';
+  document.getElementById('llm-settings-card').style.display = isAdmin ? '' : 'none';
+  document.getElementById('llm-settings-note').style.display = isAdmin ? 'none' : '';
+}
+
+// Проверяем статус через /me и решаем что показать
+async function checkAccessAndInit() {
+  try {
+    const res = await fetch(API_URL + 'me', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const me = await res.json();
+    if (me.status === 'approved') {
+      currentRole = me.role;
+      currentUser = { name: me.name, email: me.email };
+      hideAccessScreens();
+      document.getElementById('signout-btn').style.display = 'inline-flex';
+      applyRole(me.role);
+      initApp();
+    } else if (me.status === 'pending') {
+      showAccessScreen('pending-screen');
+    } else {
+      showAccessScreen('rejected-screen');
+    }
+  } catch (e) {
+    handleAuthError();
+  }
+}
+
 function handleCredentialResponse(response) {
   idToken = response.credential;
+  userSub = jwtSub(idToken);
   localStorage.setItem('g_id_token', idToken);
-  document.getElementById('login-screen').classList.remove('active');
-  document.getElementById('signout-btn').style.display = 'inline-flex';
-  initApp();
+  checkAccessAndInit();
 }
 
 function signOut() {
-  idToken = null;
+  idToken = null; userSub = null; currentRole = null;
   localStorage.removeItem('g_id_token');
+  hideAccessScreens();
   document.getElementById('login-screen').classList.add('active');
   document.getElementById('signout-btn').style.display = 'none';
   if (window.google) google.accounts.id.disableAutoSelect();
 }
 
 function handleAuthError() {
-  idToken = null;
+  idToken = null; currentRole = null;
   localStorage.removeItem('g_id_token');
+  hideAccessScreens();
   document.getElementById('login-screen').classList.add('active');
   document.getElementById('signout-btn').style.display = 'none';
 }
 
-let runs = JSON.parse(localStorage.getItem('running_tracker_runs') || '[]');
-let races = JSON.parse(localStorage.getItem('running_tracker_races') || '[]');
+let runs = JSON.parse(localStorage.getItem(ck('running_tracker_runs')) || '[]');
+let races = JSON.parse(localStorage.getItem(ck('running_tracker_races')) || '[]');
 let isOnline = false;
+
+// ── Профиль гонки (per-user) ──
+function planWeeks() { return (PLAN && PLAN.length) ? PLAN.length : 13; }
+function planStartDate() { return PROFILE.plan_start ? new Date(PROFILE.plan_start) : new Date('2026-05-10'); }
+
+function applyProfileToHeader() {
+  document.getElementById('app-title').textContent =
+    PROFILE.race_name || (PROFILE.race_date ? `Забег ${PROFILE.race_date}` : 'Running Tracker');
+  const bits = [];
+  if (PROFILE.target_time) bits.push(`Цель: ${PROFILE.target_time}`);
+  if (PLAN && PLAN.length) bits.push(`план ${PLAN.length} недель`);
+  if (currentUser.name || currentUser.email) bits.push(currentUser.name || currentUser.email);
+  document.getElementById('header-subtitle').textContent = bits.join(' · ');
+}
+
+function fillProfileForm() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+  set('p-race-name', PROFILE.race_name);
+  set('p-race-date', PROFILE.race_date);
+  set('p-target-time', PROFILE.target_time);
+  set('p-plan-start', PROFILE.plan_start);
+}
+
+async function loadProfile() {
+  try {
+    const res = await fetch(API_URL + 'profile', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (res.ok) PROFILE = await res.json();
+  } catch (e) {}
+  applyProfileToHeader();
+  fillProfileForm();
+  renderMetrics();
+}
+
+async function saveProfile() {
+  const body = {
+    race_name: document.getElementById('p-race-name').value.trim(),
+    race_date: document.getElementById('p-race-date').value,
+    target_time: document.getElementById('p-target-time').value.trim(),
+    plan_start: document.getElementById('p-plan-start').value,
+  };
+  const msg = document.getElementById('profile-msg');
+  try {
+    const res = await fetch(API_URL + 'profile', {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    PROFILE = await res.json();
+    applyProfileToHeader();
+    renderMetrics();
+    renderLog();  // week labels зависят от plan_start
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-accent)'; msg.textContent = '✓ Сохранено';
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 2000);
+  } catch (e) {
+    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)'; msg.textContent = '⚠ ' + e.message;
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 4000);
+  }
+}
 
 function escapeHtml(s) {
   if (s == null) return '';
@@ -103,17 +221,19 @@ function setStatus(msg, type = 'ok') {
 }
 
 async function loadPlan() {
-  const cached = localStorage.getItem('running_tracker_plan');
+  const cached = localStorage.getItem(ck('running_tracker_plan'));
   if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
   try {
     const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const weeks = await res.json();
-    if (weeks?.length && weeks[0]?.w !== undefined) {
+    if (Array.isArray(weeks)) {
+      // [] — новый пользователь без плана (покажем пустое состояние + «Создать план»)
       PLAN = weeks;
-      localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
+      localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
       renderPlan();
+      applyProfileToHeader();  // «план N недель» зависит от длины плана
     } else if (!PLAN) {
       document.getElementById('plan-body').innerHTML =
         '<tr><td colspan="8" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>';
@@ -267,7 +387,7 @@ async function loadRunsFromCloud() {
     const cloudRuns = await apiGet();
     // API уже возвращает только активные записи (бэкенд фильтрует deleted)
     runs = cloudRuns;
-    localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+    localStorage.setItem(ck('running_tracker_runs'), JSON.stringify(runs));
     isOnline = true;
     setStatus('✓ Синхронизировано с GCS');
     renderAll();
@@ -280,8 +400,8 @@ async function loadRunsFromCloud() {
 }
 
 function getCurrentWeek() {
-  const diff = Math.floor((new Date() - new Date('2026-05-10')) / (7 * 24 * 3600 * 1000));
-  return Math.max(0, Math.min(12, diff));
+  const diff = Math.floor((new Date() - planStartDate()) / (7 * 24 * 3600 * 1000));
+  return Math.max(0, Math.min(planWeeks() - 1, diff));
 }
 function parsePace(s) {
   if (!s) return null;
@@ -293,8 +413,8 @@ function formatPace(v) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 function getWeekLabel(dateStr) {
-  const w = Math.floor((new Date(dateStr) - new Date('2026-05-10')) / (7 * 24 * 3600 * 1000)) + 1;
-  return (w >= 1 && w <= 13) ? `Нед ${w}` : '';
+  const w = Math.floor((new Date(dateStr) - planStartDate()) / (7 * 24 * 3600 * 1000)) + 1;
+  return (w >= 1 && w <= planWeeks()) ? `Нед ${w}` : '';
 }
 
 async function saveRun() {
@@ -324,7 +444,7 @@ async function saveRun() {
         return;
       }
       runs.unshift(run);
-      localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+      localStorage.setItem(ck('running_tracker_runs'), JSON.stringify(runs));
       setStatus('⚠ Сохранено локально (нет связи)', 'warn');
       renderAll();
     }
@@ -350,7 +470,7 @@ async function deleteRun(id) {
       // Оффлайн: помечаем локально, синхронизируется при следующем подключении
       runs = runs.map(r => r.id === id ? {...r, deleted: true} : r);
       const activeRuns = runs.filter(r => !r.deleted);
-      localStorage.setItem('running_tracker_runs', JSON.stringify(runs));
+      localStorage.setItem(ck('running_tracker_runs'), JSON.stringify(runs));
       runs = activeRuns;
       renderAll();
       setStatus('⚠ Скрыто локально — синхронизируется при подключении', 'warn');
@@ -362,21 +482,57 @@ function clearLog() {
   alert('Для удаления всех данных удалите файл runs.json в GCS bucket.');
 }
 
+const PLAN_TYPES = [['dev','Развитие'],['peak','Пик'],['taper','Тейпер'],['load','Разгрузка'],['race','Старт']];
+
 function renderPlan() {
-  if (!PLAN?.length) return;
-  const cw = getCurrentWeek();
+  const body = document.getElementById('plan-body');
   const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
   const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
-  const dayCell = (val, day, i) => planEditMode
-    ? `<td class="editable" style="font-size:12px"><input value="${escapeHtml(val)}" data-week="${i}" data-day="${day}"></td>`
-    : `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${val}</td>`;
-  document.getElementById('plan-body').innerHTML = PLAN.map((r,i) => `
+
+  // ── Режим конструктора (может быть 0 строк) ──
+  if (planEditMode) {
+    const rows = (PLAN || []);
+    const inp = (i, field, val) =>
+      `<input data-week="${i}" data-field="${field}" value="${escapeHtml(val ?? '')}" style="width:100%;box-sizing:border-box">`;
+    const typeSel = (i, val) =>
+      `<select data-week="${i}" data-field="type" style="width:100%;box-sizing:border-box">${
+        PLAN_TYPES.map(([v,l]) => `<option value="${v}"${val===v?' selected':''}>${l}</option>`).join('')}</select>`;
+    const dayCell = (i, field, val) => `<td class="editable" style="font-size:12px">${inp(i, field, val)}</td>`;
+    body.innerHTML = rows.map((r,i) => `
+      <tr>
+        <td style="white-space:nowrap;font-family:'DM Mono',monospace">
+          ${r.w ?? i+1}
+          <button class="btn-sm" onclick="deletePlanWeek(${i})" style="color:var(--c-danger);padding:2px 6px;margin-left:4px" title="Удалить неделю">✕</button>
+        </td>
+        <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
+        <td class="editable" style="min-width:96px">${inp(i,'accent',r.accent)}${typeSel(i,r.type)}</td>
+        ${dayCell(i,'sun',r.sun)}${dayCell(i,'mon',r.mon)}${dayCell(i,'wed',r.wed)}${dayCell(i,'fri',r.fri)}${dayCell(i,'sat',r.sat)}
+      </tr>`).join('') +
+      `<tr><td colspan="8" style="text-align:center;padding:10px">
+        <button class="btn-sm" onclick="addPlanWeek()">+ Неделя</button>
+      </td></tr>`;
+    return;
+  }
+
+  // ── Пустое состояние (не в режиме редактирования) ──
+  if (!PLAN?.length) {
+    body.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:2rem">
+      <div class="empty" style="padding:0 0 12px">План пуст</div>
+      <button class="btn-primary" onclick="enterPlanEditMode()">Создать план</button>
+    </td></tr>`;
+    return;
+  }
+
+  // ── Обычный просмотр ──
+  const cw = getCurrentWeek();
+  const dayCell = (val, day) =>
+    `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${escapeHtml(val ?? '')}</td>`;
+  body.innerHTML = PLAN.map((r,i) => `
     <tr class="${i===cw?'current-week':''} ${r.type==='race'?'race-week':''}">
-      <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w}</td>
-      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${r.start}<br>${r.end}</td>
-      <td><span class="badge ${badgeMap[r.type]}">${labelMap[r.type]}</span><br><span style="font-size:11px;opacity:.7">${r.accent}</span></td>
-      ${dayCell(r.sun,'sun',i)}${dayCell(r.mon,'mon',i)}
-      ${dayCell(r.wed,'wed',i)}${dayCell(r.fri,'fri',i)}${dayCell(r.sat,'sat',i)}
+      <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w ?? i+1}</td>
+      <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${escapeHtml(r.start ?? '')}<br>${escapeHtml(r.end ?? '')}</td>
+      <td><span class="badge ${badgeMap[r.type]||''}">${labelMap[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
+      ${dayCell(r.sun,'sun')}${dayCell(r.mon,'mon')}${dayCell(r.wed,'wed')}${dayCell(r.fri,'fri')}${dayCell(r.sat,'sat')}
     </tr>`).join('');
 }
 
@@ -386,6 +542,7 @@ function togglePlanEdit() {
 
 function enterPlanEditMode() {
   planEditMode = true;
+  if (!Array.isArray(PLAN)) PLAN = [];
   document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
   document.getElementById('plan-save-bar').style.display = 'flex';
   renderPlan();
@@ -398,27 +555,44 @@ function cancelPlanEdit() {
   renderPlan();
 }
 
+// Считывает все поля строк (даты/акцент/тип/дни) обратно в PLAN
 function collectPlanEdits() {
-  document.querySelectorAll('#plan-body input[data-week]').forEach(inp => {
-    const i = +inp.dataset.week;
-    const day = inp.dataset.day;
-    PLAN[i][day] = inp.value;
+  document.querySelectorAll('#plan-body [data-week][data-field]').forEach(el => {
+    const i = +el.dataset.week;
+    if (PLAN[i]) PLAN[i][el.dataset.field] = el.value;
   });
+}
+
+function addPlanWeek() {
+  collectPlanEdits();
+  if (!Array.isArray(PLAN)) PLAN = [];
+  PLAN.push({ w: PLAN.length + 1, start:'', end:'', accent:'', type:'dev',
+              sun:'', mon:'', wed:'', fri:'', sat:'' });
+  renderPlan();
+}
+
+function deletePlanWeek(i) {
+  collectPlanEdits();
+  PLAN.splice(i, 1);
+  PLAN.forEach((r, idx) => { r.w = idx + 1; });   // перенумерация
+  renderPlan();
 }
 
 async function savePlanEdits() {
   collectPlanEdits();
+  if (!Array.isArray(PLAN)) PLAN = [];
+  PLAN.forEach((r, i) => { r.w = i + 1; });   // консистентная нумерация недель
   const btn = document.getElementById('plan-save-btn');
   btn.disabled = true; btn.textContent = 'Сохранение…';
   try {
     const res = await fetch(API_URL + 'plan', {
       method: 'POST',
       headers: authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit', created_by: 'aabramov77' })
+      body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit' })
     });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    localStorage.setItem('running_tracker_plan', JSON.stringify(PLAN));
+    localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
     const msg = document.getElementById('plan-save-msg');
     msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
@@ -435,13 +609,22 @@ function renderMetrics() {
   const paces = activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const bestPace = paces.length ? Math.min(...paces) : null;
   const cw = getCurrentWeek();
+  const n = planWeeks();
   document.getElementById('m-runs').textContent = activeRuns.length;
   document.getElementById('m-km').textContent = totalKm.toFixed(1);
   document.getElementById('m-pace').textContent = bestPace ? formatPace(bestPace) : '—';
-  document.getElementById('m-progress').textContent = Math.round((cw/13)*100)+'%';
-  document.getElementById('m-week').textContent = `неделя ${cw+1} из 13`;
-  const days = Math.ceil((new Date('2026-08-09')-new Date())/(24*3600*1000));
-  document.getElementById('countdown').textContent = days>0 ? days+' дн' : 'Старт!';
+  document.getElementById('m-progress').textContent = Math.round((cw/n)*100)+'%';
+  document.getElementById('m-week').textContent = `неделя ${Math.min(cw+1, n)} из ${n}`;
+  // Обратный отсчёт — только если задана дата гонки в профиле
+  const block = document.getElementById('countdown-block');
+  const rd = PROFILE.race_date ? new Date(PROFILE.race_date) : null;
+  if (rd && !isNaN(rd)) {
+    const days = Math.ceil((rd - new Date())/(24*3600*1000));
+    document.getElementById('countdown').textContent = days>0 ? days+' дн' : 'Старт!';
+    block.style.display = '';
+  } else {
+    block.style.display = 'none';
+  }
 }
 
 function renderLog() {
@@ -475,7 +658,7 @@ async function loadRacesFromCloud() {
   try {
     const cloudRaces = await apiGetRaces();
     races = cloudRaces;
-    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
     renderRaces();
   } catch (e) {
     races = races.filter(r => !r.deleted);
@@ -506,7 +689,7 @@ async function saveRace() {
   } catch (e) {
     // Офлайн: сохраняем локально
     races.unshift(race);
-    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
     renderRaces();
     const msg = document.getElementById('race-save-msg');
     msg.style.display = 'inline';
@@ -525,7 +708,7 @@ async function deleteRace(id) {
     await loadRacesFromCloud();
   } catch (e) {
     races = races.filter(r => r.id !== id);
-    localStorage.setItem('running_tracker_races', JSON.stringify(races));
+    localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
     renderRaces();
   }
 }
@@ -730,11 +913,13 @@ function closeRunDetail(event) {
 let wChart=null,pChart=null;
 function renderCharts() {
   const activeRuns = runs.filter(r => !r.deleted);
+  const n = planWeeks();
+  const start = planStartDate();
   const weekKm={};
-  activeRuns.forEach(r=>{const w=Math.floor((new Date(r.date)-new Date('2026-05-10'))/(7*24*3600*1000))+1;if(w>=1&&w<=13)weekKm[w]=(weekKm[w]||0)+r.dist;});
+  activeRuns.forEach(r=>{const w=Math.floor((new Date(r.date)-start)/(7*24*3600*1000))+1;if(w>=1&&w<=n)weekKm[w]=(weekKm[w]||0)+r.dist;});
   const sortedRuns=[...activeRuns].sort((a,b)=>a.date.localeCompare(b.date));
   if(wChart)wChart.destroy();
-  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{type:'bar',data:{labels:Array.from({length:13},(_,i)=>`Нед ${i+1}`),datasets:[{label:'км',data:Array.from({length:13},(_,i)=>+((weekKm[i+1]||0).toFixed(1))),backgroundColor:'#1D9E75',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
+  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{type:'bar',data:{labels:Array.from({length:n},(_,i)=>`Нед ${i+1}`),datasets:[{label:'км',data:Array.from({length:n},(_,i)=>+((weekKm[i+1]||0).toFixed(1))),backgroundColor:'#1D9E75',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
   if(pChart)pChart.destroy();
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>r.date.slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
 }
@@ -785,6 +970,7 @@ function updateModelOptions() {
 }
 
 async function loadLlmSettings() {
+  if (currentRole !== 'admin') return;  // не-админ не дёргает admin-only /config/llm
   // Дефолтно — anthropic, модели заполняем
   updateModelOptions();
   document.getElementById('s-api-key').value = '';
@@ -949,6 +1135,59 @@ function showTab(name,btn){
   if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
   if(name==='races')renderRaces();
   if(name==='settings')loadLlmSettings();
+  if(name==='users')loadUsers();
+}
+
+// ── Admin: управление пользователями ──
+async function loadUsers() {
+  const el = document.getElementById('users-list');
+  if (currentRole !== 'admin') { el.innerHTML = '<div class="empty">Нет доступа</div>'; return; }
+  el.innerHTML = '<div class="empty">Загрузка…</div>';
+  try {
+    const res = await fetch(API_URL + 'admin/users', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { el.innerHTML = `<div class="empty">Ошибка ${res.status}</div>`; return; }
+    const data = await res.json();
+    renderUsers(data.users || []);
+  } catch (e) {
+    el.innerHTML = '<div class="empty">Ошибка загрузки</div>';
+  }
+}
+
+function renderUsers(users) {
+  const el = document.getElementById('users-list');
+  if (!users.length) { el.innerHTML = '<div class="empty">Пользователей пока нет</div>'; return; }
+  const statusLabel = { pending: '⏳ На рассмотрении', approved: '✅ Одобрен', rejected: '⛔ Отклонён' };
+  const order = { pending: 0, approved: 1, rejected: 2 };
+  users.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+  el.innerHTML = users.map(u => {
+    const sub = escapeHtml(u.sub);
+    const approveBtn = u.status !== 'approved'
+      ? `<button class="btn-sm" onclick="userAction('approve','${sub}')" style="color:var(--c-accent)">Одобрить</button>` : '';
+    const rejectBtn = (u.status !== 'rejected' && u.role !== 'admin')
+      ? `<button class="btn-sm" onclick="userAction('reject','${sub}')" style="color:var(--c-danger)">Отклонить</button>` : '';
+    return `<div class="run-item">
+      <div class="run-info">
+        <div class="run-title">${escapeHtml(u.name || u.email || u.sub)} ${u.role === 'admin' ? '<span class="badge badge-load">админ</span>' : ''}</div>
+        <div class="run-meta">${escapeHtml(u.email || '')} · ${statusLabel[u.status] || escapeHtml(u.status)}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0">${approveBtn}${rejectBtn}</div>
+    </div>`;
+  }).join('');
+}
+
+async function userAction(action, sub) {
+  if (action === 'reject' && !confirm('Отклонить доступ этому пользователю?')) return;
+  try {
+    const res = await fetch(API_URL + 'admin/users/' + action, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ sub }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { alert('Ошибка: ' + res.status); return; }
+    loadUsers();
+  } catch (e) { alert('Ошибка: ' + e.message); }
 }
 
 function renderAll(){renderMetrics();renderLog();renderPlan();}
@@ -959,6 +1198,7 @@ function initApp() {
   document.getElementById('r-date').value = today;
   renderMetrics();
   renderLog();
+  loadProfile();
   loadPlan();
   loadRunsFromCloud();
   loadRacesFromCloud();
@@ -967,9 +1207,8 @@ function initApp() {
 // ── Запуск с авторизацией ──
 document.getElementById('login-screen').classList.add('active');
 if (idToken) {
-  document.getElementById('login-screen').classList.remove('active');
-  document.getElementById('signout-btn').style.display = 'inline-flex';
-  initApp();
+  // Токен есть — проверяем статус через /me (approved/pending/rejected)
+  checkAccessAndInit();
 }
 
 // ====================================================
