@@ -724,6 +724,17 @@ def build_llm_context(bucket, sub):
     }
 
 
+# Порядок и подписи дней недели плана (7 дней, Пн→Вс). #23
+PLAN_DAYS = [("mon", "пн"), ("tue", "вт"), ("wed", "ср"), ("thu", "чт"),
+             ("fri", "пт"), ("sat", "сб"), ("sun", "вс")]
+
+
+def _week_days_str(week):
+    """Строка тренировок недели по дням; пустые/отсутствующие дни пропускаются."""
+    parts = [f"{label}={week.get(field)}" for field, label in PLAN_DAYS if week.get(field)]
+    return "; ".join(parts) if parts else "(пусто)"
+
+
 def format_context_for_llm(ctx):
     """Превращает контекст в текстовый user prompt."""
     lines = []
@@ -736,11 +747,11 @@ def format_context_for_llm(ctx):
         phase = PLAN_PHASE_LABELS.get(cw.get("type"), cw.get("type"))
         lines.append(f"Фаза: {phase} — {cw.get('accent', '')}")
         lines.append("План текущей недели:")
-        lines.append(f"  вс={cw.get('sun')}; пн={cw.get('mon')}; ср={cw.get('wed')}; пт={cw.get('fri')}; сб={cw.get('sat')}")
+        lines.append("  " + _week_days_str(cw))
     nw = ctx.get("next_week")
     if nw:
         lines.append("План следующей недели:")
-        lines.append(f"  вс={nw.get('sun')}; пн={nw.get('mon')}; ср={nw.get('wed')}; пт={nw.get('fri')}; сб={nw.get('sat')}")
+        lines.append("  " + _week_days_str(nw))
 
     lines.append("")
     lines.append("Последние 14 тренировок (сначала свежие):")

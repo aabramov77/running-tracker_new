@@ -109,8 +109,9 @@ def test_format_context_smoke(main_module):
         ],
         "last_races": [],
         "current_week": {"w": 2, "type": "dev", "accent": "Развитие",
-                         "sun": "14км", "mon": "8км", "wed": "6x1км",
-                         "fri": "10км", "sat": "4x2км"},
+                         "mon": "8км", "tue": "6км", "wed": "6x1км",
+                         "thu": "отдых-бег", "fri": "10км", "sat": "4x2км",
+                         "sun": "14км"},
         "next_week": None,
         "week_idx": 1,
         "plan_version": 1,
@@ -120,6 +121,19 @@ def test_format_context_smoke(main_module):
     text = main_module.format_context_for_llm(ctx)
     assert "2026-05-15" in text
     assert "14.2" in text
+    # 7-day calendar (#23): Tue/Thu now included in the plan context
+    assert "вт=6км" in text
+    assert "чт=отдых-бег" in text
+
+
+def test_week_days_str_skips_empty(main_module):
+    # 5-day legacy week (no tue/thu) renders without them, no crash
+    legacy = {"mon": "8", "wed": "6x1", "fri": "10", "sat": "4x2", "sun": "14"}
+    s = main_module._week_days_str(legacy)
+    assert "пн=8" in s and "вс=14" in s
+    assert "вт=" not in s and "чт=" not in s
+    # empty week
+    assert main_module._week_days_str({}) == "(пусто)"
 
 
 # ── FIT parsing ───────────────────────────────────────────────────────────────
