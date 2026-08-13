@@ -56,22 +56,73 @@ def test_profile_defaults_and_roundtrip(main_module, fake_bucket):
 
 # ── plan versioning (per-user, immutable versions) ────────────────────────────
 
+PID = "plan-1"
+
+
 def test_plan_versioning(main_module, fake_bucket):
     w1 = [{"w": 1, "type": "dev", "sun": "10км"}]
-    main_module.write_plan_version(fake_bucket, SUB, 1, w1, "seed")
-    man = main_module.read_plan_manifest(fake_bucket, SUB)
+    main_module.write_plan_version(fake_bucket, SUB, PID, 1, w1, "seed")
+    man = main_module.read_plan_manifest(fake_bucket, SUB, PID)
     assert man["current_version"] == 1
     v1 = main_module.read_plan_version(fake_bucket, man["gcs_object_path"])
     assert v1["weeks"] == w1
 
     w2 = [{"w": 1, "type": "dev", "sun": "12км"}]
-    main_module.write_plan_version(fake_bucket, SUB, 2, w2, "edit")
-    man2 = main_module.read_plan_manifest(fake_bucket, SUB)
+    main_module.write_plan_version(fake_bucket, SUB, PID, 2, w2, "edit")
+    man2 = main_module.read_plan_manifest(fake_bucket, SUB, PID)
     assert man2["current_version"] == 2
     # v1 still readable — immutable history preserved
-    assert main_module.read_plan_version(fake_bucket, f"users/{SUB}/plan/v1/plan.json")["weeks"] == w1
-    # other user has no plan
-    assert main_module.read_plan_manifest(fake_bucket, SUB2) is None
+    assert main_module.read_plan_version(
+        fake_bucket, f"users/{SUB}/plans/{PID}/v1/plan.json")["weeks"] == w1
+    assert main_module.read_plan_weeks(fake_bucket, SUB, PID) == w2
+    # other user / other plan has nothing
+    assert main_module.read_plan_manifest(fake_bucket, SUB2, PID) is None
+    assert main_module.read_plan_weeks(fake_bucket, SUB, "other-plan") == []
+
+
+def test_save_plan_weeks_increments_version(main_module, fake_bucket):
+    main_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "first")
+    r2 = main_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}, {"w": 2}], "second")
+    assert r2["version"] == 2
+    assert len(main_module.read_plan_weeks(fake_bucket, SUB, PID)) == 2
+
+
+# ── plans registry (#25) ──────────────────────────────────────────────────────
+
+def test_create_and_switch_plans(main_module, fake_bucket):
+    a = main_module.create_plan(fake_bucket, SUB, {"race_name": "HM", "race_date": "2026-08-09"})
+    assert main_module.get_active_plan(fake_bucket, SUB)["id"] == a["id"]   # first is active
+
+    b = main_module.create_plan(fake_bucket, SUB, {"race_name": "Marathon"})
+    assert main_module.get_active_plan(fake_bucket, SUB)["id"] == b["id"]   # new becomes active
+
+    main_module.set_active_plan(fake_bucket, SUB, a["id"])
+    assert main_module.get_active_plan(fake_bucket, SUB)["race_name"] == "HM"
+    # unknown id → None, active unchanged
+    assert main_module.set_active_plan(fake_bucket, SUB, "nope") is None
+    assert main_module.get_active_plan(fake_bucket, SUB)["id"] == a["id"]
+    # isolation: other user has no plans
+    assert main_module.read_plans_index(fake_bucket, SUB2)["plans"] == []
+
+
+def test_update_plan_meta(main_module, fake_bucket):
+    p = main_module.create_plan(fake_bucket, SUB, {"race_name": "HM"})
+    upd = main_module.update_plan_meta(fake_bucket, SUB, p["id"],
+                                       {"race_name": "Берлин", "target_time": "3:30"})
+    assert upd["race_name"] == "Берлин" and upd["target_time"] == "3:30"
+    assert main_module.update_plan_meta(fake_bucket, SUB, "ghost", {}) is None
+
+
+def test_archive_plan_switches_active(main_module, fake_bucket):
+    a = main_module.create_plan(fake_bucket, SUB, {"race_name": "A"})
+    b = main_module.create_plan(fake_bucket, SUB, {"race_name": "B"})   # active
+    main_module.archive_plan(fake_bucket, SUB, b["id"])
+    index = main_module.read_plans_index(fake_bucket, SUB)
+    assert index["active_plan_id"] == a["id"]            # fell back to remaining plan
+    assert len(main_module.active_plans(index)) == 1     # archived hidden
+    assert len(index["plans"]) == 2                      # but not deleted (soft)
+    # archived plan can't be activated
+    assert main_module.set_active_plan(fake_bucket, SUB, b["id"]) is None
 
 
 # ── LLM config versioning (GLOBAL — shared key, admin-managed) ────────────────
@@ -89,6 +140,33 @@ def test_llm_config_versioning(main_module, fake_bucket):
 
     main_module.write_llm_config_version(fake_bucket, "anthropic", "claude-x", "sk-ant-999")
     assert main_module.read_llm_config_full(fake_bucket)["version"] == 2
+
+
+def test_llm_context_uses_only_active_plan(main_module, fake_bucket):
+    """#25: контекст для LLM берёт недели активного плана и только его пробежки."""
+    a = main_module.create_plan(fake_bucket, SUB, {"race_name": "A", "plan_start": "2026-05-10"})
+    b = main_module.create_plan(fake_bucket, SUB, {"race_name": "B", "plan_start": "2026-06-01"})
+    main_module.save_plan_weeks(fake_bucket, SUB, a["id"], [{"w": 1, "mon": "A-неделя"}])
+    main_module.save_plan_weeks(fake_bucket, SUB, b["id"], [{"w": 1, "mon": "B-неделя"}])
+    main_module.write_runs(fake_bucket, SUB, [
+        {"id": 1, "date": "2026-05-20", "dist": 10, "plan_id": a["id"]},
+        {"id": 2, "date": "2026-06-10", "dist": 5, "plan_id": b["id"]},
+    ])
+
+    # активен B (создан последним)
+    ctx = main_module.build_llm_context(fake_bucket, SUB)
+    assert ctx["plan_id"] == b["id"]
+    assert [r["id"] for r in ctx["last_runs"]] == [2]
+    assert ctx["race"]["race_name"] == "B"
+    assert ctx["weeks_total"] == 1
+
+    # переключаемся на A → другой набор пробежек и недель
+    main_module.set_active_plan(fake_bucket, SUB, a["id"])
+    ctx_a = main_module.build_llm_context(fake_bucket, SUB)
+    assert [r["id"] for r in ctx_a["last_runs"]] == [1]
+    assert ctx_a["race"]["race_name"] == "A"
+    text = main_module.format_context_for_llm(ctx_a)
+    assert "A" in text and "A-неделя" in text
 
 
 # ── advice round-trip + daily usage ───────────────────────────────────────────
