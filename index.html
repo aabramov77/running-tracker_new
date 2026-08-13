@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=6">
+<link rel="stylesheet" href="style.css?v=19">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -86,9 +86,40 @@
   <!-- ПЛАН -->
   <div id="tab-plan" class="tab active">
     <div class="card">
-      <div class="week-header" style="margin-bottom:10px">
-        <div class="card-title" style="margin:0">Календарный план</div>
+      <div class="week-header" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <select id="plan-select" onchange="switchPlan(this.value)" style="max-width:220px"></select>
+          <button class="btn-sm" onclick="createNewPlan()">+ Новый план</button>
+          <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
+        </div>
         <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
+      </div>
+      <div class="card" id="race-form-card" style="display:none;background:var(--bg-metric);margin-bottom:12px">
+        <div class="card-title" id="race-form-title">Гонка этого плана</div>
+        <div class="form-grid">
+          <div class="form-group full">
+            <label>Название гонки</label>
+            <input type="text" id="p-race-name" placeholder="Например: Московский полумарафон">
+          </div>
+          <div class="form-group">
+            <label>Дата старта</label>
+            <input type="date" id="p-race-date">
+          </div>
+          <div class="form-group">
+            <label>Целевое время (чч:мм)</label>
+            <input type="text" id="p-target-time" placeholder="1:40">
+          </div>
+          <div class="form-group">
+            <label>Старт плана (для расчёта недели)</label>
+            <input type="date" id="p-plan-start">
+          </div>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn-primary" id="race-save-btn" onclick="saveRaceMeta()">Сохранить</button>
+          <button class="btn-sm" onclick="toggleRaceForm(false)">Закрыть</button>
+          <button class="btn-sm" id="race-archive-btn" onclick="archiveCurrentPlan()" style="color:var(--c-danger)">Архивировать план</button>
+          <span id="profile-msg" class="save-msg"></span>
+        </div>
       </div>
       <div id="plan-save-bar" class="plan-save-bar" style="display:none">
         <button class="btn-primary" id="plan-save-btn" onclick="savePlanEdits()">Сохранить изменения</button>
@@ -167,6 +198,10 @@
       </div>
       <p class="hint" style="margin-bottom:14px">FIT-загрузка заполняет форму распарсенными значениями (включая лапы и пульс по времени). Запись создаётся при нажатии «Сохранить пробежку».</p>
       <div class="form-grid">
+        <div class="form-group full" id="f-plan-group" style="display:none">
+          <label>План</label>
+          <select id="f-plan"></select>
+        </div>
         <div class="form-group">
           <label>Дата</label>
           <input type="date" id="f-date">
@@ -225,7 +260,10 @@
     <div class="card">
       <div class="week-header">
         <div class="card-title" style="margin:0">Журнал пробежек</div>
-        <button class="btn-sm" onclick="clearLog()">Очистить всё</button>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="btn-sm scope-btn active" data-scope="plan" onclick="setRunScope('plan',this)">Текущий план</button>
+          <button class="btn-sm scope-btn" data-scope="all" onclick="setRunScope('all',this)">Все</button>
+        </div>
       </div>
       <div id="run-log"><div class="empty">Пробежек пока нет. Добавьте первую!</div></div>
     </div>
@@ -233,6 +271,15 @@
 
   <!-- АНАЛИТИКА -->
   <div id="tab-stats" class="tab">
+    <div class="card" style="margin-bottom:12px">
+      <div class="week-header" style="margin:0">
+        <div class="card-title" style="margin:0">Область данных</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="btn-sm scope-btn active" data-scope="plan" onclick="setRunScope('plan',this)">Текущий план</button>
+          <button class="btn-sm scope-btn" data-scope="all" onclick="setRunScope('all',this)">Все</button>
+        </div>
+      </div>
+    </div>
     <div class="card"><div class="card-title">Недельный объём (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
     <div class="card" style="margin-top:12px"><div class="card-title">Динамика темпа (мин/км)</div><div class="chart-wrap"><canvas id="paceChart"></canvas></div></div>
   </div>
@@ -258,29 +305,7 @@
   <div id="tab-settings" class="tab">
     <div class="card" style="margin-bottom:12px">
       <div class="card-title">Моя гонка</div>
-      <p class="hint">Название, дата и цель вашего забега. Управляют заголовком, обратным отсчётом и прогрессом плана.</p>
-      <div class="form-grid">
-        <div class="form-group full">
-          <label>Название гонки</label>
-          <input type="text" id="p-race-name" placeholder="Например: Московский полумарафон">
-        </div>
-        <div class="form-group">
-          <label>Дата старта</label>
-          <input type="date" id="p-race-date">
-        </div>
-        <div class="form-group">
-          <label>Целевое время (чч:мм)</label>
-          <input type="text" id="p-target-time" placeholder="1:40">
-        </div>
-        <div class="form-group">
-          <label>Старт плана (для расчёта недели)</label>
-          <input type="date" id="p-plan-start">
-        </div>
-      </div>
-      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-        <button class="btn-primary" onclick="saveProfile()">Сохранить</button>
-        <span id="profile-msg" class="save-msg"></span>
-      </div>
+      <p class="hint">Данные гонки теперь задаются для каждого плана отдельно — на вкладке «План» кнопка «✏ Гонка».</p>
     </div>
     <div class="card" id="llm-settings-note" style="display:none">
       <div class="card-title">Настройки ИИ</div>
@@ -384,6 +409,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=18"></script>
+<script src="app.js?v=20"></script>
 </body>
 </html>

@@ -125,3 +125,52 @@ def test_migrate_legacy_copies_and_is_idempotent(main_module, fake_bucket):
     assert report2["copied"] == []
     assert report2["errors"] == []
     assert any("уже есть" in s for s in report2["skipped"])
+
+
+# ── #25: ленивая миграция одиночного плана → реестр планов ────────────────────
+
+SUB = "u-single"
+
+
+def _seed_single_plan(main_module, fake_bucket, sub=SUB):
+    """Состояние пользователя до #25: profile.json + users/{sub}/plan/*."""
+    main_module.write_profile(fake_bucket, sub, {
+        "race_name": "Полумарафон", "race_date": "2026-08-09",
+        "target_time": "1:40", "plan_start": "2026-05-10"})
+    fake_bucket.blob(f"users/{sub}/plan/v1/plan.json").upload_from_string(
+        '{"version": 1, "weeks": [{"w": 1, "mon": "8км"}]}')
+    fake_bucket.blob(f"users/{sub}/plan/manifest.json").upload_from_string(
+        f'{{"current_version": 1, "gcs_object_path": "users/{sub}/plan/v1/plan.json"}}')
+
+
+def test_lazy_migration_creates_plan_from_profile(main_module, fake_bucket):
+    _seed_single_plan(main_module, fake_bucket)
+    main_module.write_runs(fake_bucket, SUB, [{"id": 1, "dist": 10}, {"id": 2, "dist": 5}])
+
+    index = main_module.read_plans_index(fake_bucket, SUB)   # triggers migration
+    assert len(index["plans"]) == 1
+    plan = index["plans"][0]
+    assert index["active_plan_id"] == plan["id"]
+    # race metadata carried over from profile.json
+    assert plan["race_name"] == "Полумарафон" and plan["target_time"] == "1:40"
+    # current weeks became v1 of the new plan
+    assert main_module.read_plan_weeks(fake_bucket, SUB, plan["id"]) == [{"w": 1, "mon": "8км"}]
+    # existing runs attached to the migrated plan
+    assert all(r["plan_id"] == plan["id"] for r in main_module.read_runs(fake_bucket, SUB))
+    # legacy single-plan objects untouched (no physical delete)
+    assert fake_bucket.blob(f"users/{SUB}/plan/v1/plan.json").exists()
+
+
+def test_lazy_migration_is_idempotent(main_module, fake_bucket):
+    _seed_single_plan(main_module, fake_bucket)
+    first = main_module.read_plans_index(fake_bucket, SUB)
+    second = main_module.read_plans_index(fake_bucket, SUB)
+    assert first == second
+    assert len(second["plans"]) == 1
+
+
+def test_lazy_migration_noop_for_fresh_user(main_module, fake_bucket):
+    """Новый пользователь без плана и профиля → пустой реестр, ничего не создаётся."""
+    index = main_module.read_plans_index(fake_bucket, "u-fresh")
+    assert index["plans"] == [] and index["active_plan_id"] is None
+    assert main_module.get_active_plan(fake_bucket, "u-fresh") is None

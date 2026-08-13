@@ -62,8 +62,12 @@ def get_storage_client():
 def upfx(sub):                 return f"users/{sub}/"
 def p_runs(sub):               return f"{upfx(sub)}runs.json"
 def p_races(sub):              return f"{upfx(sub)}races.json"
-def p_plan_manifest(sub):      return f"{upfx(sub)}plan/manifest.json"
-def p_plan_ver(sub, v):        return f"{upfx(sub)}plan/v{v}/plan.json"
+def p_plans_index(sub):        return f"{upfx(sub)}plans/index.json"
+def p_plan_manifest(sub, pid): return f"{upfx(sub)}plans/{pid}/manifest.json"
+def p_plan_ver(sub, pid, v):   return f"{upfx(sub)}plans/{pid}/v{v}/plan.json"
+# Одиночный план до #25 — только для ленивой миграции
+def p_singleplan_manifest(sub): return f"{upfx(sub)}plan/manifest.json"
+def p_singleplan_ver(sub, v):   return f"{upfx(sub)}plan/v{v}/plan.json"
 def p_advice_manifest(sub):    return f"{upfx(sub)}advice/manifest.json"
 def p_advice_ver(sub, v):      return f"{upfx(sub)}advice/v{v}/recommendation.json"
 def p_advice_usage(sub):       return f"{upfx(sub)}advice/usage.json"
@@ -385,10 +389,10 @@ def attach_fit_details_to_run(bucket, sub, run, fit_token):
     run["calories"] = summary.get("calories")
 
 
-# ── Plan helpers ──────────────────────────────────────────────────────────────
+# ── Plan helpers (per-plan weeks; #25) ────────────────────────────────────────
 
-def read_plan_manifest(bucket, sub):
-    blob = bucket.blob(p_plan_manifest(sub))
+def read_plan_manifest(bucket, sub, plan_id):
+    blob = bucket.blob(p_plan_manifest(sub, plan_id))
     if not blob.exists():
         return None
     return json.loads(blob.download_as_text())
@@ -401,8 +405,19 @@ def read_plan_version(bucket, object_path):
     return json.loads(blob.download_as_text())
 
 
-def write_plan_version(bucket, sub, version, weeks, change_reason, created_by="api"):
-    object_path = p_plan_ver(sub, version)
+def read_plan_weeks(bucket, sub, plan_id):
+    """Недели текущей версии плана; [] если плана/версии нет."""
+    if not plan_id:
+        return []
+    manifest = read_plan_manifest(bucket, sub, plan_id)
+    if not manifest:
+        return []
+    data = read_plan_version(bucket, manifest["gcs_object_path"])
+    return (data or {}).get("weeks", [])
+
+
+def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api"):
+    object_path = p_plan_ver(sub, plan_id, version)
     now = datetime.utcnow().isoformat() + "Z"
 
     payload = {
@@ -431,11 +446,176 @@ def write_plan_version(bucket, sub, version, weeks, change_reason, created_by="a
         "change_reason": payload["change_reason"],
         "checksum": checksum,
     }
-    bucket.blob(p_plan_manifest(sub)).upload_from_string(
+    bucket.blob(p_plan_manifest(sub, plan_id)).upload_from_string(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
     return {"version": version, "gcs_object_path": object_path}
+
+
+def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="api"):
+    """Пишет следующую версию недель плана."""
+    manifest = read_plan_manifest(bucket, sub, plan_id)
+    next_version = (manifest["current_version"] + 1) if manifest else 1
+    return write_plan_version(bucket, sub, plan_id, next_version, weeks,
+                              change_reason, created_by)
+
+
+# ── Plans registry (#25: несколько планов на пользователя) ────────────────────
+
+PLAN_META_FIELDS = ("race_name", "race_date", "target_time", "plan_start")
+
+
+def _empty_plans_index():
+    return {"active_plan_id": None, "plans": []}
+
+
+def _new_plan_id():
+    """Уникальный id плана. Случайный суффикс обязателен: два плана, созданных
+    в одну миллисекунду, иначе получили бы один id и перезаписали данные друг друга."""
+    return f"{int(datetime.now().timestamp() * 1000)}-{secrets_mod.token_hex(3)}"
+
+
+def _read_plans_index_raw(bucket, sub):
+    blob = bucket.blob(p_plans_index(sub))
+    if not blob.exists():
+        return None
+    data = json.loads(blob.download_as_text())
+    data.setdefault("plans", [])
+    data.setdefault("active_plan_id", None)
+    return data
+
+
+def write_plans_index(bucket, sub, index):
+    bucket.blob(p_plans_index(sub)).upload_from_string(
+        json.dumps(index, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return index
+
+
+def read_plans_index(bucket, sub):
+    """Реестр планов. При отсутствии — запускает ленивую миграцию (см. migrate_single_plan)."""
+    index = _read_plans_index_raw(bucket, sub)
+    if index is None:
+        index = migrate_single_plan(bucket, sub)
+    return index
+
+
+def active_plans(index):
+    return [p for p in index.get("plans", []) if not p.get("archived")]
+
+
+def find_plan(index, plan_id):
+    return next((p for p in index.get("plans", []) if p.get("id") == plan_id), None)
+
+
+def get_active_plan(bucket, sub):
+    index = read_plans_index(bucket, sub)
+    return find_plan(index, index.get("active_plan_id"))
+
+
+def create_plan(bucket, sub, meta, make_active=True):
+    index = read_plans_index(bucket, sub)
+    plan = {
+        "id": _new_plan_id(),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "archived": False,
+        **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
+    }
+    index["plans"].append(plan)
+    if make_active or not index.get("active_plan_id"):
+        index["active_plan_id"] = plan["id"]
+    write_plans_index(bucket, sub, index)
+    return plan
+
+
+def set_active_plan(bucket, sub, plan_id):
+    index = read_plans_index(bucket, sub)
+    plan = find_plan(index, plan_id)
+    if not plan or plan.get("archived"):
+        return None
+    index["active_plan_id"] = plan_id
+    write_plans_index(bucket, sub, index)
+    return plan
+
+
+def update_plan_meta(bucket, sub, plan_id, meta):
+    index = read_plans_index(bucket, sub)
+    plan = find_plan(index, plan_id)
+    if not plan:
+        return None
+    for f in PLAN_META_FIELDS:
+        if f in meta:
+            plan[f] = meta.get(f) or ""
+    plan["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    write_plans_index(bucket, sub, index)
+    return plan
+
+
+def archive_plan(bucket, sub, plan_id):
+    """Логическое удаление: archived=true. Объекты плана не удаляются."""
+    index = read_plans_index(bucket, sub)
+    plan = find_plan(index, plan_id)
+    if not plan:
+        return None
+    plan["archived"] = True
+    plan["archived_at"] = datetime.utcnow().isoformat() + "Z"
+    if index.get("active_plan_id") == plan_id:
+        remaining = active_plans(index)
+        index["active_plan_id"] = remaining[0]["id"] if remaining else None
+    write_plans_index(bucket, sub, index)
+    return plan
+
+
+def migrate_single_plan(bucket, sub):
+    """Ленивая миграция одиночного плана (до #25) в реестр планов.
+
+    Данные гонки берём из profile.json, текущие недели — из users/{sub}/plan/.
+    Старые версии остаются по legacy-пути (append-only, ничего не удаляем):
+    текущие недели переписываются как v1 нового плана.
+    Всем существующим пробежкам проставляется plan_id.
+    """
+    index = _empty_plans_index()
+
+    old_manifest_blob = bucket.blob(p_singleplan_manifest(sub))
+    profile = read_profile(bucket, sub)
+    has_profile = any(profile.get(f) for f in PLAN_META_FIELDS)
+
+    if not old_manifest_blob.exists() and not has_profile:
+        # Нечего мигрировать — пустой реестр
+        return write_plans_index(bucket, sub, index)
+
+    plan = {
+        "id": _new_plan_id(),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "archived": False,
+        **{f: profile.get(f, "") for f in PLAN_META_FIELDS},
+    }
+    index["plans"].append(plan)
+    index["active_plan_id"] = plan["id"]
+    write_plans_index(bucket, sub, index)
+
+    # Текущие недели старого плана → v1 нового
+    if old_manifest_blob.exists():
+        old_manifest = json.loads(old_manifest_blob.download_as_text())
+        old_data = read_plan_version(bucket, old_manifest.get("gcs_object_path", ""))
+        weeks = (old_data or {}).get("weeks", [])
+        if weeks:
+            write_plan_version(bucket, sub, plan["id"], 1, weeks,
+                               "migrated from single plan (#25)", "auto-migrate")
+
+    # Привязываем существующие пробежки к мигрированному плану
+    runs = read_runs(bucket, sub)
+    changed = False
+    for r in runs:
+        if not r.get("plan_id"):
+            r["plan_id"] = plan["id"]
+            changed = True
+    if changed:
+        write_runs(bucket, sub, runs)
+
+    return index
 
 
 # ── LLM config helpers ────────────────────────────────────────────────────────
@@ -614,10 +794,19 @@ TYPE_LABELS = {
 DIST_LABEL_KM = {"4.2km": 4.2, "5km": 5, "10km": 10, "HM": 21.0975, "M": 42.195}
 
 
-def current_plan_week_idx():
-    """0-based индекс текущей недели от 2026-05-10."""
-    diff = (datetime.utcnow() - datetime(2026, 5, 10)).days // 7
-    return max(0, min(12, diff))
+def current_plan_week_idx(plan_start=None, weeks_count=0):
+    """0-based индекс текущей недели плана от его plan_start.
+    Без plan_start — исторический дефолт 2026-05-10; без длины плана — 13 недель.
+    """
+    start = datetime(2026, 5, 10)
+    if plan_start:
+        try:
+            start = datetime.strptime(plan_start[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            pass
+    n = weeks_count if weeks_count else 13
+    diff = (datetime.utcnow() - start).days // 7
+    return max(0, min(n - 1, diff))
 
 
 def compute_hr_drift(details):
@@ -657,10 +846,15 @@ def lap_paces_str(details, limit=15):
 
 
 def build_llm_context(bucket, sub):
-    """Собирает компактный богатый контекст для LLM (данные пользователя sub)."""
-    # Runs
+    """Собирает компактный богатый контекст для LLM: активный план и его пробежки."""
+    active_plan = get_active_plan(bucket, sub)
+    plan_id = active_plan["id"] if active_plan else None
+
+    # Runs активного плана (#25)
     all_runs = read_runs(bucket, sub)
     active_runs = [r for r in all_runs if not r.get("deleted", False)]
+    if plan_id:
+        active_runs = [r for r in active_runs if r.get("plan_id") == plan_id]
     active_runs.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_runs = active_runs[:14]
 
@@ -681,17 +875,19 @@ def build_llm_context(bucket, sub):
     active_races.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_races = active_races[:3]
 
-    # Plan
-    plan_manifest = read_plan_manifest(bucket, sub)
+    # Plan (недели активного плана)
     plan = None
     plan_version = None
-    if plan_manifest:
-        plan_data = read_plan_version(bucket, plan_manifest["gcs_object_path"])
-        if plan_data:
-            plan = plan_data["weeks"]
-            plan_version = plan_data["version"]
+    if plan_id:
+        plan_manifest = read_plan_manifest(bucket, sub, plan_id)
+        if plan_manifest:
+            plan_data = read_plan_version(bucket, plan_manifest["gcs_object_path"])
+            if plan_data:
+                plan = plan_data["weeks"]
+                plan_version = plan_data["version"]
 
-    week_idx = current_plan_week_idx()
+    week_idx = current_plan_week_idx(active_plan.get("plan_start") if active_plan else None,
+                                     len(plan) if plan else 0)
     current_week = plan[week_idx] if plan and 0 <= week_idx < len(plan) else None
     next_week = plan[week_idx + 1] if plan and (week_idx + 1) < len(plan) else None
 
@@ -715,7 +911,10 @@ def build_llm_context(bucket, sub):
         "current_week": current_week,
         "next_week": next_week,
         "week_idx": week_idx,
+        "weeks_total": len(plan) if plan else 0,
+        "plan_id": plan_id,
         "plan_version": plan_version,
+        "race": {f: (active_plan or {}).get(f, "") for f in PLAN_META_FIELDS},
         "heuristics": {
             "avg_pace_min_per_km": avg_pace,
             "hard_or_bad_count": hard_count,
@@ -738,9 +937,15 @@ def _week_days_str(week):
 def format_context_for_llm(ctx):
     """Превращает контекст в текстовый user prompt."""
     lines = []
-    lines.append(f"Цель: полумарафон {RACE_DATE}, {RACE_TARGET_TIME} (темп {RACE_TARGET_PACE})")
+    race = ctx.get("race") or {}
+    goal_bits = [b for b in [race.get("race_name"), race.get("race_date")] if b]
+    if race.get("target_time"):
+        goal_bits.append(f"цель {race['target_time']}")
+    lines.append("Цель: " + (", ".join(goal_bits) if goal_bits else "не задана"))
     lines.append(f"Сегодня: {datetime.utcnow().date().isoformat()}")
-    lines.append(f"Текущая неделя плана: {ctx['week_idx'] + 1} из 13")
+    total = ctx.get("weeks_total") or 0
+    lines.append(f"Текущая неделя плана: {ctx['week_idx'] + 1}"
+                 + (f" из {total}" if total else ""))
 
     cw = ctx.get("current_week")
     if cw:
@@ -863,6 +1068,7 @@ def write_advice_version(bucket, sub, recommendation, ctx, provider, model, inpu
         "created_at": now,
         "created_by": created_by,
         "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
+        "based_on_plan_id": ctx.get("plan_id"),
         "based_on_plan_version": ctx["plan_version"],
         "based_on_llm_config_version": llm_config_version,
         "provider": provider,
@@ -1045,10 +1251,12 @@ def migrate_legacy_to_user(bucket, sub):
             "target_time": "1:40", "plan_start": "2026-05-10",
         })
         report["copied"].append(p_profile(sub))
+    # Глобальный план → per-user одиночный план; дальше его подхватит
+    # migrate_single_plan() и переведёт в реестр планов (#25).
     migrate_versioned(
         LEGACY_PLAN_MANIFEST,
-        lambda v: f"plan/v{v}/plan.json", lambda v: p_plan_ver(sub, v),
-        p_plan_manifest(sub))
+        lambda v: f"plan/v{v}/plan.json", lambda v: p_singleplan_ver(sub, v),
+        p_singleplan_manifest(sub))
     migrate_versioned(
         LEGACY_ADVICE_MANIFEST,
         lambda v: f"advice/v{v}/recommendation.json", lambda v: p_advice_ver(sub, v),
@@ -1348,26 +1556,81 @@ def runs_api(request):
             else:
                 return jresp({"error": "Method not allowed"}, 405)
 
-        # ── /plan — per-user; новый пользователь → пустой план (без авто-сида) ─
-        if path == "/plan":
+        # ── /plans — реестр планов (#25) ──────────────────────────────────────
+        if path == "/plans":
             if request.method == "GET":
-                manifest = read_plan_manifest(bucket, sub)
-                if not manifest:
-                    return jresp([], 200)   # пустой план — строится через конструктор
-                plan_data = read_plan_version(bucket, manifest["gcs_object_path"])
-                if not plan_data:
-                    return jresp({"error": "plan version missing"}, 500)
-                return jresp(plan_data["weeks"], 200)
+                # первый вызов запускает ленивую миграцию одиночного плана
+                return jresp(read_plans_index(bucket, sub), 200)
+            elif request.method == "POST":
+                body = request.get_json(silent=True) or {}
+                plan = create_plan(bucket, sub, body)
+                return jresp(plan, 201)
+            else:
+                return jresp({"error": "Method not allowed"}, 405)
+
+        if path == "/plans/active":
+            if request.method != "POST":
+                return jresp({"error": "Method not allowed"}, 405)
+            body = request.get_json(silent=True) or {}
+            plan = set_active_plan(bucket, sub, body.get("plan_id"))
+            if not plan:
+                return jresp({"error": "plan not found"}, 404)
+            return jresp({"ok": True, "active_plan_id": plan["id"]}, 200)
+
+        m_meta = re.match(r"^/plans/([\w-]+)/meta$", path)
+        if m_meta:
+            if request.method != "POST":
+                return jresp({"error": "Method not allowed"}, 405)
+            plan = update_plan_meta(bucket, sub, m_meta.group(1), request.get_json(silent=True) or {})
+            if not plan:
+                return jresp({"error": "plan not found"}, 404)
+            return jresp(plan, 200)
+
+        m_arch = re.match(r"^/plans/([\w-]+)/archive$", path)
+        if m_arch:
+            if request.method != "POST":
+                return jresp({"error": "Method not allowed"}, 405)
+            plan = archive_plan(bucket, sub, m_arch.group(1))
+            if not plan:
+                return jresp({"error": "plan not found"}, 404)
+            return jresp({"ok": True, "plan": plan}, 200)
+
+        m_weeks = re.match(r"^/plans/([\w-]+)/weeks$", path)
+        if m_weeks:
+            plan_id = m_weeks.group(1)
+            index = read_plans_index(bucket, sub)
+            if not find_plan(index, plan_id):
+                return jresp({"error": "plan not found"}, 404)
+            if request.method == "GET":
+                return jresp(read_plan_weeks(bucket, sub, plan_id), 200)
+            elif request.method == "POST":
+                body = request.get_json(silent=True)
+                if not body or "weeks" not in body:
+                    return jresp({"error": "Missing weeks"}, 400)
+                result = save_plan_weeks(bucket, sub, plan_id, body["weeks"],
+                                         body.get("change_reason", ""),
+                                         user.get("email", "api"))
+                return jresp(result, 201)
+            else:
+                return jresp({"error": "Method not allowed"}, 405)
+
+        # ── /plan — шорткат на недели активного плана (совместимость) ─────────
+        if path == "/plan":
+            active = get_active_plan(bucket, sub)
+            if request.method == "GET":
+                if not active:
+                    return jresp([], 200)   # планов нет — строится через конструктор
+                return jresp(read_plan_weeks(bucket, sub, active["id"]), 200)
 
             elif request.method == "POST":
                 body = request.get_json(silent=True)
                 if not body or "weeks" not in body:
                     return jresp({"error": "Missing weeks"}, 400)
-                manifest = read_plan_manifest(bucket, sub)
-                next_version = (manifest["current_version"] + 1) if manifest else 1
-                result = write_plan_version(
-                    bucket, sub, next_version, body["weeks"],
-                    body.get("change_reason", ""), body.get("created_by", user.get("email", "api")))
+                if not active:
+                    return jresp({"error": "no active plan"}, 400)
+                result = save_plan_weeks(bucket, sub, active["id"], body["weeks"],
+                                         body.get("change_reason", ""),
+                                         user.get("email", "api"))
                 return jresp(result, 201)
 
             else:
@@ -1386,12 +1649,19 @@ def runs_api(request):
                 for field in ["date", "dist"]:
                     if field not in body:
                         return jresp({"error": f"Missing field: {field}"}, 400)
+                # Привязка к плану: явный plan_id или активный план (#25)
+                plan_id = body.get("plan_id")
+                if plan_id is None:
+                    active = get_active_plan(bucket, sub)
+                    plan_id = active["id"] if active else None
+
                 run = {
                     "id": body.get("id", int(datetime.now().timestamp() * 1000)),
                     "date": body["date"], "dist": float(body["dist"]),
                     "type": body.get("type", "easy"), "time": body.get("time", ""),
                     "pace": body.get("pace", ""), "hr": body.get("hr"),
                     "feel": body.get("feel", "good"), "notes": body.get("notes", ""),
+                    "plan_id": plan_id,
                     "deleted": False,
                 }
                 fit_token = body.get("fit_token")

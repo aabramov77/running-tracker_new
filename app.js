@@ -17,7 +17,9 @@ let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
 let currentRole = null;
 let currentUser = {};
-let PROFILE = { race_name: '', race_date: '', target_time: '', plan_start: '' };
+let PLANS = [];             // все планы пользователя (#25)
+let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
+let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
 
 // Google sub из JWT — только для namespace кэша (не для безопасности; сервер
 // сам проверяет подпись). Декодируем payload без верификации.
@@ -105,40 +107,126 @@ let runs = JSON.parse(localStorage.getItem(ck('running_tracker_runs')) || '[]');
 let races = JSON.parse(localStorage.getItem(ck('running_tracker_races')) || '[]');
 let isOnline = false;
 
-// ── Профиль гонки (per-user) ──
+// ── Планы (#25): реестр, активный план, данные гонки ──
 function planWeeks() { return (PLAN && PLAN.length) ? PLAN.length : 13; }
-function planStartDate() { return PROFILE.plan_start ? new Date(PROFILE.plan_start) : new Date('2026-05-10'); }
+function planStartDate() {
+  return ACTIVE_PLAN?.plan_start ? new Date(ACTIVE_PLAN.plan_start) : new Date('2026-05-10');
+}
+function activePlanId() { return ACTIVE_PLAN ? ACTIVE_PLAN.id : null; }
+// Кэш недель — свой у каждого плана, иначе планы затирали бы друг друга
+function planCacheKey() { return ck('running_tracker_plan') + '__' + (activePlanId() || 'none'); }
+function livePlans() { return PLANS.filter(p => !p.archived); }
+function planLabel(p) {
+  return p.race_name || (p.race_date ? `Забег ${p.race_date}` : 'Без названия');
+}
 
 function applyProfileToHeader() {
+  const race = ACTIVE_PLAN || {};
   document.getElementById('app-title').textContent =
-    PROFILE.race_name || (PROFILE.race_date ? `Забег ${PROFILE.race_date}` : 'Running Tracker');
+    race.race_name || (race.race_date ? `Забег ${race.race_date}` : 'Running Tracker');
   const bits = [];
-  if (PROFILE.target_time) bits.push(`Цель: ${PROFILE.target_time}`);
+  if (race.target_time) bits.push(`Цель: ${race.target_time}`);
   if (PLAN && PLAN.length) bits.push(`план ${PLAN.length} недель`);
   if (currentUser.name || currentUser.email) bits.push(currentUser.name || currentUser.email);
   document.getElementById('header-subtitle').textContent = bits.join(' · ');
 }
 
-function fillProfileForm() {
-  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
-  set('p-race-name', PROFILE.race_name);
-  set('p-race-date', PROFILE.race_date);
-  set('p-target-time', PROFILE.target_time);
-  set('p-plan-start', PROFILE.plan_start);
+// Селектор планов над таблицей + выпадающий список в форме пробежки
+function renderPlanSelectors() {
+  const list = livePlans();
+  const sel = document.getElementById('plan-select');
+  if (sel) {
+    sel.innerHTML = list.map(p =>
+      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}</option>`
+    ).join('');
+    sel.style.display = list.length ? '' : 'none';
+  }
+  const runSel = document.getElementById('f-plan');
+  if (runSel) {
+    const prev = runSel.value;
+    runSel.innerHTML = list.map(p =>
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(planLabel(p))}</option>`).join('');
+    runSel.value = (prev && list.some(p => p.id === prev)) ? prev : (activePlanId() || '');
+    const wrap = document.getElementById('f-plan-group');
+    if (wrap) wrap.style.display = list.length ? '' : 'none';
+  }
+  fillRaceForm();
 }
 
-async function loadProfile() {
+function fillRaceForm() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+  const race = ACTIVE_PLAN || {};
+  set('p-race-name', race.race_name);
+  set('p-race-date', race.race_date);
+  set('p-target-time', race.target_time);
+  set('p-plan-start', race.plan_start);
+}
+
+async function loadPlans() {
   try {
-    const res = await fetch(API_URL + 'profile', { headers: authHeaders() });
+    const res = await fetch(API_URL + 'plans', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); return; }
-    if (res.ok) PROFILE = await res.json();
+    if (res.ok) {
+      const idx = await res.json();
+      PLANS = idx.plans || [];
+      ACTIVE_PLAN = PLANS.find(p => p.id === idx.active_plan_id) || null;
+    }
   } catch (e) {}
+  renderPlanSelectors();
   applyProfileToHeader();
-  fillProfileForm();
   renderMetrics();
 }
 
-async function saveProfile() {
+async function switchPlan(planId) {
+  if (!planId || planId === activePlanId()) return;
+  try {
+    const res = await fetch(API_URL + 'plans/active', {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ plan_id: planId }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    cancelPlanEdit();
+    await loadPlans();
+    await loadPlan();       // недели нового активного плана
+    renderAll();
+  } catch (e) { alert('Не удалось переключить план: ' + e.message); }
+}
+
+// Форма гонки работает в двух режимах: создание нового плана и правка текущего
+let planFormMode = 'edit';
+
+function openPlanForm(mode) {
+  planFormMode = mode;
+  const card = document.getElementById('race-form-card');
+  if (!card) return;
+  card.style.display = '';
+  document.getElementById('race-form-title').textContent =
+    mode === 'create' ? 'Новый план' : 'Гонка этого плана';
+  document.getElementById('race-save-btn').textContent =
+    mode === 'create' ? 'Создать план' : 'Сохранить';
+  document.getElementById('race-archive-btn').style.display =
+    mode === 'create' ? 'none' : '';
+  if (mode === 'create') {
+    ['p-race-name', 'p-race-date', 'p-target-time', 'p-plan-start']
+      .forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('p-race-name').focus();
+  } else {
+    fillRaceForm();
+  }
+}
+
+function createNewPlan() { openPlanForm('create'); }
+
+function toggleRaceForm(show) {
+  const card = document.getElementById('race-form-card');
+  if (!card) return;
+  const visible = show !== undefined ? show : card.style.display === 'none';
+  if (visible) openPlanForm('edit');
+  else card.style.display = 'none';
+}
+
+async function saveRaceMeta() {
   const body = {
     race_name: document.getElementById('p-race-name').value.trim(),
     race_date: document.getElementById('p-race-date').value,
@@ -146,23 +234,71 @@ async function saveProfile() {
     plan_start: document.getElementById('p-plan-start').value,
   };
   const msg = document.getElementById('profile-msg');
+  const flash = (text, ok) => {
+    msg.style.display = 'inline';
+    msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
+    msg.textContent = text;
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2000 : 4000);
+  };
+
+  const creating = planFormMode === 'create';
+  if (creating && !body.race_name) { flash('⚠ Введите название гонки', false); return; }
+  if (!creating && !activePlanId()) { flash('⚠ Сначала создайте план', false); return; }
+
+  const url = creating ? API_URL + 'plans' : `${API_URL}plans/${activePlanId()}/meta`;
   try {
-    const res = await fetch(API_URL + 'profile', {
+    const res = await fetch(url, {
       method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    PROFILE = await res.json();
-    applyProfileToHeader();
-    renderMetrics();
-    renderLog();  // week labels зависят от plan_start
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-accent)'; msg.textContent = '✓ Сохранено';
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 2000);
+    if (creating) cancelPlanEdit();
+    await loadPlans();
+    if (creating) await loadPlan();   // у нового плана недель нет → пустое состояние
+    renderAll();
+    if (creating) openPlanForm('edit');
+    flash(creating ? '✓ План создан' : '✓ Сохранено', true);
   } catch (e) {
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)'; msg.textContent = '⚠ ' + e.message;
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 4000);
+    flash('⚠ ' + e.message, false);
   }
+}
+
+async function archiveCurrentPlan() {
+  const id = activePlanId();
+  if (!id) return;
+  if (!confirm(`Архивировать план «${planLabel(ACTIVE_PLAN)}»? Данные сохранятся, план пропадёт из списка.`)) return;
+  try {
+    const res = await fetch(`${API_URL}plans/${id}/archive`, {
+      method: 'POST', headers: authHeaders(),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    cancelPlanEdit();
+    toggleRaceForm(false);
+    await loadPlans();
+    await loadPlan();
+    renderAll();
+  } catch (e) { alert('Не удалось архивировать: ' + e.message); }
+}
+
+// ── Область данных: текущий план или все пробежки (#25) ──
+function setRunScope(scope, btn) {
+  runScope = scope;
+  document.querySelectorAll('.scope-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  document.querySelectorAll('.scope-btn[data-scope="' + scope + '"]').forEach(b => b.classList.add('active'));
+  renderAll();
+  if (document.getElementById('tab-stats').classList.contains('active')) renderCharts();
+  if (document.getElementById('tab-adjust').classList.contains('active')) renderAdjust();
+}
+
+/** Активные пробежки с учётом выбранной области (план / все). */
+function scopedRuns() {
+  const active = runs.filter(r => !r.deleted);
+  const pid = activePlanId();
+  if (runScope === 'all' || !pid) return active;
+  return active.filter(r => r.plan_id === pid);
 }
 
 function escapeHtml(s) {
@@ -221,7 +357,7 @@ function setStatus(msg, type = 'ok') {
 }
 
 async function loadPlan() {
-  const cached = localStorage.getItem(ck('running_tracker_plan'));
+  const cached = localStorage.getItem(planCacheKey());
   if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
   try {
     const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
@@ -231,7 +367,7 @@ async function loadPlan() {
     if (Array.isArray(weeks)) {
       // [] — новый пользователь без плана (покажем пустое состояние + «Создать план»)
       PLAN = weeks;
-      localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
+      localStorage.setItem(planCacheKey(), JSON.stringify(PLAN));
       renderPlan();
       applyProfileToHeader();  // «план N недель» зависит от длины плана
     } else if (!PLAN) {
@@ -431,6 +567,8 @@ async function saveRun() {
     notes: document.getElementById('f-notes').value,
   };
   if (_pendingFitToken) run.fit_token = _pendingFitToken;
+  const planSel = document.getElementById('f-plan');
+  if (planSel && planSel.value) run.plan_id = planSel.value;   // #25
 
   const btn = document.querySelector('#tab-add .btn-primary');
   btn.disabled = true; btn.textContent = 'Сохраняем…';
@@ -595,7 +733,7 @@ async function savePlanEdits() {
     });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    localStorage.setItem(ck('running_tracker_plan'), JSON.stringify(PLAN));
+    localStorage.setItem(planCacheKey(), JSON.stringify(PLAN));
     const msg = document.getElementById('plan-save-msg');
     msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
@@ -607,7 +745,7 @@ async function savePlanEdits() {
 }
 
 function renderMetrics() {
-  const activeRuns = runs.filter(r => !r.deleted);
+  const activeRuns = scopedRuns();
   const totalKm = activeRuns.reduce((s,r)=>s+r.dist,0);
   const paces = activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const bestPace = paces.length ? Math.min(...paces) : null;
@@ -620,7 +758,7 @@ function renderMetrics() {
   document.getElementById('m-week').textContent = `неделя ${Math.min(cw+1, n)} из ${n}`;
   // Обратный отсчёт — только если задана дата гонки в профиле
   const block = document.getElementById('countdown-block');
-  const rd = PROFILE.race_date ? new Date(PROFILE.race_date) : null;
+  const rd = ACTIVE_PLAN?.race_date ? new Date(ACTIVE_PLAN.race_date) : null;
   if (rd && !isNaN(rd)) {
     const days = Math.ceil((rd - new Date())/(24*3600*1000));
     document.getElementById('countdown').textContent = days>0 ? days+' дн' : 'Старт!';
@@ -632,8 +770,15 @@ function renderMetrics() {
 
 function renderLog() {
   const el = document.getElementById('run-log');
-  const activeRuns = runs.filter(r => !r.deleted);
-  if (!activeRuns.length) { el.innerHTML='<div class="empty">Пробежек пока нет. Добавьте первую!</div>'; return; }
+  const activeRuns = scopedRuns();
+  if (!activeRuns.length) {
+    el.innerHTML = runScope === 'plan' && activePlanId()
+      ? '<div class="empty">В этом плане пробежек пока нет. Переключитесь на «Все» или добавьте первую!</div>'
+      : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>';
+    return;
+  }
+  const planName = {};
+  PLANS.forEach(p => { planName[p.id] = planLabel(p); });
   const typeLabels = {easy:'Лёгкий',interval:'Интервалы',tempo:'Темповый',long:'Длительный',race:'Соревнование',recovery:'Восстановление'};
   const feelEmoji = {great:'😊',good:'🙂',ok:'😐',hard:'😓',bad:'😔'};
   el.innerHTML = activeRuns.map(r => {
@@ -644,6 +789,7 @@ function renderLog() {
       <div class="run-info">
         <div class="run-title">${typeLabels[r.type] || escapeHtml(r.type)} — ${escapeHtml(String(r.dist))} км ${feelEmoji[r.feel]||''}</div>
         <div class="run-meta">${r.pace?`<span class="${pc}">${escapeHtml(r.pace)}/км</span> · `:''}${r.time?escapeHtml(r.time)+' · ':''}${r.hr?r.hr+' уд/мин':''}</div>
+        ${runScope==='all'&&r.plan_id&&planName[r.plan_id]?`<div class="run-meta" style="opacity:.65">📋 ${escapeHtml(planName[r.plan_id])}</div>`:''}
         ${r.notes?`<div class="run-note">${escapeHtml(r.notes)}</div>`:''}
       </div>
       <button class="btn-sm" onclick="event.stopPropagation();deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
@@ -915,7 +1061,7 @@ function closeRunDetail(event) {
 
 let wChart=null,pChart=null;
 function renderCharts() {
-  const activeRuns = runs.filter(r => !r.deleted);
+  const activeRuns = scopedRuns();
   const n = planWeeks();
   const start = planStartDate();
   const weekKm={};
@@ -929,7 +1075,7 @@ function renderCharts() {
 
 function renderAdjust() {
   const el=document.getElementById('adjust-content');
-  const activeRuns = runs.filter(r => !r.deleted);
+  const activeRuns = scopedRuns();
   if(activeRuns.length<2){el.innerHTML='<div class="empty">Добавьте несколько пробежек для рекомендаций</div>';return;}
   const paces=activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
   const avgPace=paces.length?paces.reduce((a,b)=>a+b,0)/paces.length:null;
@@ -1201,8 +1347,7 @@ function initApp() {
   document.getElementById('r-date').value = today;
   renderMetrics();
   renderLog();
-  loadProfile();
-  loadPlan();
+  loadPlans().then(loadPlan);   // сначала реестр планов, потом недели активного
   loadRunsFromCloud();
   loadRacesFromCloud();
 }
