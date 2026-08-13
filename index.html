@@ -95,7 +95,7 @@
         <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
       </div>
       <div class="card" id="race-form-card" style="display:none;background:var(--bg-metric);margin-bottom:12px">
-        <div class="card-title">Гонка этого плана</div>
+        <div class="card-title" id="race-form-title">Гонка этого плана</div>
         <div class="form-grid">
           <div class="form-group full">
             <label>Название гонки</label>
@@ -115,9 +115,9 @@
           </div>
         </div>
         <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <button class="btn-primary" onclick="saveRaceMeta()">Сохранить</button>
+          <button class="btn-primary" id="race-save-btn" onclick="saveRaceMeta()">Сохранить</button>
           <button class="btn-sm" onclick="toggleRaceForm(false)">Закрыть</button>
-          <button class="btn-sm" onclick="archiveCurrentPlan()" style="color:var(--c-danger)">Архивировать план</button>
+          <button class="btn-sm" id="race-archive-btn" onclick="archiveCurrentPlan()" style="color:var(--c-danger)">Архивировать план</button>
           <span id="profile-msg" class="save-msg"></span>
         </div>
       </div>
@@ -409,6 +409,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=19"></script>
+<script src="app.js?v=20"></script>
 </body>
 </html>

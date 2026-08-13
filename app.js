@@ -193,34 +193,40 @@ async function switchPlan(planId) {
   } catch (e) { alert('Не удалось переключить план: ' + e.message); }
 }
 
-async function createNewPlan() {
-  const name = prompt('Название гонки для нового плана:', '');
-  if (name === null) return;
-  try {
-    const res = await fetch(API_URL + 'plans', {
-      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ race_name: name.trim() }),
-    });
-    if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    cancelPlanEdit();
-    await loadPlans();
-    await loadPlan();       // у нового плана недель нет → пустое состояние
-    renderAll();
-    toggleRaceForm(true);   // сразу предложим заполнить даты/цель
-  } catch (e) { alert('Не удалось создать план: ' + e.message); }
+// Форма гонки работает в двух режимах: создание нового плана и правка текущего
+let planFormMode = 'edit';
+
+function openPlanForm(mode) {
+  planFormMode = mode;
+  const card = document.getElementById('race-form-card');
+  if (!card) return;
+  card.style.display = '';
+  document.getElementById('race-form-title').textContent =
+    mode === 'create' ? 'Новый план' : 'Гонка этого плана';
+  document.getElementById('race-save-btn').textContent =
+    mode === 'create' ? 'Создать план' : 'Сохранить';
+  document.getElementById('race-archive-btn').style.display =
+    mode === 'create' ? 'none' : '';
+  if (mode === 'create') {
+    ['p-race-name', 'p-race-date', 'p-target-time', 'p-plan-start']
+      .forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('p-race-name').focus();
+  } else {
+    fillRaceForm();
+  }
 }
+
+function createNewPlan() { openPlanForm('create'); }
 
 function toggleRaceForm(show) {
   const card = document.getElementById('race-form-card');
   if (!card) return;
   const visible = show !== undefined ? show : card.style.display === 'none';
-  card.style.display = visible ? '' : 'none';
-  if (visible) fillRaceForm();
+  if (visible) openPlanForm('edit');
+  else card.style.display = 'none';
 }
 
 async function saveRaceMeta() {
-  if (!activePlanId()) { alert('Сначала создайте план'); return; }
   const body = {
     race_name: document.getElementById('p-race-name').value.trim(),
     race_date: document.getElementById('p-race-date').value,
@@ -228,20 +234,33 @@ async function saveRaceMeta() {
     plan_start: document.getElementById('p-plan-start').value,
   };
   const msg = document.getElementById('profile-msg');
+  const flash = (text, ok) => {
+    msg.style.display = 'inline';
+    msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
+    msg.textContent = text;
+    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2000 : 4000);
+  };
+
+  const creating = planFormMode === 'create';
+  if (creating && !body.race_name) { flash('⚠ Введите название гонки', false); return; }
+  if (!creating && !activePlanId()) { flash('⚠ Сначала создайте план', false); return; }
+
+  const url = creating ? API_URL + 'plans' : `${API_URL}plans/${activePlanId()}/meta`;
   try {
-    const res = await fetch(`${API_URL}plans/${activePlanId()}/meta`, {
+    const res = await fetch(url, {
       method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (creating) cancelPlanEdit();
     await loadPlans();
+    if (creating) await loadPlan();   // у нового плана недель нет → пустое состояние
     renderAll();
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-accent)'; msg.textContent = '✓ Сохранено';
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 2000);
+    if (creating) openPlanForm('edit');
+    flash(creating ? '✓ План создан' : '✓ Сохранено', true);
   } catch (e) {
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)'; msg.textContent = '⚠ ' + e.message;
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 4000);
+    flash('⚠ ' + e.message, false);
   }
 }
 
