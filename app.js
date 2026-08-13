@@ -483,6 +483,9 @@ function clearLog() {
 }
 
 const PLAN_TYPES = [['dev','Развитие'],['peak','Пик'],['taper','Тейпер'],['load','Разгрузка'],['race','Старт']];
+// Порядок дней недели плана (7 дней, Пн→Вс). #23
+const PLAN_DAYS = [['mon','Пн'],['tue','Вт'],['wed','Ср'],['thu','Чт'],['fri','Пт'],['sat','Сб'],['sun','Вс']];
+const PLAN_COLSPAN = 3 + PLAN_DAYS.length;   // Нед + Даты + Акцент + дни = 10
 
 function renderPlan() {
   const body = document.getElementById('plan-body');
@@ -506,9 +509,9 @@ function renderPlan() {
         </td>
         <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
         <td class="editable" style="min-width:96px">${inp(i,'accent',r.accent)}${typeSel(i,r.type)}</td>
-        ${dayCell(i,'sun',r.sun)}${dayCell(i,'mon',r.mon)}${dayCell(i,'wed',r.wed)}${dayCell(i,'fri',r.fri)}${dayCell(i,'sat',r.sat)}
+        ${PLAN_DAYS.map(([f]) => dayCell(i, f, r[f])).join('')}
       </tr>`).join('') +
-      `<tr><td colspan="8" style="text-align:center;padding:10px">
+      `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:10px">
         <button class="btn-sm" onclick="addPlanWeek()">+ Неделя</button>
       </td></tr>`;
     return;
@@ -516,7 +519,7 @@ function renderPlan() {
 
   // ── Пустое состояние (не в режиме редактирования) ──
   if (!PLAN?.length) {
-    body.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:2rem">
+    body.innerHTML = `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:2rem">
       <div class="empty" style="padding:0 0 12px">План пуст</div>
       <button class="btn-primary" onclick="enterPlanEditMode()">Создать план</button>
     </td></tr>`;
@@ -532,7 +535,7 @@ function renderPlan() {
       <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w ?? i+1}</td>
       <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${escapeHtml(r.start ?? '')}<br>${escapeHtml(r.end ?? '')}</td>
       <td><span class="badge ${badgeMap[r.type]||''}">${labelMap[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
-      ${dayCell(r.sun,'sun')}${dayCell(r.mon,'mon')}${dayCell(r.wed,'wed')}${dayCell(r.fri,'fri')}${dayCell(r.sat,'sat')}
+      ${PLAN_DAYS.map(([f]) => dayCell(r[f], f)).join('')}
     </tr>`).join('');
 }
 
@@ -567,7 +570,7 @@ function addPlanWeek() {
   collectPlanEdits();
   if (!Array.isArray(PLAN)) PLAN = [];
   PLAN.push({ w: PLAN.length + 1, start:'', end:'', accent:'', type:'dev',
-              sun:'', mon:'', wed:'', fri:'', sat:'' });
+              mon:'', tue:'', wed:'', thu:'', fri:'', sat:'', sun:'' });
   renderPlan();
 }
 
