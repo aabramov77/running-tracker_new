@@ -690,6 +690,8 @@ function enterPlanEditMode() {
 }
 
 function cancelPlanEdit() {
+  // Если идёт предпросмотр импорта — «Отмена» откатывает загрузку целиком
+  if (_planBackup !== null) { cancelPlanImport(); return; }
   planEditMode = false;
   document.getElementById('plan-edit-btn').textContent = '✏ Редактировать';
   document.getElementById('plan-save-bar').style.display = 'none';
@@ -719,6 +721,310 @@ function deletePlanWeek(i) {
   renderPlan();
 }
 
+// ── Импорт/экспорт плана (#28) ────────────────────────────────────────────────
+// Формат описан в docs/plan-import-format.md
+
+let _planBackup = null;      // план до импорта (для отмены); null = импорта нет
+let _importedRace = null;    // данные гонки из JSON — для «Создать новый план»
+
+// Синонимы заголовков CSV → поле недели
+const PLAN_CSV_FIELDS = [
+  ['w',      ['нед', 'неделя', '№', 'w', 'week']],
+  ['start',  ['начало', 'старт', 'start']],
+  ['end',    ['конец', 'окончание', 'end']],
+  ['accent', ['акцент', 'фокус', 'accent', 'focus']],
+  ['type',   ['тип', 'type', 'фаза', 'phase']],
+  ['mon',    ['пн', 'понедельник', 'mon', 'monday']],
+  ['tue',    ['вт', 'вторник', 'tue', 'tuesday']],
+  ['wed',    ['ср', 'среда', 'wed', 'wednesday']],
+  ['thu',    ['чт', 'четверг', 'thu', 'thursday']],
+  ['fri',    ['пт', 'пятница', 'fri', 'friday']],
+  ['sat',    ['сб', 'суббота', 'sat', 'saturday']],
+  ['sun',    ['вс', 'воскресенье', 'sun', 'sunday']],
+];
+
+/** Принимает код (dev) или подпись (Развитие); неизвестное → dev + предупреждение. */
+function normalizePlanType(value) {
+  const s = (value || '').toString().trim().toLowerCase();
+  if (!s) return { type: 'dev', warn: null };
+  const byCode = PLAN_TYPES.find(([code]) => code === s);
+  if (byCode) return { type: byCode[0], warn: null };
+  const byLabel = PLAN_TYPES.find(([, label]) => label.toLowerCase() === s);
+  if (byLabel) return { type: byLabel[0], warn: null };
+  return { type: 'dev', warn: `неизвестный тип «${value}» → Развитие` };
+}
+
+function parsePlanCSV(text) {
+  const rows = parseCSV(text).filter(r => r.some(c => (c || '').trim() !== ''));
+  if (!rows.length) return { errors: ['Файл пуст'] };
+
+  const colOf = {};
+  const unknown = [];
+  rows[0].forEach((raw, i) => {
+    const h = normalizeHeader(raw);
+    if (!h) return;
+    const hit = PLAN_CSV_FIELDS.find(([, syn]) => syn.includes(h));
+    if (hit) { if (colOf[hit[0]] === undefined) colOf[hit[0]] = i; }
+    else unknown.push(raw.trim());
+  });
+
+  if (!PLAN_DAYS.some(([f]) => colOf[f] !== undefined)) {
+    return { errors: ['Не найдено ни одной колонки дня недели (Пн…Вс). Проверьте строку заголовка — см. docs/plan-import-format.md'] };
+  }
+
+  const warnings = [];
+  if (unknown.length) warnings.push('Игнорируются колонки: ' + unknown.join(', '));
+
+  const weeks = [];
+  rows.slice(1).forEach((r, idx) => {
+    const cell = f => (colOf[f] !== undefined ? (r[colOf[f]] || '') : '').trim();
+    const t = normalizePlanType(cell('type'));
+    if (t.warn) warnings.push(`Строка ${idx + 2}: ${t.warn}`);
+    const week = { w: weeks.length + 1, start: cell('start'), end: cell('end'),
+                   accent: cell('accent'), type: t.type };
+    PLAN_DAYS.forEach(([f]) => { week[f] = cell(f); });
+    weeks.push(week);
+  });
+
+  if (!weeks.length) return { errors: ['В файле только заголовок, нет строк с данными'] };
+  return { weeks, warnings };
+}
+
+function parsePlanJSON(text) {
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { return { errors: ['Некорректный JSON: ' + e.message] }; }
+
+  const warnings = [];
+  let rawWeeks, race = null;
+  if (Array.isArray(data)) {
+    rawWeeks = data;
+  } else if (data && Array.isArray(data.weeks)) {
+    rawWeeks = data.weeks;
+    race = data.race || null;
+    if (data.version && Number(data.version) > 1) {
+      warnings.push(`Версия формата ${data.version} новее поддерживаемой (1) — часть полей может быть проигнорирована`);
+    }
+  } else {
+    return { errors: ['Ожидался объект с полем "weeks" или массив недель'] };
+  }
+  if (!rawWeeks.length) return { errors: ['Список недель пуст'] };
+
+  const weeks = rawWeeks.map((r, i) => {
+    const t = normalizePlanType(r && r.type);
+    if (t.warn) warnings.push(`Неделя ${i + 1}: ${t.warn}`);
+    const week = { w: i + 1, start: ((r && r.start) || '').toString(),
+                   end: ((r && r.end) || '').toString(),
+                   accent: ((r && r.accent) || '').toString(), type: t.type };
+    PLAN_DAYS.forEach(([f]) => { week[f] = ((r && r[f]) || '').toString(); });
+    return week;
+  });
+  return { weeks, race, warnings };
+}
+
+function importPlanFile(file) {
+  if (!file) return;
+  const input = document.getElementById('plan-import-file');
+  const reader = new FileReader();
+  reader.onload = e => {
+    const text = (e.target.result || '').replace(/^﻿/, '');   // Excel BOM
+    const looksJson = /\.json$/i.test(file.name) || /^\s*[\[{]/.test(text);
+    const res = looksJson ? parsePlanJSON(text) : parsePlanCSV(text);
+    if (input) input.value = '';
+    if (res.errors && res.errors.length) {
+      renderImportBar({ fileName: file.name, errors: res.errors });
+      return;
+    }
+    applyImportedPlan(res.weeks, file.name, res.warnings || [], res.race || null);
+  };
+  reader.onerror = () => renderImportBar({ fileName: file.name, errors: ['Не удалось прочитать файл'] });
+  reader.readAsText(file, 'UTF-8');
+}
+
+/** Показывает загруженный план в конструкторе, ничего не сохраняя. */
+function applyImportedPlan(weeks, fileName, warnings, race) {
+  _planBackup = Array.isArray(PLAN) ? JSON.parse(JSON.stringify(PLAN)) : [];
+  _importedRace = race;
+  PLAN = weeks;
+  planEditMode = true;
+  document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
+  document.getElementById('plan-save-bar').style.display = 'none';  // свой бар
+  renderPlan();
+  renderImportBar({ fileName, count: weeks.length, warnings });
+}
+
+function renderImportBar({ fileName, count, warnings, errors }) {
+  const bar = document.getElementById('plan-import-bar');
+  const summary = document.getElementById('plan-import-summary');
+  const warnEl = document.getElementById('plan-import-warnings');
+  const actions = document.getElementById('plan-import-actions');
+  const closeBtn = document.getElementById('plan-import-close');
+  if (!bar) return;
+  bar.style.display = '';
+  bar.classList.toggle('error', !!errors);
+  if (errors) {
+    summary.textContent = `⚠ Не удалось загрузить «${fileName}»`;
+    warnEl.style.display = '';
+    warnEl.innerHTML = errors.map(escapeHtml).join('<br>');
+    actions.style.display = 'none';
+    closeBtn.style.display = '';
+  } else {
+    summary.textContent = `✓ Загружено недель: ${count} из «${fileName}». Проверьте и при необходимости поправьте, затем выберите действие.`;
+    warnEl.style.display = (warnings && warnings.length) ? '' : 'none';
+    warnEl.innerHTML = (warnings || []).map(w => '⚠ ' + escapeHtml(w)).join('<br>');
+    actions.style.display = 'flex';
+    closeBtn.style.display = 'none';
+  }
+}
+
+function hideImportBar() {
+  const bar = document.getElementById('plan-import-bar');
+  if (bar) { bar.style.display = 'none'; bar.classList.remove('error'); }
+}
+
+function importFlash(text) {
+  const summary = document.getElementById('plan-import-summary');
+  if (summary) summary.textContent = text;
+}
+
+function finishImport() {
+  _planBackup = null; _importedRace = null;
+  planEditMode = false;
+  document.getElementById('plan-edit-btn').textContent = '✏ Редактировать';
+  document.getElementById('plan-save-bar').style.display = 'none';
+  hideImportBar();
+}
+
+function cancelPlanImport() {
+  PLAN = _planBackup || [];
+  finishImport();
+  renderPlan();
+  applyProfileToHeader();
+}
+
+async function saveImportedPlan() {
+  collectPlanEdits();
+  PLAN.forEach((r, i) => { r.w = i + 1; });
+  try {
+    await postPlanWeeks(PLAN, 'import from file');
+    finishImport();
+    renderPlan();
+    applyProfileToHeader();
+  } catch (e) { importFlash('⚠ Не удалось сохранить: ' + e.message); }
+}
+
+async function saveImportedAsNewPlan() {
+  collectPlanEdits();
+  PLAN.forEach((r, i) => { r.w = i + 1; });
+  const weeks = JSON.parse(JSON.stringify(PLAN));
+  const race = _importedRace || {};
+  try {
+    const res = await fetch(API_URL + 'plans', {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        race_name: (race.race_name || '').trim() || 'Импортированный план',
+        race_date: race.race_date || '', target_time: race.target_time || '',
+        plan_start: race.plan_start || '',
+      }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const plan = await res.json();          // новый план сразу становится активным
+    const wres = await fetch(`${API_URL}plans/${plan.id}/weeks`, {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ weeks, change_reason: 'import from file' }),
+    });
+    if (!wres.ok) throw new Error('HTTP ' + wres.status);
+    finishImport();
+    await loadPlans();
+    await loadPlan();
+    renderAll();
+  } catch (e) { importFlash('⚠ Не удалось создать план: ' + e.message); }
+}
+
+// ── Экспорт ──
+
+function csvCell(v) {
+  const s = (v === null || v === undefined) ? '' : String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function planToCSV(weeks) {
+  const header = ['Нед', 'Начало', 'Конец', 'Акцент', 'Тип', ...PLAN_DAYS.map(([, label]) => label)];
+  const lines = [header.join(',')];
+  (weeks || []).forEach((r, i) => {
+    lines.push([r.w ?? i + 1, r.start, r.end, r.accent, r.type,
+                ...PLAN_DAYS.map(([f]) => r[f])].map(csvCell).join(','));
+  });
+  return lines.join('\r\n');
+}
+
+function downloadFile(name, content, mime) {
+  const blob = new Blob([content], { type: mime + ';charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function planFileName(ext) {
+  const raw = (ACTIVE_PLAN && ACTIVE_PLAN.race_name) || 'training';
+  const base = raw.replace(/\s+/g, '-').replace(/[^\wа-яА-ЯёЁ-]/g, '') || 'training';
+  return `plan-${base}-${new Date().toISOString().slice(0, 10)}.${ext}`;
+}
+
+function exportPlanCSV() {
+  if (!PLAN || !PLAN.length) { renderImportBar({ fileName: '—', errors: ['План пуст — нечего выгружать'] }); return; }
+  // BOM, чтобы Excel открыл русский текст в UTF-8
+  downloadFile(planFileName('csv'), '﻿' + planToCSV(PLAN), 'text/csv');
+}
+
+function exportPlanJSON() {
+  if (!PLAN || !PLAN.length) { renderImportBar({ fileName: '—', errors: ['План пуст — нечего выгружать'] }); return; }
+  const race = ACTIVE_PLAN || {};
+  const payload = {
+    format: 'running-tracker-plan',
+    version: 1,
+    race: {
+      race_name: race.race_name || '', race_date: race.race_date || '',
+      target_time: race.target_time || '', plan_start: race.plan_start || '',
+    },
+    weeks: PLAN.map((r, i) => {
+      const w = { w: r.w ?? i + 1, start: r.start || '', end: r.end || '',
+                  accent: r.accent || '', type: r.type || 'dev' };
+      PLAN_DAYS.forEach(([f]) => { w[f] = r[f] || ''; });
+      return w;
+    }),
+  };
+  downloadFile(planFileName('json'), JSON.stringify(payload, null, 2), 'application/json');
+}
+
+function downloadPlanTemplate() {
+  const sample = [
+    { w: 1, start: '10.05', end: '16.05', accent: 'Развитие', type: 'dev',
+      mon: '6–8 км легко', tue: '', wed: '3×7 мин по 4:35–4:40', thu: '',
+      fri: '8–10 км средний', sat: '8 км по 5:05–5:15', sun: '12 км легко' },
+    { w: 2, start: '17.05', end: '23.05', accent: 'Развитие', type: 'dev',
+      mon: '7–8 км легко', tue: '4 км восстановительный', wed: '6×1 км по 4:30–4:35', thu: '',
+      fri: '10 км средний', sat: '4×2 км по 4:48–4:50', sun: '14–16 км легко' },
+  ];
+  downloadFile('plan-template.csv', '﻿' + planToCSV(sample), 'text/csv');
+}
+
+/** Пишет недели в активный план (бэкенд создаёт новую версию). */
+async function postPlanWeeks(weeks, changeReason) {
+  const res = await fetch(API_URL + 'plan', {
+    method: 'POST',
+    headers: authHeaders({'Content-Type': 'application/json'}),
+    body: JSON.stringify({ weeks, change_reason: changeReason })
+  });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  localStorage.setItem(planCacheKey(), JSON.stringify(weeks));
+  return res.json();
+}
+
 async function savePlanEdits() {
   collectPlanEdits();
   if (!Array.isArray(PLAN)) PLAN = [];
@@ -726,14 +1032,7 @@ async function savePlanEdits() {
   const btn = document.getElementById('plan-save-btn');
   btn.disabled = true; btn.textContent = 'Сохранение…';
   try {
-    const res = await fetch(API_URL + 'plan', {
-      method: 'POST',
-      headers: authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ weeks: PLAN, change_reason: 'manual edit' })
-    });
-    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    localStorage.setItem(planCacheKey(), JSON.stringify(PLAN));
+    await postPlanWeeks(PLAN, 'manual edit');
     const msg = document.getElementById('plan-save-msg');
     msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);

@@ -182,6 +182,23 @@ table.plan tr:hover td { background: var(--bg-metric); }
 }
 .btn-sm:hover { opacity: .8; }
 
+/* Бар предпросмотра импорта плана (#28) */
+.plan-import-bar {
+  border-left: 3px solid var(--c-accent);
+  background: var(--c-accent-light);
+  color: var(--c-accent-dark);
+  border-radius: 0 8px 8px 0;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.plan-import-bar.error {
+  border-color: var(--c-danger);
+  background: var(--c-danger-light);
+  color: var(--c-danger);
+}
+.plan-import-bar .hint { color: inherit; opacity: .85; margin: 0; }
+
 /* Переключатель области данных: текущий план / все (#25) */
 .scope-btn.active {
   background: var(--c-accent);

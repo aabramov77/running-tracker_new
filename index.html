@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=19">
+<link rel="stylesheet" href="style.css?v=21">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -92,7 +92,29 @@
           <button class="btn-sm" onclick="createNewPlan()">+ Новый план</button>
           <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
         </div>
-        <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
+            ⤒ Загрузить
+            <input type="file" id="plan-import-file" accept=".csv,.json"
+                   onchange="importPlanFile(this.files[0])" style="display:none">
+          </label>
+          <button class="btn-sm" onclick="exportPlanCSV()" title="Скачать текущий план в CSV">⤓ CSV</button>
+          <button class="btn-sm" onclick="exportPlanJSON()" title="Скачать текущий план в JSON">⤓ JSON</button>
+          <button class="btn-sm" onclick="downloadPlanTemplate()" title="Скачать пример формата">Шаблон</button>
+          <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
+        </div>
+      </div>
+      <div id="plan-import-bar" class="plan-import-bar" style="display:none">
+        <div id="plan-import-summary"></div>
+        <div id="plan-import-warnings" class="hint" style="display:none;margin:6px 0 0"></div>
+        <div id="plan-import-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn-primary" onclick="saveImportedPlan()">Сохранить в текущий план</button>
+          <button class="btn-sm" onclick="saveImportedAsNewPlan()">Создать новый план</button>
+          <button class="btn-sm" onclick="cancelPlanImport()" style="color:var(--c-danger)">Отменить импорт</button>
+        </div>
+        <div style="margin-top:10px">
+          <button class="btn-sm" id="plan-import-close" onclick="hideImportBar()" style="display:none">Закрыть</button>
+        </div>
       </div>
       <div class="card" id="race-form-card" style="display:none;background:var(--bg-metric);margin-bottom:12px">
         <div class="card-title" id="race-form-title">Гонка этого плана</div>
@@ -409,6 +431,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=20"></script>
+<script src="app.js?v=21"></script>
 </body>
 </html>
