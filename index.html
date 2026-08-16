@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=21">
+<link rel="stylesheet" href="style.css?v=22">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -79,7 +79,7 @@
     <button class="nav-btn" onclick="showTab('stats',this)">Аналитика</button>
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
-    <button class="nav-btn" onclick="showTab('settings',this)">⚙ Настройки</button>
+    <button class="nav-btn" onclick="showTab('profile',this)">👤 Профиль</button>
     <button class="nav-btn" id="nav-users-btn" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
   </nav>
 
@@ -140,7 +140,7 @@
           <button class="btn-primary" id="race-save-btn" onclick="saveRaceMeta()">Сохранить</button>
           <button class="btn-sm" onclick="toggleRaceForm(false)">Закрыть</button>
           <button class="btn-sm" id="race-archive-btn" onclick="archiveCurrentPlan()" style="color:var(--c-danger)">Архивировать план</button>
-          <span id="profile-msg" class="save-msg"></span>
+          <span id="race-meta-msg" class="save-msg"></span>
         </div>
       </div>
       <div id="plan-save-bar" class="plan-save-bar" style="display:none">
@@ -324,10 +324,128 @@
   </div>
 
   <!-- НАСТРОЙКИ -->
-  <div id="tab-settings" class="tab">
+  <div id="tab-profile" class="tab">
     <div class="card" style="margin-bottom:12px">
-      <div class="card-title">Моя гонка</div>
-      <p class="hint">Данные гонки теперь задаются для каждого плана отдельно — на вкладке «План» кнопка «✏ Гонка».</p>
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Профиль спортсмена</div>
+        <span class="hint" id="profile-version" style="margin:0"></span>
+      </div>
+      <p class="hint">Эти данные уходят в контекст ИИ вместе с планом и тренировками — чем полнее профиль, тем точнее рекомендации. Незаполненные поля просто пропускаются.</p>
+
+      <div class="profile-section">Личное</div>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>ФИО</label>
+          <input type="text" id="pr-full-name" placeholder="Иванов Иван">
+        </div>
+        <div class="form-group">
+          <label>Дата рождения</label>
+          <input type="date" id="pr-birth-date" oninput="updateProfileHints()">
+        </div>
+        <div class="form-group">
+          <label>Пол</label>
+          <select id="pr-sex">
+            <option value="">—</option>
+            <option value="m">Мужской</option>
+            <option value="f">Женский</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Рост (см)</label>
+          <input type="number" id="pr-height-cm" min="100" max="250" placeholder="182" oninput="updateProfileHints()">
+        </div>
+        <div class="form-group">
+          <label>Вес (кг)</label>
+          <input type="number" id="pr-weight-kg" step="0.1" min="30" max="200" placeholder="74" oninput="updateProfileHints()">
+        </div>
+      </div>
+
+      <div class="profile-section">Физиология</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Пульс максимальный</label>
+          <input type="number" id="pr-hr-max" min="100" max="230" placeholder="178">
+        </div>
+        <div class="form-group">
+          <label>Пульс ПАНО</label>
+          <input type="number" id="pr-hr-threshold" min="80" max="220" placeholder="162">
+        </div>
+        <div class="form-group">
+          <label>Пульс покоя</label>
+          <input type="number" id="pr-hr-rest" min="30" max="120" placeholder="48">
+        </div>
+        <div class="form-group">
+          <label>МПК (VO₂max)</label>
+          <input type="number" id="pr-vo2max" step="0.1" min="20" max="90" placeholder="52">
+        </div>
+      </div>
+
+      <div class="profile-section">Тренировки</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Стаж бега (лет)</label>
+          <input type="number" id="pr-years-running" step="0.5" min="0" max="70" placeholder="6">
+        </div>
+        <div class="form-group">
+          <label>Обычный объём (км/нед)</label>
+          <input type="number" id="pr-weekly-km" step="1" min="0" max="300" placeholder="45">
+        </div>
+        <div class="form-group">
+          <label>Тренировок в неделю</label>
+          <input type="number" id="pr-sessions" min="0" max="14" placeholder="4">
+        </div>
+        <div class="form-group">
+          <label>День длительной</label>
+          <select id="pr-long-run-day">
+            <option value="">—</option>
+            <option value="mon">Понедельник</option>
+            <option value="tue">Вторник</option>
+            <option value="wed">Среда</option>
+            <option value="thu">Четверг</option>
+            <option value="fri">Пятница</option>
+            <option value="sat">Суббота</option>
+            <option value="sun">Воскресенье</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>Дни, доступные для тренировок</label>
+          <div class="day-picker" id="pr-available-days">
+            <label><input type="checkbox" value="mon"><span>Пн</span></label>
+            <label><input type="checkbox" value="tue"><span>Вт</span></label>
+            <label><input type="checkbox" value="wed"><span>Ср</span></label>
+            <label><input type="checkbox" value="thu"><span>Чт</span></label>
+            <label><input type="checkbox" value="fri"><span>Пт</span></label>
+            <label><input type="checkbox" value="sat"><span>Сб</span></label>
+            <label><input type="checkbox" value="sun"><span>Вс</span></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="profile-section">Здоровье и пожелания</div>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>Травмы и ограничения</label>
+          <textarea id="pr-injuries" rows="2" placeholder="Например: правое ахилловое, беспокоит после интервалов"></textarea>
+        </div>
+        <div class="form-group full">
+          <label>От спортсмена — что важно знать тренеру</label>
+          <textarea id="pr-notes" rows="3" placeholder="Цели, режим дня, командировки, предпочтения по тренировкам"></textarea>
+        </div>
+      </div>
+
+      <div class="profile-derived" id="profile-derived"></div>
+
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn-primary" onclick="saveProfile()">Сохранить</button>
+        <button class="btn-sm" onclick="showLlmPreview()">👁 Показать контекст для ИИ</button>
+        <span id="profile-msg" class="save-msg"></span>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-title">Личные рекорды</div>
+      <p class="hint">Считаются автоматически по разделу «Старты».</p>
+      <div id="profile-pb"><div class="empty">Загрузка…</div></div>
     </div>
     <div class="card" id="llm-settings-note" style="display:none">
       <div class="card-title">Настройки ИИ</div>
@@ -413,6 +531,21 @@
     </div>
   </div>
 
+  <!-- Контекст для ИИ (#32) -->
+  <div id="llm-preview-overlay" class="run-detail-overlay" onclick="closeLlmPreview(event)">
+    <div class="run-detail-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div class="card-title" style="margin:0">Что уйдёт в ИИ</div>
+        <button class="btn-sm" onclick="closeLlmPreview()" style="color:var(--text-muted);font-size:16px">✕</button>
+      </div>
+      <p class="hint">Ровно этот текст отправляется модели при нажатии «Запросить рекомендации» в разделе «Корректировка».</p>
+      <pre id="llm-preview-body" class="llm-preview">Загрузка…</pre>
+      <div style="margin-top:16px">
+        <button class="btn-primary" onclick="closeLlmPreview()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Детали тренировки -->
   <div id="run-detail-overlay" class="run-detail-overlay" onclick="closeRunDetail(event)">
     <div class="run-detail-card">
@@ -431,6 +564,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=21"></script>
+<script src="app.js?v=22"></script>
 </body>
 </html>

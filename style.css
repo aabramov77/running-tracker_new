@@ -401,3 +401,72 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .badge-10k  { background: var(--c-accent-light);  color: var(--c-accent-dark); }
 .badge-hm   { background: var(--c-warn-light);    color: var(--c-warn); }
 .badge-marathon { background: var(--c-danger-light); color: var(--c-danger); }
+
+/* ── Профиль спортсмена (#32) ── */
+.profile-section {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin: 18px 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 0.5px solid var(--border);
+}
+.profile-section:first-of-type { margin-top: 8px; }
+
+.day-picker { display: flex; gap: 6px; flex-wrap: wrap; }
+.day-picker label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 0.5px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  user-select: none;
+}
+.day-picker input { margin: 0; accent-color: var(--c-accent); }
+.day-picker label:has(input:checked) {
+  background: var(--c-accent-light);
+  border-color: var(--c-accent);
+  color: var(--c-accent-dark);
+}
+
+.profile-derived:empty { display: none; }
+.profile-derived {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--bg-metric);
+  border-radius: 10px;
+}
+.derived-row { font-size: 14px; }
+.derived-sep { color: var(--text-muted); margin: 0 8px; }
+.hr-zones { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.hr-zone {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-card);
+  border: 0.5px solid var(--border);
+  white-space: nowrap;
+}
+
+table.pb-table { width: 100%; border-collapse: collapse; }
+table.pb-table td { padding: 8px 0; border-bottom: 0.5px solid var(--border); font-size: 14px; }
+table.pb-table tr:last-child td { border-bottom: none; }
+table.pb-table td:last-child { text-align: right; }
+
+.llm-preview {
+  font-family: 'DM Mono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-metric);
+  border-radius: 10px;
+  padding: 12px;
+  margin: 0;
+  max-height: 55vh;
+  overflow-y: auto;
+}

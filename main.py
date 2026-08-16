@@ -1190,6 +1190,19 @@ def build_llm_context(bucket, sub):
     }
 
 
+def plural_ru(number, one, few, many):
+    """«1 тренировка», «3 тренировки», «5 тренировок» — промпт читает человек тоже."""
+    tail = abs(int(number)) % 100
+    if 11 <= tail <= 14:
+        return many
+    tail %= 10
+    if tail == 1:
+        return one
+    if 2 <= tail <= 4:
+        return few
+    return many
+
+
 def format_profile_block(profile, derived, bests):
     """Строки профиля для промпта. Незаполненное не печатаем — шум для модели."""
     lines = []
@@ -1199,7 +1212,7 @@ def format_profile_block(profile, derived, bests):
     if profile.get("sex"):
         who.append(SEX_LABELS.get(profile["sex"], ""))
     if derived.get("age") is not None:
-        who.append(f"{derived['age']} лет")
+        who.append(f"{derived['age']} {plural_ru(derived['age'], 'год', 'года', 'лет')}")
     if profile.get("height_cm"):
         who.append(f"{profile['height_cm']} см")
     if profile.get("weight_kg"):
@@ -1226,11 +1239,13 @@ def format_profile_block(profile, derived, bests):
 
     experience = []
     if profile.get("years_running"):
-        experience.append(f"стаж {profile['years_running']:g} лет")
+        years = profile["years_running"]
+        experience.append(f"стаж {years:g} {plural_ru(years, 'год', 'года', 'лет')}")
     if profile.get("weekly_km_typical"):
         experience.append(f"обычный объём {profile['weekly_km_typical']:g} км/нед")
     if profile.get("sessions_per_week"):
-        experience.append(f"{profile['sessions_per_week']} тренировок в неделю")
+        sessions = profile["sessions_per_week"]
+        experience.append(f"{sessions} {plural_ru(sessions, 'тренировка', 'тренировки', 'тренировок')} в неделю")
     if experience:
         lines.append("Опыт: " + ", ".join(experience))
 

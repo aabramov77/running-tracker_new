@@ -170,6 +170,14 @@ def test_format_context_without_profile_has_no_block(main_module):
     assert "Профиль:" not in text and "Ограничения:" not in text
 
 
+@pytest.mark.parametrize("n,expected", [
+    (1, "тренировка"), (2, "тренировки"), (4, "тренировки"),
+    (5, "тренировок"), (11, "тренировок"), (14, "тренировок"), (21, "тренировка"),
+])
+def test_plural_ru(main_module, n, expected):
+    assert main_module.plural_ru(n, "тренировка", "тренировки", "тренировок") == expected
+
+
 def test_profile_block_marks_estimated_hr_max(main_module):
     """Оценка HRmax помечается — модель не должна принять её за измерение."""
     profile = {**main_module.empty_athlete_profile(), "birth_date": "1986-01-01"}
