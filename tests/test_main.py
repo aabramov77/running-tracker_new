@@ -3,6 +3,7 @@
 These lock in behavior we previously verified manually (cadence fix, pace/time
 formatting, LLM JSON extraction, key masking, HR-drift, FIT parsing).
 """
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -124,6 +125,62 @@ def test_format_context_smoke(main_module):
     # 7-day calendar (#23): Tue/Thu now included in the plan context
     assert "вт=6км" in text
     assert "чт=отдых-бег" in text
+
+
+def test_format_context_includes_profile_block(main_module):
+    """#32: заполненный профиль печатается первым блоком промпта."""
+    ctx = {
+        "profile": {"sex": "m", "birth_date": "1979-03-01", "height_cm": 182,
+                    "weight_kg": 74.0, "hr_max": 178, "hr_threshold": 162,
+                    "hr_rest": 48, "years_running": 6, "weekly_km_typical": 45,
+                    "sessions_per_week": 4, "available_days": ["mon", "wed", "sat"],
+                    "long_run_day": "sun", "injuries": "правое ахилловое",
+                    "notes": "во вторник тренировок не бывает"},
+        "profile_derived": {"age": 47, "bmi": 22.3, "hr_max_estimated": None},
+        "personal_bests": [{"km": 10, "time": "44:30", "date": "2026-07-04"}],
+        "last_runs": [], "last_races": [], "current_week": None, "next_week": None,
+        "week_idx": 0, "plan_version": 1,
+        "heuristics": {"avg_pace_min_per_km": None, "hard_or_bad_count": 0,
+                       "total_km_last_14": 0},
+    }
+    text = main_module.format_context_for_llm(ctx)
+    assert text.startswith("Профиль: М, 47 лет, 182 см, 74 кг (ИМТ 22.3)")
+    assert "макс 178" in text and "ПАНО 162" in text
+    assert "доступные дни — пн, ср, сб" in text and "длительная — вс" in text
+    assert "10 км 44:30 (2026-07-04)" in text
+    assert "Ограничения: правое ахилловое" in text
+    assert "От спортсмена: во вторник" in text
+    # профиль идёт до цели и тренировок
+    assert text.index("Профиль:") < text.index("Цель:")
+
+
+def test_format_context_without_profile_has_no_block(main_module):
+    """Пустой профиль не должен добавлять в промпт пустых строк-заглушек."""
+    ctx = {
+        "profile": main_module.empty_athlete_profile(),
+        "profile_derived": main_module.compute_athlete_derived(main_module.empty_athlete_profile()),
+        "personal_bests": [],
+        "last_runs": [], "last_races": [], "current_week": None, "next_week": None,
+        "week_idx": 0, "plan_version": None,
+        "heuristics": {"avg_pace_min_per_km": None, "hard_or_bad_count": 0,
+                       "total_km_last_14": 0},
+    }
+    text = main_module.format_context_for_llm(ctx)
+    assert text.startswith("Цель:")
+    assert "Профиль:" not in text and "Ограничения:" not in text
+
+
+def test_profile_block_marks_estimated_hr_max(main_module):
+    """Оценка HRmax помечается — модель не должна принять её за измерение."""
+    profile = {**main_module.empty_athlete_profile(), "birth_date": "1986-01-01"}
+    derived = main_module.compute_athlete_derived(profile, today=date(2026, 8, 16))
+    lines = "\n".join(main_module.format_profile_block(profile, derived, []))
+    assert "оценка по возрасту" in lines
+    # с измеренным пульсом оценки в промпте нет
+    measured = {**profile, "hr_max": 190}
+    lines2 = "\n".join(main_module.format_profile_block(
+        measured, main_module.compute_athlete_derived(measured, today=date(2026, 8, 16)), []))
+    assert "оценка" not in lines2 and "макс 190" in lines2
 
 
 def test_week_days_str_skips_empty(main_module):

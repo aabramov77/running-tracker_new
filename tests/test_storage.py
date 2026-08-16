@@ -37,21 +37,170 @@ def test_runs_namespaced_paths(main_module, fake_bucket):
     assert "runs.json" not in fake_bucket._store   # no global write
 
 
-# ── profile (per-user race config) ────────────────────────────────────────────
+# ── legacy race profile (до #25; сейчас — только источник для миграции) ───────
 
-def test_profile_defaults_and_roundtrip(main_module, fake_bucket):
+def test_legacy_race_profile_defaults_and_roundtrip(main_module, fake_bucket):
     # no profile yet → defaults (all empty)
-    p = main_module.read_profile(fake_bucket, SUB)
+    p = main_module.read_legacy_race_profile(fake_bucket, SUB)
     assert p == {"race_name": "", "race_date": "", "target_time": "", "plan_start": ""}
 
-    main_module.write_profile(fake_bucket, SUB, {
+    main_module.write_legacy_race_profile(fake_bucket, SUB, {
         "race_name": "Берлин", "race_date": "2026-09-27",
         "target_time": "3:30", "plan_start": "2026-06-01", "junk": "ignored"})
-    p2 = main_module.read_profile(fake_bucket, SUB)
+    p2 = main_module.read_legacy_race_profile(fake_bucket, SUB)
     assert p2["race_name"] == "Берлин" and p2["target_time"] == "3:30"
     assert "junk" not in p2                       # only known fields kept
     # isolation
-    assert main_module.read_profile(fake_bucket, SUB2)["race_name"] == ""
+    assert main_module.read_legacy_race_profile(fake_bucket, SUB2)["race_name"] == ""
+
+
+# ── athlete profile (#32): версии, валидация, вычисляемые, рекорды ────────────
+
+FILLED_PROFILE = {
+    "full_name": "Иванов Иван", "birth_date": "1979-03-01", "sex": "m",
+    "height_cm": "182", "weight_kg": "74.4", "hr_max": "178",
+    "hr_threshold": "162", "hr_rest": "48", "vo2max": "52",
+    "years_running": "6", "weekly_km_typical": "45", "sessions_per_week": "4",
+    "available_days": ["sat", "mon", "wed"], "long_run_day": "sun",
+    "injuries": "  правое ахилловое  ", "notes": "цель — разменять 1:40",
+}
+
+
+def test_athlete_profile_empty_when_never_saved(main_module, fake_bucket):
+    profile, version, updated_at = main_module.read_athlete_profile(fake_bucket, SUB)
+    assert version == 0 and updated_at is None
+    assert profile["full_name"] == "" and profile["hr_max"] is None
+    assert profile["available_days"] == []
+
+
+def test_athlete_profile_cleaning(main_module):
+    profile, errors = main_module.clean_athlete_profile(FILLED_PROFILE)
+    assert errors == {}
+    assert profile["height_cm"] == 182 and isinstance(profile["height_cm"], int)
+    assert profile["weight_kg"] == 74.4
+    assert profile["injuries"] == "правое ахилловое"          # обрезаны пробелы
+    assert profile["available_days"] == ["mon", "wed", "sat"]  # порядок Пн→Вс
+
+
+@pytest.mark.parametrize("field,value", [
+    ("height_cm", 300), ("weight_kg", 10), ("hr_max", 250),
+    ("hr_rest", 5), ("vo2max", 5), ("sessions_per_week", 20),
+    ("height_cm", "высокий"),
+])
+def test_athlete_profile_rejects_out_of_range(main_module, field, value):
+    _, errors = main_module.clean_athlete_profile({field: value})
+    assert field in errors
+
+
+def test_athlete_profile_rejects_inconsistent_hr(main_module):
+    _, errors = main_module.clean_athlete_profile({"hr_max": 170, "hr_threshold": 175})
+    assert "hr_threshold" in errors
+    _, errors2 = main_module.clean_athlete_profile({"hr_max": 170, "hr_rest": 180})
+    assert "hr_rest" in errors2
+
+
+@pytest.mark.parametrize("value,field", [
+    ("2030-01-01", "birth_date"),      # в будущем
+    ("01.03.1979", "birth_date"),      # не ISO
+])
+def test_athlete_profile_rejects_bad_birth_date(main_module, value, field):
+    _, errors = main_module.clean_athlete_profile({"birth_date": value})
+    assert field in errors
+
+
+def test_athlete_profile_rejects_unknown_days(main_module):
+    _, errors = main_module.clean_athlete_profile({"available_days": ["mon", "funday"]})
+    assert "available_days" in errors
+    _, errors2 = main_module.clean_athlete_profile({"long_run_day": "funday"})
+    assert "long_run_day" in errors2
+    _, errors3 = main_module.clean_athlete_profile({"sex": "x"})
+    assert "sex" in errors3
+
+
+def test_athlete_profile_versions_are_immutable(main_module, fake_bucket):
+    profile, _ = main_module.clean_athlete_profile(FILLED_PROFILE)
+    v1 = main_module.write_athlete_version(fake_bucket, SUB, profile, "первое заполнение")
+    assert v1["version"] == 1 and v1["supersedes_version"] is None
+
+    heavier = {**profile, "weight_kg": 72.0}
+    v2 = main_module.write_athlete_version(fake_bucket, SUB, heavier, "взвесился")
+    assert v2["version"] == 2 and v2["supersedes_version"] == 1
+
+    # v1 не тронут — политика append-only
+    import json
+    stored_v1 = json.loads(fake_bucket.blob(f"users/{SUB}/athlete/v1/profile.json").download_as_text())
+    assert stored_v1["profile"]["weight_kg"] == 74.4
+
+    current, version, updated_at = main_module.read_athlete_profile(fake_bucket, SUB)
+    assert version == 2 and current["weight_kg"] == 72.0 and updated_at
+
+    # изоляция между пользователями
+    other, other_version, _ = main_module.read_athlete_profile(fake_bucket, SUB2)
+    assert other_version == 0 and other["full_name"] == ""
+
+
+def test_athlete_history_tracks_measurements(main_module, fake_bucket):
+    profile, _ = main_module.clean_athlete_profile(FILLED_PROFILE)
+    main_module.write_athlete_version(fake_bucket, SUB, profile, "первое заполнение")
+    main_module.write_athlete_version(fake_bucket, SUB, {**profile, "weight_kg": 72.0}, "взвесился")
+
+    history = main_module.read_athlete_history(fake_bucket, SUB)
+    assert [h["version"] for h in history] == [1, 2]
+    assert [h["weight_kg"] for h in history] == [74.4, 72.0]
+    assert history[1]["change_reason"] == "взвесился"
+    assert main_module.read_athlete_history(fake_bucket, SUB2) == []
+
+
+def test_athlete_derived_values(main_module):
+    from datetime import date
+    profile, _ = main_module.clean_athlete_profile(FILLED_PROFILE)
+    derived = main_module.compute_athlete_derived(profile, today=date(2026, 8, 16))
+    assert derived["age"] == 47
+    assert derived["bmi"] == 22.5
+    assert derived["hr_max_estimated"] is None        # пульс измерен — оценка не нужна
+    assert derived["hr_max_effective"] == 178
+    assert len(derived["hr_zones"]) == 5
+    assert derived["hr_zones"][0]["from"] == 89       # 50% от 178
+    assert derived["hr_zones"][-1]["to"] == 178
+
+
+def test_athlete_derived_estimates_hr_max_without_measurement(main_module):
+    from datetime import date
+    profile = {**main_module.empty_athlete_profile(), "birth_date": "1986-08-16"}
+    derived = main_module.compute_athlete_derived(profile, today=date(2026, 8, 16))
+    assert derived["age"] == 40
+    assert derived["hr_max_estimated"] == 180         # Танака: 208 − 0.7×40
+    assert derived["hr_max_effective"] == 180
+    assert derived["bmi"] is None                     # роста и веса нет
+
+
+def test_athlete_derived_empty_profile_is_all_none(main_module):
+    derived = main_module.compute_athlete_derived(main_module.empty_athlete_profile())
+    assert derived["age"] is None and derived["bmi"] is None
+    assert derived["hr_max_effective"] is None and derived["hr_zones"] == []
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("44:30", 2670), ("1:47:20", 6440), ("0:59", 59),
+    ("", None), ("не время", None), ("44", None), ("1:2:3:4", None),
+])
+def test_parse_time_to_sec(main_module, text, expected):
+    assert main_module.parse_time_to_sec(text) == expected
+
+
+def test_personal_bests_picks_fastest_and_skips_deleted(main_module):
+    races = [
+        {"dist_label": "10km", "time": "46:10", "date": "2026-05-30"},
+        {"dist_label": "10km", "time": "44:30", "date": "2026-07-04"},   # лучший
+        {"dist_label": "10km", "time": "41:00", "date": "2026-07-20", "deleted": True},
+        {"dist_label": "HM", "time": "1:47:20", "date": "2025-09-15"},
+        {"dist_label": "HM", "time": "битое", "date": "2025-10-01"},     # без времени
+        {"dist_label": "чего-то", "time": "30:00", "date": "2026-01-01"},
+    ]
+    bests = main_module.personal_bests(races)
+    assert [b["dist_label"] for b in bests] == ["10km", "HM"]   # по возрастанию км
+    assert bests[0]["time"] == "44:30" and bests[0]["date"] == "2026-07-04"
+    assert main_module.personal_bests([]) == []
 
 
 # ── plan versioning (per-user, immutable versions) ────────────────────────────
