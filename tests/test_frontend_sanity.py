@@ -13,7 +13,7 @@ REPO = Path(__file__).resolve().parent.parent
 APP_JS = REPO / "app.js"
 INDEX = REPO / "index.html"
 STYLE = REPO / "style.css"
-MAIN_PY = REPO / "main.py"
+BACKEND_PY = sorted(REPO.glob("*.py"))   # main, api, storage, domain, llm_prompt, config
 
 
 _REGEX_PREV_PUNCT = set("(,=:[!&|?{};+-*%~^<>")
@@ -155,7 +155,7 @@ def test_strip_js_literals_ignores_brackets_inside_literals():
     assert strip_js_literals("function f() { return [1]; }").count("{") == 1
 
 
-@pytest.mark.parametrize("path", [APP_JS, INDEX, STYLE, MAIN_PY])
+@pytest.mark.parametrize("path", [APP_JS, INDEX, STYLE, *BACKEND_PY])
 def test_no_merge_conflict_markers(path):
     text = path.read_text(encoding="utf-8")
     for marker in ("<<<<<<<", ">>>>>>>"):
@@ -164,8 +164,9 @@ def test_no_merge_conflict_markers(path):
     # flag it when paired with the other markers above (already checked).
 
 
-def test_main_py_parses():
-    ast.parse(MAIN_PY.read_text(encoding="utf-8"))
+@pytest.mark.parametrize("path", BACKEND_PY, ids=lambda p: p.name)
+def test_backend_module_parses(path):
+    ast.parse(path.read_text(encoding="utf-8"))
 
 
 def test_index_references_cachebusted_assets():

@@ -1,11 +1,10 @@
 """Pytest fixtures: import main.py with cloud deps stubbed.
 
-main.py imports google-cloud-storage / google-auth / functions_framework, which
-are not installed in the local/test environment. The pure functions we test do
-not touch GCS or auth at import time, so we stub those modules before importing.
+storage.py / api.py import google-cloud-storage and google-auth, which are not
+installed in the local/test environment. Ничего из этого не трогается на этапе
+импорта, поэтому модули подменяются заглушками до первого import.
 fitparse and httpx ARE installed and used for real.
 """
-import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -47,12 +46,17 @@ for _m in ["httpx", "fitparse"]:
 
 
 @pytest.fixture(scope="session")
-def main_module():
-    """Imports main.py fresh under the stubbed environment."""
-    spec = importlib.util.spec_from_file_location("main_under_test", REPO / "main.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def storage_module():
+    """Слой данных (#36): GCS-хелперы, реестр, FIT, контекст для LLM."""
+    import storage
+    return storage
+
+
+@pytest.fixture(scope="session")
+def api_module():
+    """HTTP-слой (#36): таблица маршрутов, хендлеры, диспетчер."""
+    import api
+    return api
 
 
 # ── In-memory fake GCS (mirrors the google-cloud-storage surface main.py uses) ─
@@ -105,11 +109,11 @@ class FakeClient:
 
 
 @pytest.fixture(autouse=True)
-def _reset_registry_cache(main_module):
-    """Кэш реестра — глобальный для модуля, а main_module живёт всю сессию.
+def _reset_registry_cache(storage_module):
+    """Кэш реестра — глобальный для модуля, а модуль живёт всю сессию.
     Без сброса состояние протекает между тестами и между файлами."""
-    main_module._registry_cache["data"] = None
-    main_module._registry_cache["ts"] = 0.0
+    storage_module._registry_cache["data"] = None
+    storage_module._registry_cache["ts"] = 0.0
     yield
 
 
@@ -119,9 +123,8 @@ def fake_bucket():
 
 
 @pytest.fixture
-def patched_main(main_module, fake_bucket, monkeypatch):
-    """main_module whose get_storage_client() returns a fake client over
-    fake_bucket — lets us exercise the no-bucket-arg helpers (read/write runs,
-    races) against in-memory storage."""
-    monkeypatch.setattr(main_module, "get_storage_client", lambda: FakeClient(fake_bucket))
-    return main_module
+def patched_api(api_module, fake_bucket, monkeypatch):
+    """HTTP-слой, у которого get_storage_client() отдаёт фейковый бакет.
+    Патчим имя в api: оно связано импортом и на storage уже не смотрит."""
+    monkeypatch.setattr(api_module, "get_storage_client", lambda: FakeClient(fake_bucket))
+    return api_module

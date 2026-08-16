@@ -81,10 +81,23 @@
 GitHub Pages (prod) / Cloudflare Pages (dev)
         index.html + app.js + style.css
                     ↓  REST + Bearer <Google ID token>
-        Cloud Run Function (main.py, Python 3.11)
+        Cloud Run Function (Python 3.11)
              runs-api          runs-api-dev
                     ↓
         GCS: running-tracker-aabramov77 / …-dev
+```
+
+### Модули бэкенда
+
+Зависимости идут в одну сторону, циклов нет:
+
+```
+config.py       константы: client id, бакет, лимиты
+domain.py       словарь домена: дни недели, подписи, дистанции, рекорды
+llm_prompt.py   сборка текстового промпта из готового контекста
+storage.py      GCS, версии, реестр пользователей, разбор FIT, контекст LLM
+api.py          проверка токена, таблица маршрутов, хендлеры
+main.py         точка входа Cloud Run Function
 ```
 
 - Фронтенд — vanilla JS без сборки; выбор API-эндпоинта по hostname.
@@ -121,7 +134,7 @@ config/llm/…                      конфиг и ключ LLM (только �
 
 ```bash
 git checkout Dev        # весь код пишется в Dev, в main — только merge
-python -m pytest -q     # 130 тестов
+python -m pytest -q     # 190 тестов
 ```
 
 - Тесты не требуют доступа к GCP: `tests/conftest.py` подменяет

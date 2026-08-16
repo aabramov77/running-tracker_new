@@ -9,31 +9,31 @@ import json
 import pytest
 
 
-def routes(main_module):
-    return main_module.ROUTES
+def routes(api_module):
+    return api_module.ROUTES
 
 
 # ── Целостность таблицы ───────────────────────────────────────────────────────
 
-def test_no_duplicate_routes(main_module):
-    pairs = [(method, pattern) for method, pattern, _, _ in routes(main_module)]
+def test_no_duplicate_routes(api_module):
+    pairs = [(method, pattern) for method, pattern, _, _ in routes(api_module)]
     assert len(pairs) == len(set(pairs)), "две записи на один метод+путь"
 
 
-def test_all_handlers_are_callable(main_module):
-    for method, pattern, handler, _ in routes(main_module):
+def test_all_handlers_are_callable(api_module):
+    for method, pattern, handler, _ in routes(api_module):
         assert callable(handler), f"{method} {pattern}: хендлер не вызывается"
 
 
-def test_patterns_are_anchored(main_module):
+def test_patterns_are_anchored(api_module):
     """Без якорей ^…$ порядок объявления снова начал бы влиять на выбор."""
-    for method, pattern, _, _ in routes(main_module):
+    for method, pattern, _, _ in routes(api_module):
         assert pattern.startswith("^") and pattern.endswith("$"), f"{method} {pattern}"
 
 
 @pytest.mark.parametrize("prefix", ["^/admin/", "^/config/llm"])
-def test_privileged_paths_are_admin_only(main_module, prefix):
-    guarded = [(m, p, admin) for m, p, _, admin in routes(main_module) if p.startswith(prefix)]
+def test_privileged_paths_are_admin_only(api_module, prefix):
+    guarded = [(m, p, admin) for m, p, _, admin in routes(api_module) if p.startswith(prefix)]
     assert guarded, f"нет маршрутов под {prefix}"
     for method, pattern, admin_only in guarded:
         assert admin_only, f"{method} {pattern} доступен не только админу"
@@ -65,53 +65,53 @@ def test_privileged_paths_are_admin_only(main_module, prefix):
     ("DELETE", "/races",                 "h_races_delete"),
     ("POST",   "/config/llm/test",       "h_llm_config_test"),
 ])
-def test_path_resolves_to_expected_handler(main_module, method, path, handler_name):
-    route, match, allow = main_module.match_route(path, method)
+def test_path_resolves_to_expected_handler(api_module, method, path, handler_name):
+    route, match, allow = api_module.match_route(path, method)
     assert allow is None, f"{method} {path}: неожиданный 405"
     assert route is not None, f"{method} {path}: маршрут не найден"
     assert route[2].__name__ == handler_name
 
 
-def test_prefix_paths_do_not_shadow_each_other(main_module):
+def test_prefix_paths_do_not_shadow_each_other(api_module):
     """Тот самый класс ошибок, ради которого затевалась таблица."""
     for path, expected in [("/advise/preview", "h_advise_preview"),
                            ("/profile/history", "h_profile_history"),
                            ("/config/llm/test", "h_llm_config_test")]:
-        route, _, _ = main_module.match_route(path, "GET" if path != "/config/llm/test" else "POST")
+        route, _, _ = api_module.match_route(path, "GET" if path != "/config/llm/test" else "POST")
         assert route[2].__name__ == expected
     # /plans/active — не plan_id в шаблоне /plans/{id}/…
-    route, match, _ = main_module.match_route("/plans/active", "POST")
+    route, match, _ = api_module.match_route("/plans/active", "POST")
     assert route[2].__name__ == "h_plan_activate" and match.groups() == ()
 
 
-def test_path_groups_reach_the_handler(main_module):
-    _, match, _ = main_module.match_route("/plans/plan-42/weeks", "GET")
+def test_path_groups_reach_the_handler(api_module):
+    _, match, _ = api_module.match_route("/plans/plan-42/weeks", "GET")
     assert match.groups() == ("plan-42",)
-    _, match, _ = main_module.match_route("/runs/98765/details", "GET")
+    _, match, _ = api_module.match_route("/runs/98765/details", "GET")
     assert match.groups() == ("98765",)
-    _, match, _ = main_module.match_route("/admin/users/reject", "POST")
+    _, match, _ = api_module.match_route("/admin/users/reject", "POST")
     assert match.groups() == ("reject",)
 
 
 # ── Ошибки ────────────────────────────────────────────────────────────────────
 
-def test_known_path_wrong_method_gives_405_with_allow(main_module):
-    route, match, allow = main_module.match_route("/profile", "DELETE")
+def test_known_path_wrong_method_gives_405_with_allow(api_module):
+    route, match, allow = api_module.match_route("/profile", "DELETE")
     assert route is None and match is None
     assert allow == ["GET", "OPTIONS", "POST"]
 
 
-def test_405_lists_every_method_of_the_path(main_module):
-    _, _, allow = main_module.match_route("/", "PATCH")
+def test_405_lists_every_method_of_the_path(api_module):
+    _, _, allow = api_module.match_route("/", "PATCH")
     assert allow == ["DELETE", "GET", "OPTIONS", "POST"]
 
 
 @pytest.mark.parametrize("path", ["/unknown", "/plans/active/extra", "/profile/history/x",
                                   "/runs/notanumber/details"])
-def test_unknown_path_is_404(main_module, path):
+def test_unknown_path_is_404(api_module, path):
     """До #36 неизвестный путь проваливался в ветку runs и отдавал список
     пробежек — теперь это честный 404."""
-    route, match, allow = main_module.match_route(path, "GET")
+    route, match, allow = api_module.match_route(path, "GET")
     assert route is None and match is None and allow is None
 
 
@@ -131,16 +131,16 @@ class FakeRequest:
 
 
 @pytest.fixture
-def api(patched_main, fake_bucket, monkeypatch):
+def api(patched_api, fake_bucket, monkeypatch):
     """runs_api с подменённой проверкой токена: тут проверяется маршрутизация,
     а не подпись Google. Пользователь по умолчанию одобрен."""
     def call(request, sub="u1", email="runner@example.com", approved=True):
         token = {"sub": sub, "email": email, "name": "Runner"}
-        monkeypatch.setattr(patched_main, "verify_token", lambda r: token)
-        patched_main.resolve_user(fake_bucket, token)
+        monkeypatch.setattr(patched_api, "verify_token", lambda r: token)
+        patched_api.resolve_user(fake_bucket, token)
         if approved:
-            patched_main.set_user_status(fake_bucket, sub, "approved", "admin-sub")
-        return patched_main.runs_api(request)
+            patched_api.set_user_status(fake_bucket, sub, "approved", "admin-sub")
+        return patched_api.handle_request(request)
     return call
 
 
@@ -164,8 +164,8 @@ def test_dispatch_unknown_path_is_404(api):
     assert _status(api(FakeRequest("GET", "/nope"))) == 404
 
 
-def test_dispatch_options_needs_no_token(patched_main):
-    body, code, headers = patched_main.runs_api(FakeRequest("OPTIONS", "/profile"))
+def test_dispatch_options_needs_no_token(patched_api):
+    body, code, headers = patched_api.handle_request(FakeRequest("OPTIONS", "/profile"))
     assert code == 204 and "Access-Control-Allow-Origin" in headers
 
 
@@ -220,3 +220,21 @@ def test_dispatch_surfaces_handler_validation(api):
 def test_dispatch_plan_shortcut_without_plans(api):
     body, code, _ = api(FakeRequest("GET", "/plan"))
     assert code == 200 and body == "[]"
+
+
+def test_entry_point_delegates_to_api(monkeypatch):
+    """main.py — точка входа Cloud Run Function (--function=runs_api).
+    Тесты работают с api напрямую, поэтому entry point проверяем отдельно:
+    сломанный импорт здесь был бы виден только на проде."""
+    import main
+    assert callable(main.runs_api)
+
+    seen = {}
+
+    def spy(request):
+        seen["req"] = request
+        return "ok"
+
+    monkeypatch.setattr(main, "handle_request", spy)
+    assert main.runs_api("запрос") == "ok"
+    assert seen["req"] == "запрос"
