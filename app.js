@@ -233,7 +233,7 @@ async function saveRaceMeta() {
     target_time: document.getElementById('p-target-time').value.trim(),
     plan_start: document.getElementById('p-plan-start').value,
   };
-  const msg = document.getElementById('profile-msg');
+  const msg = document.getElementById('race-meta-msg');
   const flash = (text, ok) => {
     msg.style.display = 'inline';
     msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
@@ -1417,6 +1417,215 @@ function updateModelOptions() {
     `<option value="${m.id}">${m.label}</option>`).join('');
 }
 
+// ── Профиль спортсмена (#32) ──
+
+const PROFILE_FIELD_MAP = {
+  full_name: 'pr-full-name', birth_date: 'pr-birth-date', sex: 'pr-sex',
+  height_cm: 'pr-height-cm', weight_kg: 'pr-weight-kg',
+  hr_max: 'pr-hr-max', hr_threshold: 'pr-hr-threshold', hr_rest: 'pr-hr-rest',
+  vo2max: 'pr-vo2max', years_running: 'pr-years-running',
+  weekly_km_typical: 'pr-weekly-km', sessions_per_week: 'pr-sessions',
+  long_run_day: 'pr-long-run-day', injuries: 'pr-injuries', notes: 'pr-notes',
+};
+
+// Подписи для сообщений валидации с бэка (там приходят коды полей)
+const PROFILE_FIELD_LABELS = {
+  full_name: 'ФИО', birth_date: 'Дата рождения', sex: 'Пол', height_cm: 'Рост',
+  weight_kg: 'Вес', hr_max: 'Пульс максимальный', hr_threshold: 'Пульс ПАНО',
+  hr_rest: 'Пульс покоя', vo2max: 'МПК', years_running: 'Стаж',
+  weekly_km_typical: 'Обычный объём', sessions_per_week: 'Тренировок в неделю',
+  long_run_day: 'День длительной', available_days: 'Доступные дни',
+  injuries: 'Травмы и ограничения', notes: 'Заметки',
+};
+
+const PB_LABELS = {'4.2km':'4,2 км','5km':'5 км','10km':'10 км','HM':'Полумарафон','M':'Марафон'};
+
+// Пульсовые зоны считает бэкенд — формула живёт в одном месте.
+let PROFILE_DERIVED = null;
+
+// POST /profile заменяет профиль целиком, поэтому сохранять можно только то,
+// что мы успешно загрузили: иначе неудачная загрузка + «Сохранить» затрут
+// заполненный профиль пустыми полями.
+let PROFILE_LOADED = false;
+
+function profileDayBoxes() {
+  return Array.from(document.querySelectorAll('#pr-available-days input[type=checkbox]'));
+}
+
+function fillProfileForm(profile) {
+  Object.entries(PROFILE_FIELD_MAP).forEach(([field, id]) => {
+    const v = profile[field];
+    document.getElementById(id).value = (v === null || v === undefined) ? '' : v;
+  });
+  const days = profile.available_days || [];
+  profileDayBoxes().forEach(cb => { cb.checked = days.includes(cb.value); });
+}
+
+function collectProfileForm() {
+  const body = {};
+  Object.entries(PROFILE_FIELD_MAP).forEach(([field, id]) => {
+    body[field] = document.getElementById(id).value.trim();
+  });
+  body.available_days = profileDayBoxes().filter(cb => cb.checked).map(cb => cb.value);
+  return body;
+}
+
+// Возраст и ИМТ пересчитываем на лету — арифметика в одну строку.
+function profileAgeLocal() {
+  const value = document.getElementById('pr-birth-date').value;
+  if (!value) return null;
+  const born = new Date(value + 'T00:00:00');
+  if (isNaN(born.getTime())) return null;
+  const today = new Date();
+  let age = today.getFullYear() - born.getFullYear();
+  const m = today.getMonth() - born.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < born.getDate())) age--;
+  return (age >= 0 && age <= 100) ? age : null;
+}
+
+function profileBmiLocal() {
+  const h = parseFloat(document.getElementById('pr-height-cm').value);
+  const w = parseFloat(document.getElementById('pr-weight-kg').value);
+  if (!h || !w) return null;
+  return Math.round(w / Math.pow(h / 100, 2) * 10) / 10;
+}
+
+function renderProfileDerived() {
+  const el = document.getElementById('profile-derived');
+  const bits = [];
+  const age = profileAgeLocal();
+  if (age !== null) bits.push(`Возраст: <b>${age}</b>`);
+  const bmi = profileBmiLocal();
+  if (bmi !== null) bits.push(`ИМТ: <b>${bmi}</b>`);
+
+  const zones = PROFILE_DERIVED && PROFILE_DERIVED.hr_zones ? PROFILE_DERIVED.hr_zones : [];
+  if (PROFILE_DERIVED && PROFILE_DERIVED.hr_max_estimated) {
+    bits.push(`HRmax: <b>~${PROFILE_DERIVED.hr_max_estimated}</b> <span class="hint">(оценка по возрасту)</span>`);
+  }
+
+  if (!bits.length && !zones.length) { el.innerHTML = ''; return; }
+
+  let html = bits.length ? `<div class="derived-row">${bits.join('<span class="derived-sep">·</span>')}</div>` : '';
+  if (zones.length) {
+    html += '<div class="hr-zones">' + zones.map(z =>
+      `<span class="hr-zone">${escapeHtml(z.name)} <b>${z.from}–${z.to}</b></span>`).join('') + '</div>';
+    html += '<div class="hint" style="margin:6px 0 0">Зоны — ориентир от максимального пульса, не медицинская рекомендация. Обновляются после сохранения.</div>';
+  }
+  el.innerHTML = html;
+}
+
+// Живой пересчёт при вводе (вызывается из oninput)
+function updateProfileHints() { renderProfileDerived(); }
+
+function renderPersonalBests(bests) {
+  const el = document.getElementById('profile-pb');
+  if (!bests || !bests.length) {
+    el.innerHTML = '<div class="empty">Пока пусто — добавьте результат в разделе «Старты».</div>';
+    return;
+  }
+  el.innerHTML = '<table class="pb-table"><tbody>' + bests.map(b => `
+    <tr>
+      <td>${escapeHtml(PB_LABELS[b.dist_label] || b.dist_label || '')}</td>
+      <td style="font-family:'DM Mono',monospace"><b>${escapeHtml(b.time || '')}</b></td>
+      <td class="hint" style="margin:0">${escapeHtml(b.date || '')}</td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+function applyProfileResponse(data) {
+  fillProfileForm(data.profile || {});
+  PROFILE_DERIVED = data.derived || null;
+  renderProfileDerived();
+  renderPersonalBests(data.personal_bests);
+  const label = document.getElementById('profile-version');
+  label.textContent = data.version
+    ? `версия ${data.version}${data.updated_at ? ' · ' + data.updated_at.slice(0, 10) : ''}`
+    : 'ещё не заполнен';
+}
+
+function flashProfileMsg(text, ok, sticky) {
+  const msg = document.getElementById('profile-msg');
+  msg.style.display = 'inline';
+  msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
+  msg.textContent = text;
+  if (sticky) return;   // условие не пройдёт само — сообщение не прячем
+  setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2500 : 6000);
+}
+
+function setProfileSaveEnabled(enabled) {
+  const btn = document.getElementById('profile-save-btn');
+  btn.disabled = !enabled;
+  btn.title = enabled ? '' : 'Профиль не загружен — сохранение затёрло бы данные';
+}
+
+async function loadProfile() {
+  PROFILE_LOADED = false;
+  setProfileSaveEnabled(false);
+  try {
+    const res = await fetch(API_URL + 'profile', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    applyProfileResponse(await res.json());
+    PROFILE_LOADED = true;
+    setProfileSaveEnabled(true);
+  } catch (e) {
+    document.getElementById('profile-pb').innerHTML =
+      '<div class="empty">Не удалось загрузить профиль</div>';
+    flashProfileMsg('⚠ Профиль не загрузился — сохранение отключено, чтобы не затереть данные. Обновите страницу.', false, true);
+  }
+}
+
+async function saveProfile() {
+  if (!PROFILE_LOADED) {
+    flashProfileMsg('⚠ Профиль не загружен — обновите страницу', false);
+    return;
+  }
+  const btn = document.getElementById('profile-save-btn');
+  btn.disabled = true; btn.textContent = 'Сохраняем…';
+  try {
+    const res = await fetch(API_URL + 'profile', {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({ profile: collectProfileForm() }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 400 && data.error === 'validation_failed') {
+      const problems = Object.entries(data.fields || {})
+        .map(([f, m]) => `${PROFILE_FIELD_LABELS[f] || f} — ${m}`).join('; ');
+      flashProfileMsg('⚠ ' + problems, false);
+      return;
+    }
+    if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+    applyProfileResponse(data);
+    flashProfileMsg('✓ Сохранено', true);
+  } catch (e) {
+    flashProfileMsg('⚠ ' + e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Сохранить';
+  }
+}
+
+async function showLlmPreview() {
+  const overlay = document.getElementById('llm-preview-overlay');
+  const body = document.getElementById('llm-preview-body');
+  body.textContent = 'Загрузка…';
+  overlay.classList.add('active');
+  try {
+    const res = await fetch(API_URL + 'advise/preview', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    body.textContent = data.prompt || '(пусто)';
+  } catch (e) {
+    body.textContent = 'Не удалось получить контекст: ' + e.message;
+  }
+}
+
+function closeLlmPreview(event) {
+  if (event && event.target !== document.getElementById('llm-preview-overlay')) return;
+  document.getElementById('llm-preview-overlay').classList.remove('active');
+}
+
 async function loadLlmSettings() {
   if (currentRole !== 'admin') return;  // не-админ не дёргает admin-only /config/llm
   // Дефолтно — anthropic, модели заполняем
@@ -1582,7 +1791,7 @@ function showTab(name,btn){
   if(name==='stats')renderCharts();
   if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
   if(name==='races')renderRaces();
-  if(name==='settings')loadLlmSettings();
+  if(name==='profile'){loadProfile(); loadLlmSettings();}   // #32; loadLlmSettings сам пропустит не-админа
   if(name==='users')loadUsers();
 }
 

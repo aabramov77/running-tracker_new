@@ -39,6 +39,22 @@ def test_resolve_is_idempotent(main_module, fake_bucket):
     assert len(reg["users"]) == 1
 
 
+def test_registry_never_holds_personal_profile_data(main_module, fake_bucket):
+    """#32: ФИО и дата рождения — персданные, в админский список не попадают.
+
+    /admin/users отдаёт записи реестра как есть, поэтому проверяем сам реестр.
+    """
+    main_module.resolve_user(fake_bucket, USER_TOKEN)
+    profile, _ = main_module.clean_athlete_profile(
+        {"full_name": "Иванов Иван", "birth_date": "1979-03-01", "weight_kg": 74})
+    main_module.write_athlete_version(fake_bucket, "u1", profile, "тест")
+
+    record = main_module.read_registry(fake_bucket)["users"]["u1"]
+    for field in ("full_name", "birth_date", "weight_kg", "hr_max", "injuries", "notes"):
+        assert field not in record
+    assert "Иванов" not in str(record)
+
+
 def test_register_writes_audit_event(main_module, fake_bucket):
     main_module.resolve_user(fake_bucket, USER_TOKEN)
     events = [b.name for b in fake_bucket.list_blobs(prefix="users/events/")]
@@ -109,7 +125,7 @@ def test_migrate_legacy_copies_and_is_idempotent(main_module, fake_bucket):
     assert fake_bucket.blob("users/admin-sub/plan/v1/plan.json").exists()
 
     # profile seeded with Alexander's historical race constants
-    prof = main_module.read_profile(fake_bucket, "admin-sub")
+    prof = main_module.read_legacy_race_profile(fake_bucket, "admin-sub")
     assert prof["race_date"] == "2026-08-09" and prof["target_time"] == "1:40"
 
     # per-user plan manifest points INTO the user namespace (not the legacy path)
@@ -134,7 +150,7 @@ SUB = "u-single"
 
 def _seed_single_plan(main_module, fake_bucket, sub=SUB):
     """Состояние пользователя до #25: profile.json + users/{sub}/plan/*."""
-    main_module.write_profile(fake_bucket, sub, {
+    main_module.write_legacy_race_profile(fake_bucket, sub, {
         "race_name": "Полумарафон", "race_date": "2026-08-09",
         "target_time": "1:40", "plan_start": "2026-05-10"})
     fake_bucket.blob(f"users/{sub}/plan/v1/plan.json").upload_from_string(

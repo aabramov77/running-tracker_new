@@ -71,7 +71,9 @@ def p_singleplan_ver(sub, v):   return f"{upfx(sub)}plan/v{v}/plan.json"
 def p_advice_manifest(sub):    return f"{upfx(sub)}advice/manifest.json"
 def p_advice_ver(sub, v):      return f"{upfx(sub)}advice/v{v}/recommendation.json"
 def p_advice_usage(sub):       return f"{upfx(sub)}advice/usage.json"
-def p_profile(sub):            return f"{upfx(sub)}profile.json"
+def p_profile(sub):            return f"{upfx(sub)}profile.json"   # legacy: гонка до #25
+def p_athlete_manifest(sub):   return f"{upfx(sub)}athlete/manifest.json"
+def p_athlete_ver(sub, v):     return f"{upfx(sub)}athlete/v{v}/profile.json"
 def p_run_manifest(sub, rid):  return f"{upfx(sub)}runs/{rid}/manifest.json"
 def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
 def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
@@ -103,13 +105,17 @@ def write_runs(bucket, sub, runs):
     )
 
 
-# ── Profile helpers (per-user: гонка, цель, старт плана) ──────────────────────
+# ── Legacy race profile (до #25 здесь жили гонка, цель и старт плана) ─────────
+#
+# Данные гонки переехали в план (#25). Объект остаётся источником для ленивой
+# миграции пользователей, заведённых раньше, — новых записей в него не делаем,
+# кроме сида при переносе legacy-данных админа.
 
 PROFILE_DEFAULT = {"race_name": "", "race_date": "", "target_time": "", "plan_start": ""}
 PROFILE_FIELDS = ("race_name", "race_date", "target_time", "plan_start")
 
 
-def read_profile(bucket, sub):
+def read_legacy_race_profile(bucket, sub):
     blob = bucket.blob(p_profile(sub))
     if not blob.exists():
         return dict(PROFILE_DEFAULT)
@@ -117,13 +123,247 @@ def read_profile(bucket, sub):
     return {**PROFILE_DEFAULT, **{k: data.get(k, "") for k in PROFILE_FIELDS}}
 
 
-def write_profile(bucket, sub, profile):
+def write_legacy_race_profile(bucket, sub, profile):
     clean = {k: (profile.get(k) or "") for k in PROFILE_FIELDS}
     bucket.blob(p_profile(sub)).upload_from_string(
         json.dumps(clean, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
     return clean
+
+
+# ── Athlete profile (#32) ─────────────────────────────────────────────────────
+#
+# Профиль спортсмена — источник контекста для LLM. Хранится версионно:
+# users/{sub}/athlete/manifest.json + v{N}/profile.json. Каждое сохранение —
+# новая версия, поэтому история веса и пульсовых показателей копится сама.
+
+# Порядок и подписи дней недели плана (7 дней, Пн→Вс). #23
+PLAN_DAYS = [("mon", "пн"), ("tue", "вт"), ("wed", "ср"), ("thu", "чт"),
+             ("fri", "пт"), ("sat", "сб"), ("sun", "вс")]
+
+ATHLETE_TEXT_FIELDS = ("full_name", "birth_date", "sex", "long_run_day", "injuries", "notes")
+
+# поле: (минимум, максимум, округлять до целого)
+ATHLETE_NUM_FIELDS = {
+    "height_cm":         (100, 250, True),
+    "weight_kg":         (30, 200, False),
+    "hr_max":            (100, 230, True),
+    "hr_threshold":      (80, 220, True),
+    "hr_rest":           (30, 120, True),
+    "vo2max":            (20, 90, False),
+    "years_running":     (0, 70, False),
+    "weekly_km_typical": (0, 300, False),
+    "sessions_per_week": (0, 14, True),
+}
+
+# Поля, по которым имеет смысл смотреть динамику между версиями
+ATHLETE_HISTORY_FIELDS = ("weight_kg", "hr_max", "hr_threshold", "hr_rest", "vo2max")
+
+SEX_LABELS = {"m": "М", "f": "Ж"}
+
+# Границы пульсовых зон в % от максимального пульса — ориентир, не медицинская
+# рекомендация.
+HR_ZONE_BOUNDS = [
+    ("Z1 восстановление", 50, 60),
+    ("Z2 аэробная",       60, 70),
+    ("Z3 темповая",       70, 80),
+    ("Z4 ПАНО",           80, 90),
+    ("Z5 максимальная",   90, 100),
+]
+
+
+def empty_athlete_profile():
+    profile = {f: "" for f in ATHLETE_TEXT_FIELDS}
+    profile.update({f: None for f in ATHLETE_NUM_FIELDS})
+    profile["available_days"] = []
+    return profile
+
+
+def clean_athlete_profile(raw):
+    """Валидация и нормализация входных данных. Возвращает (профиль, ошибки)."""
+    errors = {}
+    profile = {}
+    day_codes = [code for code, _ in PLAN_DAYS]
+
+    for field in ATHLETE_TEXT_FIELDS:
+        value = raw.get(field, "")
+        profile[field] = value.strip() if isinstance(value, str) else ""
+
+    if profile["sex"] not in ("", "m", "f"):
+        errors["sex"] = "допустимо: m, f или пусто"
+        profile["sex"] = ""
+
+    if profile["long_run_day"] and profile["long_run_day"] not in day_codes:
+        errors["long_run_day"] = "неизвестный день недели"
+        profile["long_run_day"] = ""
+
+    raw_days = raw.get("available_days") or []
+    if not isinstance(raw_days, list):
+        errors["available_days"] = "ожидается список дней"
+        raw_days = []
+    unknown = [str(d) for d in raw_days if d not in day_codes]
+    if unknown:
+        errors["available_days"] = "неизвестные дни: " + ", ".join(unknown)
+    profile["available_days"] = [d for d in day_codes if d in raw_days]
+
+    if profile["birth_date"]:
+        try:
+            born = datetime.strptime(profile["birth_date"], "%Y-%m-%d").date()
+            today = datetime.utcnow().date()
+            if born > today:
+                errors["birth_date"] = "дата рождения в будущем"
+            elif (today - born).days > 100 * 366:
+                errors["birth_date"] = "возраст больше 100 лет"
+        except ValueError:
+            errors["birth_date"] = "ожидается формат ГГГГ-ММ-ДД"
+
+    for field, (low, high, as_int) in ATHLETE_NUM_FIELDS.items():
+        value = raw.get(field)
+        if value in (None, "", []):
+            profile[field] = None
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            errors[field] = "ожидается число"
+            profile[field] = None
+            continue
+        if not (low <= number <= high):
+            errors[field] = f"допустимо от {low} до {high}"
+            profile[field] = None
+            continue
+        profile[field] = int(round(number)) if as_int else round(number, 1)
+
+    # Пустой список доступных дней означает «ограничений нет» — проверяем только
+    # заданное расписание, иначе промпт противоречит сам себе: «доступны пн, ср,
+    # сб; длительная — вс» при запрете тренироваться в недоступные дни.
+    if profile["available_days"] and profile["long_run_day"] \
+            and profile["long_run_day"] not in profile["available_days"]:
+        errors["long_run_day"] = "день длительной не входит в доступные дни"
+
+    if profile.get("hr_max") and profile.get("hr_threshold") and profile["hr_threshold"] >= profile["hr_max"]:
+        errors["hr_threshold"] = "ПАНО должен быть ниже максимального пульса"
+    if profile.get("hr_max") and profile.get("hr_rest") and profile["hr_rest"] >= profile["hr_max"]:
+        errors["hr_rest"] = "пульс покоя должен быть ниже максимального"
+
+    return profile, errors
+
+
+def athlete_age(birth_date, today=None):
+    if not birth_date:
+        return None
+    try:
+        born = datetime.strptime(birth_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    today = today or datetime.utcnow().date()
+    years = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    return years if 0 <= years <= 100 else None
+
+
+def compute_athlete_derived(profile, today=None):
+    """Возраст, ИМТ, оценка HRmax и пульсовые зоны. Не хранится — считается на лету."""
+    age = athlete_age(profile.get("birth_date"), today)
+    derived = {"age": age, "bmi": None, "hr_max_estimated": None,
+               "hr_max_effective": None, "hr_zones": []}
+
+    height, weight = profile.get("height_cm"), profile.get("weight_kg")
+    if height and weight:
+        derived["bmi"] = round(weight / (height / 100) ** 2, 1)
+
+    if not profile.get("hr_max") and age is not None:
+        derived["hr_max_estimated"] = int(round(208 - 0.7 * age))   # формула Танаки
+
+    effective = profile.get("hr_max") or derived["hr_max_estimated"]
+    derived["hr_max_effective"] = effective
+    if effective:
+        derived["hr_zones"] = [
+            {"name": name,
+             "from": int(round(effective * low / 100)),
+             "to": int(round(effective * high / 100))}
+            for name, low, high in HR_ZONE_BOUNDS
+        ]
+    return derived
+
+
+def read_athlete_manifest(bucket, sub):
+    blob = bucket.blob(p_athlete_manifest(sub))
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+def read_athlete_profile(bucket, sub):
+    """(профиль, версия, когда обновлён). Незаполненный профиль — версия 0."""
+    manifest = read_athlete_manifest(bucket, sub)
+    if not manifest:
+        return empty_athlete_profile(), 0, None
+    blob = bucket.blob(manifest["gcs_object_path"])
+    if not blob.exists():
+        return empty_athlete_profile(), 0, None
+    data = json.loads(blob.download_as_text())
+    profile = empty_athlete_profile()
+    stored = data.get("profile") or {}
+    profile.update({k: v for k, v in stored.items() if k in profile})
+    return profile, data.get("version", 0), manifest.get("updated_at")
+
+
+def write_athlete_version(bucket, sub, profile, change_reason="", created_by="api"):
+    manifest = read_athlete_manifest(bucket, sub)
+    next_version = (manifest["current_version"] + 1) if manifest else 1
+    object_path = p_athlete_ver(sub, next_version)
+    now = datetime.utcnow().isoformat() + "Z"
+
+    payload = {
+        "version": next_version,
+        "is_current": True,
+        "created_at": now,
+        "created_by": created_by,
+        "change_reason": change_reason or "profile update",
+        "supersedes_version": next_version - 1 if next_version > 1 else None,
+        "profile": profile,
+    }
+    bucket.blob(object_path).upload_from_string(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    bucket.blob(p_athlete_manifest(sub)).upload_from_string(
+        json.dumps({"current_version": next_version,
+                    "gcs_object_path": object_path,
+                    "updated_at": now}, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return payload
+
+
+ATHLETE_HISTORY_LIMIT = 50
+
+
+def read_athlete_history(bucket, sub, limit=ATHLETE_HISTORY_LIMIT):
+    """Сводка по последним версиям профиля — для динамики веса и пульса.
+
+    Каждая версия — отдельный объект в GCS, поэтому читаем ограниченное окно:
+    у пользователя с сотнями сохранений полный обход упёрся бы в таймаут.
+    """
+    manifest = read_athlete_manifest(bucket, sub)
+    if not manifest:
+        return []
+    current = manifest["current_version"]
+    history = []
+    for version in range(max(1, current - limit + 1), current + 1):
+        blob = bucket.blob(p_athlete_ver(sub, version))
+        if not blob.exists():
+            continue
+        data = json.loads(blob.download_as_text())
+        stored = data.get("profile") or {}
+        history.append({
+            "version": data.get("version", version),
+            "created_at": data.get("created_at"),
+            "change_reason": data.get("change_reason", ""),
+            **{f: stored.get(f) for f in ATHLETE_HISTORY_FIELDS},
+        })
+    return history
 
 
 # ── Races helpers ─────────────────────────────────────────────────────────────
@@ -579,7 +819,7 @@ def migrate_single_plan(bucket, sub):
     index = _empty_plans_index()
 
     old_manifest_blob = bucket.blob(p_singleplan_manifest(sub))
-    profile = read_profile(bucket, sub)
+    profile = read_legacy_race_profile(bucket, sub)
     has_profile = any(profile.get(f) for f in PLAN_META_FIELDS)
 
     if not old_manifest_blob.exists() and not has_profile:
@@ -794,6 +1034,41 @@ TYPE_LABELS = {
 DIST_LABEL_KM = {"4.2km": 4.2, "5km": 5, "10km": 10, "HM": 21.0975, "M": 42.195}
 
 
+def parse_time_to_sec(text):
+    """«44:30» → 2670, «1:47:20» → 6440. Мусор → None."""
+    if not text:
+        return None
+    parts = str(text).strip().split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.strip().isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    if len(parts) == 2:
+        return nums[0] * 60 + nums[1]
+    return nums[0] * 3600 + nums[1] * 60 + nums[2]
+
+
+def personal_bests(races):
+    """Лучший результат на каждой дистанции из раздела «Старты» (#32).
+
+    Отдельных полей в профиле не заводим: расхождение между «Стартами» и
+    профилем дало бы неверный контекст для LLM.
+    """
+    best = {}
+    for race in races:
+        if race.get("deleted"):
+            continue
+        label = race.get("dist_label")
+        seconds = parse_time_to_sec(race.get("time"))
+        if label not in DIST_LABEL_KM or seconds is None:
+            continue
+        current = best.get(label)
+        if current is None or seconds < current["seconds"]:
+            best[label] = {"dist_label": label, "km": DIST_LABEL_KM[label],
+                           "time": race.get("time"), "date": race.get("date", ""),
+                           "seconds": seconds}
+    return sorted(best.values(), key=lambda b: b["km"])
+
+
 def current_plan_week_idx(plan_start=None, weeks_count=0):
     """0-based индекс текущей недели плана от его plan_start.
     Без plan_start — исторический дефолт 2026-05-10; без длины плана — 13 недель.
@@ -869,6 +1144,9 @@ def build_llm_context(bucket, sub):
             except Exception:
                 pass
 
+    # Профиль спортсмена (#32)
+    profile, profile_version, _ = read_athlete_profile(bucket, sub)
+
     # Races
     all_races = read_races(bucket, sub)
     active_races = [r for r in all_races if not r.get("deleted", False)]
@@ -906,6 +1184,10 @@ def build_llm_context(bucket, sub):
     avg_pace = (sum(paces) / len(paces)) if paces else None
 
     return {
+        "profile": profile,
+        "profile_derived": compute_athlete_derived(profile),
+        "profile_version": profile_version,
+        "personal_bests": personal_bests(all_races),
         "last_runs": last_runs,
         "last_races": last_races,
         "current_week": current_week,
@@ -923,9 +1205,86 @@ def build_llm_context(bucket, sub):
     }
 
 
-# Порядок и подписи дней недели плана (7 дней, Пн→Вс). #23
-PLAN_DAYS = [("mon", "пн"), ("tue", "вт"), ("wed", "ср"), ("thu", "чт"),
-             ("fri", "пт"), ("sat", "сб"), ("sun", "вс")]
+def plural_ru(number, one, few, many):
+    """«1 тренировка», «3 тренировки», «5 тренировок» — промпт читает человек тоже."""
+    tail = abs(int(number)) % 100
+    if 11 <= tail <= 14:
+        return many
+    tail %= 10
+    if tail == 1:
+        return one
+    if 2 <= tail <= 4:
+        return few
+    return many
+
+
+def format_profile_block(profile, derived, bests):
+    """Строки профиля для промпта. Незаполненное не печатаем — шум для модели."""
+    lines = []
+    day_ru = dict(PLAN_DAYS)
+
+    who = []
+    if profile.get("sex"):
+        who.append(SEX_LABELS.get(profile["sex"], ""))
+    if derived.get("age") is not None:
+        who.append(f"{derived['age']} {plural_ru(derived['age'], 'год', 'года', 'лет')}")
+    if profile.get("height_cm"):
+        who.append(f"{profile['height_cm']} см")
+    if profile.get("weight_kg"):
+        weight = f"{profile['weight_kg']:g} кг"
+        if derived.get("bmi"):
+            weight += f" (ИМТ {derived['bmi']})"
+        who.append(weight)
+    if who:
+        lines.append("Профиль: " + ", ".join(w for w in who if w))
+
+    hr = []
+    if profile.get("hr_max"):
+        hr.append(f"макс {profile['hr_max']}")
+    elif derived.get("hr_max_estimated"):
+        hr.append(f"макс ~{derived['hr_max_estimated']} (оценка по возрасту, не измерялся)")
+    if profile.get("hr_threshold"):
+        hr.append(f"ПАНО {profile['hr_threshold']}")
+    if profile.get("hr_rest"):
+        hr.append(f"покой {profile['hr_rest']}")
+    if hr:
+        lines.append("Пульс: " + ", ".join(hr))
+    if profile.get("vo2max"):
+        lines.append(f"МПК: {profile['vo2max']:g}")
+
+    # Ноль здесь — валидное и сильное значение (новичок без стажа), поэтому
+    # сравниваем с None, а не проверяем на истинность.
+    experience = []
+    if profile.get("years_running") is not None:
+        years = profile["years_running"]
+        experience.append(f"стаж {years:g} {plural_ru(years, 'год', 'года', 'лет')}")
+    if profile.get("weekly_km_typical") is not None:
+        experience.append(f"обычный объём {profile['weekly_km_typical']:g} км/нед")
+    if profile.get("sessions_per_week") is not None:
+        sessions = profile["sessions_per_week"]
+        experience.append(f"{sessions} {plural_ru(sessions, 'тренировка', 'тренировки', 'тренировок')} в неделю")
+    if experience:
+        lines.append("Опыт: " + ", ".join(experience))
+
+    schedule = []
+    if profile.get("available_days"):
+        schedule.append("доступные дни — " + ", ".join(day_ru.get(d, d) for d in profile["available_days"]))
+    if profile.get("long_run_day"):
+        schedule.append("длительная — " + day_ru.get(profile["long_run_day"], profile["long_run_day"]))
+    if schedule:
+        lines.append("Расписание: " + "; ".join(schedule))
+
+    if bests:
+        lines.append("Личные рекорды: " + ", ".join(
+            f"{b['km']:g} км {b['time']}" + (f" ({b['date']})" if b.get("date") else "")
+            for b in bests))
+
+    if profile.get("injuries"):
+        lines.append(f"Ограничения: {profile['injuries']}")
+    if profile.get("notes"):
+        lines.append(f"От спортсмена: {profile['notes']}")
+
+    return lines
 
 
 def _week_days_str(week):
@@ -937,6 +1296,13 @@ def _week_days_str(week):
 def format_context_for_llm(ctx):
     """Превращает контекст в текстовый user prompt."""
     lines = []
+    profile_block = format_profile_block(ctx.get("profile") or {},
+                                         ctx.get("profile_derived") or {},
+                                         ctx.get("personal_bests") or [])
+    if profile_block:
+        lines.extend(profile_block)
+        lines.append("")
+
     race = ctx.get("race") or {}
     goal_bits = [b for b in [race.get("race_name"), race.get("race_date")] if b]
     if race.get("target_time"):
@@ -1003,7 +1369,9 @@ def format_context_for_llm(ctx):
     return "\n".join(lines)
 
 
-SYSTEM_PROMPT = """Ты опытный беговой тренер. Анализируешь данные тренировок бегуна, готовящегося к полумарафону.
+SYSTEM_PROMPT = """Ты опытный беговой тренер. Анализируешь данные тренировок бегуна, готовящегося к целевому старту (дистанция и цель указаны в данных).
+
+Если в данных есть профиль спортсмена — учитывай возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
 
 Дай рекомендации СТРОГО в JSON-формате без лишнего текста до или после:
 {
@@ -1070,6 +1438,7 @@ def write_advice_version(bucket, sub, recommendation, ctx, provider, model, inpu
         "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
         "based_on_plan_id": ctx.get("plan_id"),
         "based_on_plan_version": ctx["plan_version"],
+        "based_on_profile_version": ctx.get("profile_version", 0),
         "based_on_llm_config_version": llm_config_version,
         "provider": provider,
         "model": model,
@@ -1246,7 +1615,7 @@ def migrate_legacy_to_user(bucket, sub):
     if bucket.blob(p_profile(sub)).exists():
         report["skipped"].append(f"{p_profile(sub)} (уже есть)")
     else:
-        write_profile(bucket, sub, {
+        write_legacy_race_profile(bucket, sub, {
             "race_name": "Полумарафон", "race_date": "2026-08-09",
             "target_time": "1:40", "plan_start": "2026-05-10",
         })
@@ -1462,6 +1831,14 @@ def runs_api(request):
             except Exception as e:
                 return jresp({"ok": False, "error": str(e)[:200]}, 200)
 
+        # ── /advise/preview — что именно уйдёт в LLM (#32) ────────────────────
+        if path == "/advise/preview":
+            if request.method != "GET":
+                return jresp({"error": "Method not allowed"}, 405)
+            ctx = build_llm_context(bucket, sub)
+            return jresp({"prompt": format_context_for_llm(ctx),
+                          "system_prompt": SYSTEM_PROMPT}, 200)
+
         # ── /advise — все approved; общий ключ; дневной лимит; per-user данные ─
         if path == "/advise":
             if request.method == "GET":
@@ -1504,13 +1881,32 @@ def runs_api(request):
             else:
                 return jresp({"error": "Method not allowed"}, 405)
 
-        # ── /profile — per-user (гонка, цель, старт плана) ────────────────────
+        # ── /profile — профиль спортсмена, версионно (#32) ─────────────────────
+        if path == "/profile/history":
+            if request.method != "GET":
+                return jresp({"error": "Method not allowed"}, 405)
+            return jresp(read_athlete_history(bucket, sub), 200)
+
         if path == "/profile":
+            def profile_response(profile, version, updated_at):
+                return {"profile": profile,
+                        "derived": compute_athlete_derived(profile),
+                        "personal_bests": personal_bests(read_races(bucket, sub)),
+                        "version": version,
+                        "updated_at": updated_at}
+
             if request.method == "GET":
-                return jresp(read_profile(bucket, sub), 200)
+                return jresp(profile_response(*read_athlete_profile(bucket, sub)), 200)
             elif request.method == "POST":
                 body = request.get_json(silent=True) or {}
-                return jresp(write_profile(bucket, sub, body), 200)
+                profile, errors = clean_athlete_profile(body.get("profile") or body)
+                if errors:
+                    return jresp({"error": "validation_failed", "fields": errors}, 400)
+                payload = write_athlete_version(
+                    bucket, sub, profile,
+                    change_reason=(body.get("change_reason") or "").strip(),
+                    created_by=user.get("email", "api"))
+                return jresp(profile_response(profile, payload["version"], payload["created_at"]), 201)
             else:
                 return jresp({"error": "Method not allowed"}, 405)
 
