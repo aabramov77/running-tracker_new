@@ -235,6 +235,13 @@ def clean_athlete_profile(raw):
             continue
         profile[field] = int(round(number)) if as_int else round(number, 1)
 
+    # Пустой список доступных дней означает «ограничений нет» — проверяем только
+    # заданное расписание, иначе промпт противоречит сам себе: «доступны пн, ср,
+    # сб; длительная — вс» при запрете тренироваться в недоступные дни.
+    if profile["available_days"] and profile["long_run_day"] \
+            and profile["long_run_day"] not in profile["available_days"]:
+        errors["long_run_day"] = "день длительной не входит в доступные дни"
+
     if profile.get("hr_max") and profile.get("hr_threshold") and profile["hr_threshold"] >= profile["hr_max"]:
         errors["hr_threshold"] = "ПАНО должен быть ниже максимального пульса"
     if profile.get("hr_max") and profile.get("hr_rest") and profile["hr_rest"] >= profile["hr_max"]:
@@ -330,13 +337,21 @@ def write_athlete_version(bucket, sub, profile, change_reason="", created_by="ap
     return payload
 
 
-def read_athlete_history(bucket, sub):
-    """Сводка по всем версиям профиля — для динамики веса и пульсовых показателей."""
+ATHLETE_HISTORY_LIMIT = 50
+
+
+def read_athlete_history(bucket, sub, limit=ATHLETE_HISTORY_LIMIT):
+    """Сводка по последним версиям профиля — для динамики веса и пульса.
+
+    Каждая версия — отдельный объект в GCS, поэтому читаем ограниченное окно:
+    у пользователя с сотнями сохранений полный обход упёрся бы в таймаут.
+    """
     manifest = read_athlete_manifest(bucket, sub)
     if not manifest:
         return []
+    current = manifest["current_version"]
     history = []
-    for version in range(1, manifest["current_version"] + 1):
+    for version in range(max(1, current - limit + 1), current + 1):
         blob = bucket.blob(p_athlete_ver(sub, version))
         if not blob.exists():
             continue
@@ -1237,13 +1252,15 @@ def format_profile_block(profile, derived, bests):
     if profile.get("vo2max"):
         lines.append(f"МПК: {profile['vo2max']:g}")
 
+    # Ноль здесь — валидное и сильное значение (новичок без стажа), поэтому
+    # сравниваем с None, а не проверяем на истинность.
     experience = []
-    if profile.get("years_running"):
+    if profile.get("years_running") is not None:
         years = profile["years_running"]
         experience.append(f"стаж {years:g} {plural_ru(years, 'год', 'года', 'лет')}")
-    if profile.get("weekly_km_typical"):
+    if profile.get("weekly_km_typical") is not None:
         experience.append(f"обычный объём {profile['weekly_km_typical']:g} км/нед")
-    if profile.get("sessions_per_week"):
+    if profile.get("sessions_per_week") is not None:
         sessions = profile["sessions_per_week"]
         experience.append(f"{sessions} {plural_ru(sessions, 'тренировка', 'тренировки', 'тренировок')} в неделю")
     if experience:

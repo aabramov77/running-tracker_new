@@ -1443,6 +1443,11 @@ const PB_LABELS = {'4.2km':'4,2 км','5km':'5 км','10km':'10 км','HM':'По
 // Пульсовые зоны считает бэкенд — формула живёт в одном месте.
 let PROFILE_DERIVED = null;
 
+// POST /profile заменяет профиль целиком, поэтому сохранять можно только то,
+// что мы успешно загрузили: иначе неудачная загрузка + «Сохранить» затрут
+// заполненный профиль пустыми полями.
+let PROFILE_LOADED = false;
+
 function profileDayBoxes() {
   return Array.from(document.querySelectorAll('#pr-available-days input[type=checkbox]'));
 }
@@ -1537,27 +1542,45 @@ function applyProfileResponse(data) {
     : 'ещё не заполнен';
 }
 
-function flashProfileMsg(text, ok) {
+function flashProfileMsg(text, ok, sticky) {
   const msg = document.getElementById('profile-msg');
   msg.style.display = 'inline';
   msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
   msg.textContent = text;
+  if (sticky) return;   // условие не пройдёт само — сообщение не прячем
   setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2500 : 6000);
 }
 
+function setProfileSaveEnabled(enabled) {
+  const btn = document.getElementById('profile-save-btn');
+  btn.disabled = !enabled;
+  btn.title = enabled ? '' : 'Профиль не загружен — сохранение затёрло бы данные';
+}
+
 async function loadProfile() {
+  PROFILE_LOADED = false;
+  setProfileSaveEnabled(false);
   try {
     const res = await fetch(API_URL + 'profile', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     applyProfileResponse(await res.json());
+    PROFILE_LOADED = true;
+    setProfileSaveEnabled(true);
   } catch (e) {
     document.getElementById('profile-pb').innerHTML =
       '<div class="empty">Не удалось загрузить профиль</div>';
+    flashProfileMsg('⚠ Профиль не загрузился — сохранение отключено, чтобы не затереть данные. Обновите страницу.', false, true);
   }
 }
 
 async function saveProfile() {
+  if (!PROFILE_LOADED) {
+    flashProfileMsg('⚠ Профиль не загружен — обновите страницу', false);
+    return;
+  }
+  const btn = document.getElementById('profile-save-btn');
+  btn.disabled = true; btn.textContent = 'Сохраняем…';
   try {
     const res = await fetch(API_URL + 'profile', {
       method: 'POST',
@@ -1577,6 +1600,8 @@ async function saveProfile() {
     flashProfileMsg('✓ Сохранено', true);
   } catch (e) {
     flashProfileMsg('⚠ ' + e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Сохранить';
   }
 }
 

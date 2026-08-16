@@ -133,7 +133,7 @@ def test_format_context_includes_profile_block(main_module):
         "profile": {"sex": "m", "birth_date": "1979-03-01", "height_cm": 182,
                     "weight_kg": 74.0, "hr_max": 178, "hr_threshold": 162,
                     "hr_rest": 48, "years_running": 6, "weekly_km_typical": 45,
-                    "sessions_per_week": 4, "available_days": ["mon", "wed", "sat"],
+                    "sessions_per_week": 4, "available_days": ["mon", "wed", "sat", "sun"],
                     "long_run_day": "sun", "injuries": "правое ахилловое",
                     "notes": "во вторник тренировок не бывает"},
         "profile_derived": {"age": 47, "bmi": 22.3, "hr_max_estimated": None},
@@ -146,7 +146,7 @@ def test_format_context_includes_profile_block(main_module):
     text = main_module.format_context_for_llm(ctx)
     assert text.startswith("Профиль: М, 47 лет, 182 см, 74 кг (ИМТ 22.3)")
     assert "макс 178" in text and "ПАНО 162" in text
-    assert "доступные дни — пн, ср, сб" in text and "длительная — вс" in text
+    assert "доступные дни — пн, ср, сб, вс" in text and "длительная — вс" in text
     assert "10 км 44:30 (2026-07-04)" in text
     assert "Ограничения: правое ахилловое" in text
     assert "От спортсмена: во вторник" in text
@@ -176,6 +176,19 @@ def test_format_context_without_profile_has_no_block(main_module):
 ])
 def test_plural_ru(main_module, n, expected):
     assert main_module.plural_ru(n, "тренировка", "тренировки", "тренировок") == expected
+
+
+def test_profile_block_keeps_zero_values(main_module):
+    """Ноль — валидный ответ новичка, а не «не заполнено»."""
+    profile = {**main_module.empty_athlete_profile(),
+               "years_running": 0, "weekly_km_typical": 0, "sessions_per_week": 0}
+    lines = "\n".join(main_module.format_profile_block(profile, {}, []))
+    assert "стаж 0 лет" in lines
+    assert "обычный объём 0 км/нед" in lines
+    assert "0 тренировок в неделю" in lines
+    # незаполненные поля по-прежнему пропускаются
+    assert "Опыт:" not in "\n".join(
+        main_module.format_profile_block(main_module.empty_athlete_profile(), {}, []))
 
 
 def test_profile_block_marks_estimated_hr_max(main_module):

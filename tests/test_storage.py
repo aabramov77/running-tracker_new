@@ -61,7 +61,7 @@ FILLED_PROFILE = {
     "height_cm": "182", "weight_kg": "74.4", "hr_max": "178",
     "hr_threshold": "162", "hr_rest": "48", "vo2max": "52",
     "years_running": "6", "weekly_km_typical": "45", "sessions_per_week": "4",
-    "available_days": ["sat", "mon", "wed"], "long_run_day": "sun",
+    "available_days": ["sat", "mon", "wed", "sun"], "long_run_day": "sun",
     "injuries": "  правое ахилловое  ", "notes": "цель — разменять 1:40",
 }
 
@@ -79,7 +79,7 @@ def test_athlete_profile_cleaning(main_module):
     assert profile["height_cm"] == 182 and isinstance(profile["height_cm"], int)
     assert profile["weight_kg"] == 74.4
     assert profile["injuries"] == "правое ахилловое"          # обрезаны пробелы
-    assert profile["available_days"] == ["mon", "wed", "sat"]  # порядок Пн→Вс
+    assert profile["available_days"] == ["mon", "wed", "sat", "sun"]  # порядок Пн→Вс
 
 
 @pytest.mark.parametrize("field,value", [
@@ -106,6 +106,20 @@ def test_athlete_profile_rejects_inconsistent_hr(main_module):
 def test_athlete_profile_rejects_bad_birth_date(main_module, value, field):
     _, errors = main_module.clean_athlete_profile({"birth_date": value})
     assert field in errors
+
+
+def test_athlete_profile_rejects_long_run_on_unavailable_day(main_module):
+    """Иначе промпт противоречит сам себе: длительная в день, когда бегать нельзя."""
+    _, errors = main_module.clean_athlete_profile(
+        {"available_days": ["mon", "wed", "sat"], "long_run_day": "sun"})
+    assert "long_run_day" in errors
+    # согласованное расписание проходит
+    ok, no_errors = main_module.clean_athlete_profile(
+        {"available_days": ["mon", "wed", "sun"], "long_run_day": "sun"})
+    assert no_errors == {} and ok["long_run_day"] == "sun"
+    # пустой список доступных дней = ограничений нет
+    _, no_errors2 = main_module.clean_athlete_profile({"long_run_day": "sun"})
+    assert no_errors2 == {}
 
 
 def test_athlete_profile_rejects_unknown_days(main_module):
@@ -149,6 +163,19 @@ def test_athlete_history_tracks_measurements(main_module, fake_bucket):
     assert [h["weight_kg"] for h in history] == [74.4, 72.0]
     assert history[1]["change_reason"] == "взвесился"
     assert main_module.read_athlete_history(fake_bucket, SUB2) == []
+
+
+def test_athlete_history_is_bounded_to_latest_versions(main_module, fake_bucket):
+    """Каждая версия — отдельный объект; полный обход упёрся бы в таймаут."""
+    profile = main_module.empty_athlete_profile()
+    for i in range(1, 8):
+        main_module.write_athlete_version(fake_bucket, SUB, {**profile, "weight_kg": 70 + i}, f"v{i}")
+
+    limited = main_module.read_athlete_history(fake_bucket, SUB, limit=3)
+    assert [h["version"] for h in limited] == [5, 6, 7]      # последние, не первые
+    assert [h["weight_kg"] for h in limited] == [75, 76, 77]
+    # окно больше числа версий — отдаём всё, без пустых дыр
+    assert len(main_module.read_athlete_history(fake_bucket, SUB, limit=100)) == 7
 
 
 def test_athlete_derived_values(main_module):

@@ -436,7 +436,7 @@
       <div class="profile-derived" id="profile-derived"></div>
 
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button class="btn-primary" onclick="saveProfile()">Сохранить</button>
+        <button class="btn-primary" id="profile-save-btn" onclick="saveProfile()" disabled>Сохранить</button>
         <button class="btn-sm" onclick="showLlmPreview()">👁 Показать контекст для ИИ</button>
         <span id="profile-msg" class="save-msg"></span>
       </div>
@@ -564,6 +564,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=22"></script>
+<script src="app.js?v=23"></script>
 </body>
 </html>
