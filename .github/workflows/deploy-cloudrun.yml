@@ -4,7 +4,11 @@ on:
   push:
     branches: [Dev, main]
     paths:
-      - 'main.py'
+      # не 'main.py': с #36 код живёт ещё и в domain.py / llm_prompt.py, и
+      # правка в них обязана запускать деплой — иначе прод молча остаётся
+      # на старом коде при зелёном PR
+      - '**.py'
+      - '!tests/**'          # правки тестов деплой не меняют
       - 'requirements.txt'
       - '.github/workflows/deploy-cloudrun.yml'
   workflow_dispatch:  # ручной запуск из UI на случай если нужно передеплоить без изменений

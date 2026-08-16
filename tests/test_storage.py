@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+import domain
+
 SUB = "user-abc"
 SUB2 = "user-xyz"
 
@@ -211,11 +213,11 @@ def test_athlete_derived_empty_profile_is_all_none(main_module):
     ("44:30", 2670), ("1:47:20", 6440), ("0:59", 59),
     ("", None), ("не время", None), ("44", None), ("1:2:3:4", None),
 ])
-def test_parse_time_to_sec(main_module, text, expected):
-    assert main_module.parse_time_to_sec(text) == expected
+def test_parse_time_to_sec(text, expected):
+    assert domain.parse_time_to_sec(text) == expected
 
 
-def test_personal_bests_picks_fastest_and_skips_deleted(main_module):
+def test_personal_bests_picks_fastest_and_skips_deleted():
     races = [
         {"dist_label": "10km", "time": "46:10", "date": "2026-05-30"},
         {"dist_label": "10km", "time": "44:30", "date": "2026-07-04"},   # лучший
@@ -224,10 +226,10 @@ def test_personal_bests_picks_fastest_and_skips_deleted(main_module):
         {"dist_label": "HM", "time": "битое", "date": "2025-10-01"},     # без времени
         {"dist_label": "чего-то", "time": "30:00", "date": "2026-01-01"},
     ]
-    bests = main_module.personal_bests(races)
+    bests = domain.personal_bests(races)
     assert [b["dist_label"] for b in bests] == ["10km", "HM"]   # по возрастанию км
     assert bests[0]["time"] == "44:30" and bests[0]["date"] == "2026-07-04"
-    assert main_module.personal_bests([]) == []
+    assert domain.personal_bests([]) == []
 
 
 # ── plan versioning (per-user, immutable versions) ────────────────────────────

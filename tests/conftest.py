@@ -13,6 +13,10 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
+# main.py импортирует соседей (domain, llm_prompt) — корень репозитория должен
+# быть на sys.path, иначе импорт упадёт и здесь, и в Cloud Run бы не совпало.
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 # Synthetic, GPS-free FIT committed to the repo → runs in CI.
 SYNTHETIC_FIT = REPO / "tests" / "fixtures" / "synthetic_activity.fit"
 # Optional real personal run (gitignored) → richer local-only assertions.

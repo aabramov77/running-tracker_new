@@ -1,4 +1,4 @@
-"""Unit tests for pure helper functions in main.py.
+"""Unit tests for pure helper functions in main.py and llm_prompt.py.
 
 These lock in behavior we previously verified manually (cadence fix, pace/time
 formatting, LLM JSON extraction, key masking, HR-drift, FIT parsing).
@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import llm_prompt
 from conftest import FIT_FIXTURE, SYNTHETIC_FIT
 
 
@@ -119,7 +120,7 @@ def test_format_context_smoke(main_module):
         "heuristics": {"avg_pace_min_per_km": 5.5, "hard_or_bad_count": 0,
                        "total_km_last_14": 14.2},
     }
-    text = main_module.format_context_for_llm(ctx)
+    text = llm_prompt.format_context_for_llm(ctx)
     assert "2026-05-15" in text
     assert "14.2" in text
     # 7-day calendar (#23): Tue/Thu now included in the plan context
@@ -143,7 +144,7 @@ def test_format_context_includes_profile_block(main_module):
         "heuristics": {"avg_pace_min_per_km": None, "hard_or_bad_count": 0,
                        "total_km_last_14": 0},
     }
-    text = main_module.format_context_for_llm(ctx)
+    text = llm_prompt.format_context_for_llm(ctx)
     assert text.startswith("Профиль: М, 47 лет, 182 см, 74 кг (ИМТ 22.3)")
     assert "макс 178" in text and "ПАНО 162" in text
     assert "доступные дни — пн, ср, сб, вс" in text and "длительная — вс" in text
@@ -165,7 +166,7 @@ def test_format_context_without_profile_has_no_block(main_module):
         "heuristics": {"avg_pace_min_per_km": None, "hard_or_bad_count": 0,
                        "total_km_last_14": 0},
     }
-    text = main_module.format_context_for_llm(ctx)
+    text = llm_prompt.format_context_for_llm(ctx)
     assert text.startswith("Цель:")
     assert "Профиль:" not in text and "Ограничения:" not in text
 
@@ -174,44 +175,44 @@ def test_format_context_without_profile_has_no_block(main_module):
     (1, "тренировка"), (2, "тренировки"), (4, "тренировки"),
     (5, "тренировок"), (11, "тренировок"), (14, "тренировок"), (21, "тренировка"),
 ])
-def test_plural_ru(main_module, n, expected):
-    assert main_module.plural_ru(n, "тренировка", "тренировки", "тренировок") == expected
+def test_plural_ru(n, expected):
+    assert llm_prompt.plural_ru(n, "тренировка", "тренировки", "тренировок") == expected
 
 
 def test_profile_block_keeps_zero_values(main_module):
     """Ноль — валидный ответ новичка, а не «не заполнено»."""
     profile = {**main_module.empty_athlete_profile(),
                "years_running": 0, "weekly_km_typical": 0, "sessions_per_week": 0}
-    lines = "\n".join(main_module.format_profile_block(profile, {}, []))
+    lines = "\n".join(llm_prompt.format_profile_block(profile, {}, []))
     assert "стаж 0 лет" in lines
     assert "обычный объём 0 км/нед" in lines
     assert "0 тренировок в неделю" in lines
     # незаполненные поля по-прежнему пропускаются
     assert "Опыт:" not in "\n".join(
-        main_module.format_profile_block(main_module.empty_athlete_profile(), {}, []))
+        llm_prompt.format_profile_block(main_module.empty_athlete_profile(), {}, []))
 
 
 def test_profile_block_marks_estimated_hr_max(main_module):
     """Оценка HRmax помечается — модель не должна принять её за измерение."""
     profile = {**main_module.empty_athlete_profile(), "birth_date": "1986-01-01"}
     derived = main_module.compute_athlete_derived(profile, today=date(2026, 8, 16))
-    lines = "\n".join(main_module.format_profile_block(profile, derived, []))
+    lines = "\n".join(llm_prompt.format_profile_block(profile, derived, []))
     assert "оценка по возрасту" in lines
     # с измеренным пульсом оценки в промпте нет
     measured = {**profile, "hr_max": 190}
-    lines2 = "\n".join(main_module.format_profile_block(
+    lines2 = "\n".join(llm_prompt.format_profile_block(
         measured, main_module.compute_athlete_derived(measured, today=date(2026, 8, 16)), []))
     assert "оценка" not in lines2 and "макс 190" in lines2
 
 
-def test_week_days_str_skips_empty(main_module):
+def test_week_days_str_skips_empty():
     # 5-day legacy week (no tue/thu) renders without them, no crash
     legacy = {"mon": "8", "wed": "6x1", "fri": "10", "sat": "4x2", "sun": "14"}
-    s = main_module._week_days_str(legacy)
+    s = llm_prompt._week_days_str(legacy)
     assert "пн=8" in s and "вс=14" in s
     assert "вт=" not in s and "чт=" not in s
     # empty week
-    assert main_module._week_days_str({}) == "(пусто)"
+    assert llm_prompt._week_days_str({}) == "(пусто)"
 
 
 # ── FIT parsing ───────────────────────────────────────────────────────────────

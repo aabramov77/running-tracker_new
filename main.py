@@ -13,6 +13,9 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from fitparse import FitFile
 
+from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
+from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
+
 CLIENT_ID = "463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
 
 # Кто получает role=admin при первом логине. Остальные — pending до одобрения.
@@ -117,9 +120,6 @@ def write_legacy_race_profile(bucket, sub, profile):
 # users/{sub}/athlete/manifest.json + v{N}/profile.json. Каждое сохранение —
 # новая версия, поэтому история веса и пульсовых показателей копится сама.
 
-# Порядок и подписи дней недели плана (7 дней, Пн→Вс). #23
-PLAN_DAYS = [("mon", "пн"), ("tue", "вт"), ("wed", "ср"), ("thu", "чт"),
-             ("fri", "пт"), ("sat", "сб"), ("sun", "вс")]
 
 ATHLETE_TEXT_FIELDS = ("full_name", "birth_date", "sex", "long_run_day", "injuries", "notes")
 
@@ -138,18 +138,6 @@ ATHLETE_NUM_FIELDS = {
 
 # Поля, по которым имеет смысл смотреть динамику между версиями
 ATHLETE_HISTORY_FIELDS = ("weight_kg", "hr_max", "hr_threshold", "hr_rest", "vo2max")
-
-SEX_LABELS = {"m": "М", "f": "Ж"}
-
-# Границы пульсовых зон в % от максимального пульса — ориентир, не медицинская
-# рекомендация.
-HR_ZONE_BOUNDS = [
-    ("Z1 восстановление", 50, 60),
-    ("Z2 аэробная",       60, 70),
-    ("Z3 темповая",       70, 80),
-    ("Z4 ПАНО",           80, 90),
-    ("Z5 максимальная",   90, 100),
-]
 
 
 def empty_athlete_profile():
@@ -985,68 +973,6 @@ def parse_llm_json(text):
 
 # ── Advice context + storage ─────────────────────────────────────────────────
 
-PLAN_PHASE_LABELS = {
-    "dev": "Развитие",
-    "peak": "Пик формы",
-    "taper": "Тейпер",
-    "load": "Разгрузка",
-    "race": "Соревнование (подводка)",
-}
-
-FEEL_LABELS = {
-    "great": "отлично",
-    "good": "хорошо",
-    "ok": "нормально",
-    "hard": "тяжело",
-    "bad": "плохо",
-}
-
-TYPE_LABELS = {
-    "easy": "лёгкий",
-    "interval": "интервалы",
-    "tempo": "темповый",
-    "long": "длительный",
-    "race": "соревнование",
-    "recovery": "восстановительный",
-}
-
-DIST_LABEL_KM = {"4.2km": 4.2, "5km": 5, "10km": 10, "HM": 21.0975, "M": 42.195}
-
-
-def parse_time_to_sec(text):
-    """«44:30» → 2670, «1:47:20» → 6440. Мусор → None."""
-    if not text:
-        return None
-    parts = str(text).strip().split(":")
-    if not 2 <= len(parts) <= 3 or not all(p.strip().isdigit() for p in parts):
-        return None
-    nums = [int(p) for p in parts]
-    if len(parts) == 2:
-        return nums[0] * 60 + nums[1]
-    return nums[0] * 3600 + nums[1] * 60 + nums[2]
-
-
-def personal_bests(races):
-    """Лучший результат на каждой дистанции из раздела «Старты» (#32).
-
-    Отдельных полей в профиле не заводим: расхождение между «Стартами» и
-    профилем дало бы неверный контекст для LLM.
-    """
-    best = {}
-    for race in races:
-        if race.get("deleted"):
-            continue
-        label = race.get("dist_label")
-        seconds = parse_time_to_sec(race.get("time"))
-        if label not in DIST_LABEL_KM or seconds is None:
-            continue
-        current = best.get(label)
-        if current is None or seconds < current["seconds"]:
-            best[label] = {"dist_label": label, "km": DIST_LABEL_KM[label],
-                           "time": race.get("time"), "date": race.get("date", ""),
-                           "seconds": seconds}
-    return sorted(best.values(), key=lambda b: b["km"])
-
 
 def current_plan_week_idx(plan_start=None, weeks_count=0):
     """0-based индекс текущей недели плана от его plan_start.
@@ -1182,187 +1108,6 @@ def build_llm_context(bucket, sub):
             "total_km_last_14": round(total_km, 1),
         },
     }
-
-
-def plural_ru(number, one, few, many):
-    """«1 тренировка», «3 тренировки», «5 тренировок» — промпт читает человек тоже."""
-    tail = abs(int(number)) % 100
-    if 11 <= tail <= 14:
-        return many
-    tail %= 10
-    if tail == 1:
-        return one
-    if 2 <= tail <= 4:
-        return few
-    return many
-
-
-def format_profile_block(profile, derived, bests):
-    """Строки профиля для промпта. Незаполненное не печатаем — шум для модели."""
-    lines = []
-    day_ru = dict(PLAN_DAYS)
-
-    who = []
-    if profile.get("sex"):
-        who.append(SEX_LABELS.get(profile["sex"], ""))
-    if derived.get("age") is not None:
-        who.append(f"{derived['age']} {plural_ru(derived['age'], 'год', 'года', 'лет')}")
-    if profile.get("height_cm"):
-        who.append(f"{profile['height_cm']} см")
-    if profile.get("weight_kg"):
-        weight = f"{profile['weight_kg']:g} кг"
-        if derived.get("bmi"):
-            weight += f" (ИМТ {derived['bmi']})"
-        who.append(weight)
-    if who:
-        lines.append("Профиль: " + ", ".join(w for w in who if w))
-
-    hr = []
-    if profile.get("hr_max"):
-        hr.append(f"макс {profile['hr_max']}")
-    elif derived.get("hr_max_estimated"):
-        hr.append(f"макс ~{derived['hr_max_estimated']} (оценка по возрасту, не измерялся)")
-    if profile.get("hr_threshold"):
-        hr.append(f"ПАНО {profile['hr_threshold']}")
-    if profile.get("hr_rest"):
-        hr.append(f"покой {profile['hr_rest']}")
-    if hr:
-        lines.append("Пульс: " + ", ".join(hr))
-    if profile.get("vo2max"):
-        lines.append(f"МПК: {profile['vo2max']:g}")
-
-    # Ноль здесь — валидное и сильное значение (новичок без стажа), поэтому
-    # сравниваем с None, а не проверяем на истинность.
-    experience = []
-    if profile.get("years_running") is not None:
-        years = profile["years_running"]
-        experience.append(f"стаж {years:g} {plural_ru(years, 'год', 'года', 'лет')}")
-    if profile.get("weekly_km_typical") is not None:
-        experience.append(f"обычный объём {profile['weekly_km_typical']:g} км/нед")
-    if profile.get("sessions_per_week") is not None:
-        sessions = profile["sessions_per_week"]
-        experience.append(f"{sessions} {plural_ru(sessions, 'тренировка', 'тренировки', 'тренировок')} в неделю")
-    if experience:
-        lines.append("Опыт: " + ", ".join(experience))
-
-    schedule = []
-    if profile.get("available_days"):
-        schedule.append("доступные дни — " + ", ".join(day_ru.get(d, d) for d in profile["available_days"]))
-    if profile.get("long_run_day"):
-        schedule.append("длительная — " + day_ru.get(profile["long_run_day"], profile["long_run_day"]))
-    if schedule:
-        lines.append("Расписание: " + "; ".join(schedule))
-
-    if bests:
-        lines.append("Личные рекорды: " + ", ".join(
-            f"{b['km']:g} км {b['time']}" + (f" ({b['date']})" if b.get("date") else "")
-            for b in bests))
-
-    if profile.get("injuries"):
-        lines.append(f"Ограничения: {profile['injuries']}")
-    if profile.get("notes"):
-        lines.append(f"От спортсмена: {profile['notes']}")
-
-    return lines
-
-
-def _week_days_str(week):
-    """Строка тренировок недели по дням; пустые/отсутствующие дни пропускаются."""
-    parts = [f"{label}={week.get(field)}" for field, label in PLAN_DAYS if week.get(field)]
-    return "; ".join(parts) if parts else "(пусто)"
-
-
-def format_context_for_llm(ctx):
-    """Превращает контекст в текстовый user prompt."""
-    lines = []
-    profile_block = format_profile_block(ctx.get("profile") or {},
-                                         ctx.get("profile_derived") or {},
-                                         ctx.get("personal_bests") or [])
-    if profile_block:
-        lines.extend(profile_block)
-        lines.append("")
-
-    race = ctx.get("race") or {}
-    goal_bits = [b for b in [race.get("race_name"), race.get("race_date")] if b]
-    if race.get("target_time"):
-        goal_bits.append(f"цель {race['target_time']}")
-    lines.append("Цель: " + (", ".join(goal_bits) if goal_bits else "не задана"))
-    lines.append(f"Сегодня: {datetime.utcnow().date().isoformat()}")
-    total = ctx.get("weeks_total") or 0
-    lines.append(f"Текущая неделя плана: {ctx['week_idx'] + 1}"
-                 + (f" из {total}" if total else ""))
-
-    cw = ctx.get("current_week")
-    if cw:
-        phase = PLAN_PHASE_LABELS.get(cw.get("type"), cw.get("type"))
-        lines.append(f"Фаза: {phase} — {cw.get('accent', '')}")
-        lines.append("План текущей недели:")
-        lines.append("  " + _week_days_str(cw))
-    nw = ctx.get("next_week")
-    if nw:
-        lines.append("План следующей недели:")
-        lines.append("  " + _week_days_str(nw))
-
-    lines.append("")
-    lines.append("Последние 14 тренировок (сначала свежие):")
-    for r in ctx["last_runs"]:
-        t = TYPE_LABELS.get(r.get("type"), r.get("type", ""))
-        feel = FEEL_LABELS.get(r.get("feel"), "")
-        parts = [r.get("date", "?"), t, f"{r.get('dist', '?')}км"]
-        if r.get("time"): parts.append(r["time"])
-        if r.get("pace"): parts.append(f"темп {r['pace']}/км")
-        if r.get("hr"): parts.append(f"пульс ср.{r['hr']}")
-        if r.get("max_hr"): parts.append(f"макс {r['max_hr']}")
-        if r.get("avg_cadence"): parts.append(f"каденс {r['avg_cadence']}")
-        if r.get("total_ascent_m"): parts.append(f"набор {r['total_ascent_m']}м")
-        if feel: parts.append(f"ощ:{feel}")
-        line = "  - " + " ".join(parts)
-        if r.get("_lap_paces"):
-            line += f"\n    лапы: {r['_lap_paces']}"
-        if r.get("_hr_drift_pct") is not None:
-            d = r["_hr_drift_pct"]
-            sign = "+" if d >= 0 else ""
-            line += f"\n    HR-drift: {sign}{d}% (изменение среднего пульса 1-я→2-я половина)"
-        if r.get("notes"):
-            line += f"\n    заметки: {r['notes']}"
-        lines.append(line)
-
-    if ctx["last_races"]:
-        lines.append("")
-        lines.append("Последние забеги:")
-        for race in ctx["last_races"]:
-            label = race.get("dist_label", "")
-            km = DIST_LABEL_KM.get(label, "?")
-            lines.append(f"  - {race.get('date', '?')} {race.get('name', '?')} {km}км {race.get('time', '?')}")
-
-    h = ctx["heuristics"]
-    lines.append("")
-    lines.append("Эвристики:")
-    if h["avg_pace_min_per_km"] is not None:
-        ap = h["avg_pace_min_per_km"]
-        m = int(ap); s = round((ap - m) * 60)
-        lines.append(f"  - средний темп за 14 тренировок: {m}:{s:02d}/км")
-    lines.append(f"  - тяжёлых/плохих тренировок: {h['hard_or_bad_count']}")
-    lines.append(f"  - суммарно: {h['total_km_last_14']} км")
-
-    return "\n".join(lines)
-
-
-SYSTEM_PROMPT = """Ты опытный беговой тренер. Анализируешь данные тренировок бегуна, готовящегося к целевому старту (дистанция и цель указаны в данных).
-
-Если в данных есть профиль спортсмена — учитывай возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
-
-Дай рекомендации СТРОГО в JSON-формате без лишнего текста до или после:
-{
-  "assessment": "1-2 предложения общей оценки прогресса",
-  "adjustments": [
-    {"day": "среда", "change": "конкретное предложение по корректировке"}
-  ],
-  "warnings": ["предупреждение если есть риски"]
-}
-
-Если корректировок не нужно — пустой массив adjustments. Если предупреждений нет — пустой массив warnings.
-Отвечай на русском языке."""
 
 
 def read_advice_manifest(bucket, sub):
