@@ -24,3 +24,9 @@ tests/fixtures/*.fit
 
 # pytest
 .pytest_cache/
+
+# Секреты — в репозиторий не попадают никогда.
+# Auth/ — выгрузки OAuth-клиента из Google Cloud Console; шаблон ниже ловит
+# такой файл и вне этой папки, если он окажется где-то ещё.
+Auth/
+*client_secret*.json
