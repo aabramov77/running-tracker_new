@@ -104,6 +104,15 @@ class FakeClient:
         return self._bucket
 
 
+@pytest.fixture(autouse=True)
+def _reset_registry_cache(main_module):
+    """Кэш реестра — глобальный для модуля, а main_module живёт всю сессию.
+    Без сброса состояние протекает между тестами и между файлами."""
+    main_module._registry_cache["data"] = None
+    main_module._registry_cache["ts"] = 0.0
+    yield
+
+
 @pytest.fixture
 def fake_bucket():
     return FakeBucket()

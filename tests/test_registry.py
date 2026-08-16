@@ -7,14 +7,6 @@ ADMIN_TOKEN = {"sub": "admin-sub", "email": "aabramov77@gmail.com", "name": "Ale
 USER_TOKEN = {"sub": "u1", "email": "runner@example.com", "name": "Runner"}
 
 
-@pytest.fixture(autouse=True)
-def _reset_registry_cache(main_module):
-    """The registry cache is module-global; clear it between tests."""
-    main_module._registry_cache["data"] = None
-    main_module._registry_cache["ts"] = 0.0
-    yield
-
-
 # ── resolve_user ──────────────────────────────────────────────────────────────
 
 def test_admin_first_login_is_approved(main_module, fake_bucket):
