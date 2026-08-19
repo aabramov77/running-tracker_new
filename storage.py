@@ -17,7 +17,8 @@ from fitparse import FitFile
 from google.cloud import storage as gcs
 
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
-                    MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
+                    LLM_MAX_TOKENS, MAX_PENDING, REGISTRY_TTL_SEC,
+                    USERS_REGISTRY)
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 
@@ -904,25 +905,40 @@ def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500)
     }
 
 
-def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt, max_tokens=1500):
-    """Универсальный клиент для OpenAI и Deepseek (одинаковый протокол)."""
-    res = httpx.post(
+# Имя параметра лимита вывода. У моделей с рассуждением OpenAI старый
+# max_tokens отклоняет, а новый покрывает и рассуждение, и видимый ответ.
+# Провайдер, знающий только старое имя, ответит 400 с упоминанием нового —
+# тогда повторяем запрос со старым, вместо того чтобы гадать по документации.
+BUDGET_PARAM = "max_completion_tokens"
+LEGACY_BUDGET_PARAM = "max_tokens"
+
+
+def _post_chat(base_url, api_key, payload):
+    return httpx.post(
         f"{base_url}/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "response_format": {"type": "json_object"},
-        },
+        json=payload,
         timeout=60.0,
     )
+
+
+def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt, max_tokens=None):
+    """Универсальный клиент для OpenAI и Deepseek (одинаковый протокол)."""
+    budget = max_tokens or LLM_MAX_TOKENS
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    res = _post_chat(base_url, api_key, {**body, BUDGET_PARAM: budget})
+    if res.status_code == 400 and BUDGET_PARAM in res.text:
+        res = _post_chat(base_url, api_key, {**body, LEGACY_BUDGET_PARAM: budget})
     res.raise_for_status()
     data = res.json()
     text = data["choices"][0]["message"]["content"]
