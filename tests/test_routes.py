@@ -238,3 +238,35 @@ def test_entry_point_delegates_to_api(monkeypatch):
     monkeypatch.setattr(main, "handle_request", spy)
     assert main.runs_api("запрос") == "ok"
     assert seen["req"] == "запрос"
+
+
+# ── конфиг LLM: глубина рассуждения (#38) ─────────────────────────────────────
+
+ADMIN = {"sub": "admin-sub", "email": "aabramov77@gmail.com"}
+
+
+def test_llm_config_rejects_unknown_effort(api):
+    body, code, _ = api(FakeRequest("POST", "/config/llm", json_body={
+        "provider": "openai", "model": "gpt-5.6-luna",
+        "api_key": "sk-test", "effort": "xhigh"}), **ADMIN)
+    assert code == 400 and "Invalid effort" in body
+
+
+def test_llm_config_stores_and_returns_effort(api):
+    body, code, _ = api(FakeRequest("POST", "/config/llm", json_body={
+        "provider": "openai", "model": "gpt-5.6-luna",
+        "api_key": "sk-test", "effort": "high"}), **ADMIN)
+    assert code == 201 and json.loads(body)["effort"] == "high"
+
+    body, code, _ = api(FakeRequest("GET", "/config/llm"), **ADMIN)
+    cfg = json.loads(body)
+    assert code == 200 and cfg["effort"] == "high"
+    assert cfg["effort_levels"] == ["low", "medium", "high"]
+    assert "sk-test" not in body            # ключ наружу не уходит
+
+
+def test_llm_config_without_effort_gets_default(api):
+    api(FakeRequest("POST", "/config/llm", json_body={
+        "provider": "openai", "model": "gpt-5.6-luna", "api_key": "sk-test"}), **ADMIN)
+    cfg = json.loads(api(FakeRequest("GET", "/config/llm"), **ADMIN)[0])
+    assert cfg["effort"] == cfg["default_effort"] == "medium"

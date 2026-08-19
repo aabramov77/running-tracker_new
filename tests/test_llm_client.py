@@ -136,3 +136,54 @@ def test_call_llm_routes_to_provider(storage_module, captured, provider, host):
 def test_call_llm_rejects_unknown_provider(storage_module):
     with pytest.raises(ValueError, match="Unknown provider"):
         storage_module.call_llm("nope", "m", "k", "s", "u")
+
+
+# ── глубина рассуждения (#38, фаза 2) ─────────────────────────────────────────
+
+def test_default_effort_is_sent(storage_module, captured):
+    _call(storage_module)
+    body = captured["calls"][0]["body"]
+    assert body["reasoning_effort"] == storage_module.LLM_DEFAULT_EFFORT
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_explicit_effort_is_sent(storage_module, captured, level):
+    _call(storage_module, effort=level)
+    assert captured["calls"][0]["body"]["reasoning_effort"] == level
+
+
+@pytest.mark.parametrize("bad", [None, "", "xhigh", "максимальная", 5])
+def test_unknown_effort_falls_back_to_default(storage_module, captured, bad):
+    """Чужая строка в теле запроса даёт 400 от провайдера, а конфиг мог быть
+    записан до #38 — там поля effort нет вовсе."""
+    _call(storage_module, effort=bad)
+    assert captured["calls"][0]["body"]["reasoning_effort"] == storage_module.LLM_DEFAULT_EFFORT
+
+
+def test_call_llm_passes_effort_through(storage_module, captured):
+    storage_module.call_llm("openai", "test-model", "sk-test", "s", "u", effort="high")
+    assert captured["calls"][0]["body"]["reasoning_effort"] == "high"
+
+
+def test_effort_survives_the_legacy_budget_retry(storage_module, captured):
+    """Повтор со старым именем бюджета не должен терять уровень."""
+    captured["replies"].append(FakeResponse({}, status_code=400,
+                                            text="Unsupported parameter: 'max_completion_tokens'"))
+    captured["replies"].append(FakeResponse(OK_BODY))
+    _call(storage_module, effort="high")
+    assert captured["calls"][1]["body"]["reasoning_effort"] == "high"
+
+
+# ── конфиг LLM хранит уровень ─────────────────────────────────────────────────
+
+def test_config_version_stores_effort(storage_module, fake_bucket):
+    storage_module.write_llm_config_version(fake_bucket, "openai", "gpt-5.6-luna",
+                                            "sk-test", effort="high")
+    cfg = storage_module.read_llm_config_full(fake_bucket)
+    assert cfg["effort"] == "high"
+
+
+def test_config_version_without_effort_gets_default(storage_module, fake_bucket):
+    storage_module.write_llm_config_version(fake_bucket, "openai", "gpt-5.6-luna", "sk-test")
+    cfg = storage_module.read_llm_config_full(fake_bucket)
+    assert cfg["effort"] == storage_module.LLM_DEFAULT_EFFORT

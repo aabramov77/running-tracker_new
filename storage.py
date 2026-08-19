@@ -17,8 +17,8 @@ from fitparse import FitFile
 from google.cloud import storage as gcs
 
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
-                    LLM_MAX_TOKENS, MAX_PENDING, REGISTRY_TTL_SEC,
-                    USERS_REGISTRY)
+                    LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
+                    MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 
@@ -841,7 +841,7 @@ def read_llm_config_full(bucket):
     return json.loads(blob.download_as_text())
 
 
-def write_llm_config_version(bucket, provider, model, api_key, created_by="aabramov77"):
+def write_llm_config_version(bucket, provider, model, api_key, effort=None, created_by="aabramov77"):
     manifest = read_llm_manifest(bucket)
     next_version = (manifest["current_version"] + 1) if manifest else 1
     object_path = f"config/llm/v{next_version}/config.json"
@@ -855,6 +855,7 @@ def write_llm_config_version(bucket, provider, model, api_key, created_by="aabra
         "provider": provider,
         "model": model,
         "api_key": api_key,
+        "effort": clean_effort(effort),
         "supersedes_version": next_version - 1 if next_version > 1 else None,
     }
     payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -874,7 +875,8 @@ def write_llm_config_version(bucket, provider, model, api_key, created_by="aabra
         json.dumps(new_manifest, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
-    return {"version": next_version, "provider": provider, "model": model}
+    return {"version": next_version, "provider": provider, "model": model,
+            "effort": payload["effort"]}
 
 
 # ── LLM clients (Anthropic / OpenAI / Deepseek) ──────────────────────────────
@@ -925,7 +927,8 @@ def _post_chat(base_url, api_key, payload):
     )
 
 
-def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt, max_tokens=None):
+def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt,
+                            max_tokens=None, effort=None):
     """Универсальный клиент для OpenAI и Deepseek (одинаковый протокол)."""
     budget = max_tokens or LLM_MAX_TOKENS
     body = {
@@ -935,6 +938,7 @@ def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt
             {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
+        "reasoning_effort": clean_effort(effort),
     }
     res = _post_chat(base_url, api_key, {**body, BUDGET_PARAM: budget})
     if res.status_code == 400 and BUDGET_PARAM in res.text:
@@ -950,13 +954,24 @@ def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt
     }
 
 
-def call_llm(provider, model, api_key, system_prompt, user_prompt):
+def clean_effort(effort):
+    """Неизвестный уровень молча заменяем дефолтом: чужая строка в теле
+    запроса даёт 400 от провайдера, а конфиг мог быть записан до #38."""
+    return effort if effort in LLM_EFFORT_LEVELS else LLM_DEFAULT_EFFORT
+
+
+def call_llm(provider, model, api_key, system_prompt, user_prompt, effort=None):
     if provider == "anthropic":
+        # Провайдер вне интерфейса (#38): ключа нет. Уровень рассуждения у
+        # Anthropic задаётся не reasoning_effort, а output_config.effort —
+        # прокинуть его сюда придётся вместе с возвратом провайдера.
         return _call_anthropic(model, api_key, system_prompt, user_prompt)
     if provider == "openai":
-        return _call_openai_compatible("https://api.openai.com/v1", model, api_key, system_prompt, user_prompt)
+        return _call_openai_compatible("https://api.openai.com/v1", model, api_key,
+                                       system_prompt, user_prompt, effort=effort)
     if provider == "deepseek":
-        return _call_openai_compatible("https://api.deepseek.com/v1", model, api_key, system_prompt, user_prompt)
+        return _call_openai_compatible("https://api.deepseek.com/v1", model, api_key,
+                                       system_prompt, user_prompt, effort=effort)
     raise ValueError(f"Unknown provider: {provider}")
 
 

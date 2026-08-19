@@ -466,6 +466,14 @@
           <label>Модель</label>
           <select id="s-model"></select>
         </div>
+        <div class="form-group">
+          <label>Глубина рассуждения</label>
+          <select id="s-effort">
+            <option value="low">Низкая — быстро и дёшево</option>
+            <option value="medium" selected>Средняя</option>
+            <option value="high">Высокая — для сложных корректировок</option>
+          </select>
+        </div>
         <div class="form-group full">
           <label>API ключ <span id="s-key-current" style="color:var(--text-muted);font-weight:400;font-size:11px"></span></label>
           <input type="password" id="s-api-key" placeholder="введите новый ключ или оставьте пустым" autocomplete="new-password">
@@ -563,6 +571,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=25"></script>
+<script src="app.js?v=26"></script>
 </body>
 </html>

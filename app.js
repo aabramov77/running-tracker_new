@@ -1642,6 +1642,7 @@ async function loadLlmSettings() {
       document.getElementById('s-provider').value = cfg.provider;
       updateModelOptions();
       document.getElementById('s-model').value = cfg.model;
+      if (cfg.effort) document.getElementById('s-effort').value = cfg.effort;
       document.getElementById('s-key-current').textContent = `(текущий: ${cfg.api_key_masked})`;
       document.getElementById('s-api-key').placeholder = 'оставьте пустым чтобы не менять ключ';
     }
@@ -1652,6 +1653,7 @@ async function saveLlmConfig() {
   const provider = document.getElementById('s-provider').value;
   const model = document.getElementById('s-model').value;
   const apiKeyInput = document.getElementById('s-api-key').value.trim();
+  const effort = document.getElementById('s-effort').value;
   const msg = document.getElementById('settings-msg');
 
   // Если ключ не введён — берём текущий с бэка (нельзя — нет реального ключа на фронте).
@@ -1667,7 +1669,7 @@ async function saveLlmConfig() {
     const res = await fetch(API_URL + 'config/llm', {
       method: 'POST',
       headers: authHeaders({'Content-Type':'application/json'}),
-      body: JSON.stringify({ provider, model, api_key: apiKeyInput }),
+      body: JSON.stringify({ provider, model, api_key: apiKeyInput, effort }),
     });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) {
