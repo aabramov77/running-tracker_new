@@ -13,12 +13,13 @@ from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
 from config import (ADMIN_DAILY_ADVISE_LIMIT, BUCKET_NAME, CLIENT_ID,
-                    DAILY_ADVISE_LIMIT)
+                    DAILY_ADVISE_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
-from storage import (RegistrationClosed, _fmt_duration, _fmt_pace, archive_plan,
+from storage import (LLMRefused, LLMTruncated, RegistrationClosed,
+                     _fmt_duration, _fmt_pace, archive_plan,
                      attach_fit_details_to_run, build_llm_context, call_llm,
-                     clean_athlete_profile, cleanup_old_tmp,
+                     clean_athlete_profile, clean_effort, cleanup_old_tmp,
                      compute_athlete_derived, create_plan, find_plan,
                      get_active_plan, get_storage_client,
                      increment_advice_usage, mask_key, migrate_legacy_to_user,
@@ -159,6 +160,9 @@ def h_llm_config_get(c):
         "provider": cfg["provider"],
         "model": cfg["model"],
         "api_key_masked": mask_key(cfg.get("api_key", "")),
+        "effort": clean_effort(cfg.get("effort")),   # конфиг мог быть записан до #38
+        "effort_levels": list(LLM_EFFORT_LEVELS),
+        "default_effort": LLM_DEFAULT_EFFORT,
         "updated_at": cfg.get("created_at"),
     }, 200)
 
@@ -174,7 +178,11 @@ def h_llm_config_post(c):
         return jresp({"error": "Missing model"}, 400)
     if not api_key:
         return jresp({"error": "Missing api_key"}, 400)
-    result = write_llm_config_version(c.bucket, provider, model, api_key, created_by=c.email)
+    effort = body.get("effort") or LLM_DEFAULT_EFFORT
+    if effort not in LLM_EFFORT_LEVELS:
+        return jresp({"error": "Invalid effort", "allowed": list(LLM_EFFORT_LEVELS)}, 400)
+    result = write_llm_config_version(c.bucket, provider, model, api_key,
+                                      effort=effort, created_by=c.email)
     return jresp(result, 201)
 
 
@@ -187,7 +195,8 @@ def h_llm_config_test(c):
         res = call_llm(
             cfg["provider"], cfg["model"], cfg["api_key"],
             "Ты помощник. Отвечай строго: {\"ok\":true}",
-            "Верни строго JSON {\"ok\":true}"
+            "Верни строго JSON {\"ok\":true}",
+            effort=cfg.get("effort")
         )
         latency_ms = int((datetime.utcnow() - t0).total_seconds() * 1000)
         return jresp({
@@ -196,6 +205,8 @@ def h_llm_config_test(c):
             "output_tokens": res["output_tokens"],
             "sample_response": res["text"][:200],
         }, 200)
+    except LLMRefused as e:
+        return jresp({"ok": False, "error": f"Модель отклонила запрос: {str(e)[:200]}"}, 200)
     except httpx.HTTPStatusError as e:
         return jresp({"ok": False, "error": f"Provider {e.response.status_code}: {e.response.text[:200]}"}, 200)
     except Exception as e:
@@ -228,7 +239,13 @@ def h_advise_post(c):
         return jresp({"error": "Нужна хотя бы одна пробежка для рекомендаций"}, 400)
     user_prompt = format_context_for_llm(ctx)
     try:
-        llm_res = call_llm(cfg["provider"], cfg["model"], cfg["api_key"], SYSTEM_PROMPT, user_prompt)
+        llm_res = call_llm(cfg["provider"], cfg["model"], cfg["api_key"],
+                           SYSTEM_PROMPT, user_prompt, effort=cfg.get("effort"))
+    except LLMRefused as e:
+        return jresp({"error": f"Модель отклонила запрос: {str(e)[:300]}"}, 422)
+    except LLMTruncated:
+        return jresp({"error": "Ответ не поместился в лимит токенов — "
+                               "понизьте глубину рассуждения в настройках."}, 502)
     except httpx.HTTPStatusError as e:
         return jresp({"error": f"Provider {e.response.status_code}: {e.response.text[:300]}"}, 502)
     except Exception as e:

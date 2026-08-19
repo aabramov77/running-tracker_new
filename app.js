@@ -1393,27 +1393,28 @@ function renderAdjust() {
 
 // ── LLM Settings ──────────────────────────────────────────────────────────────
 
+// По одному варианту на провайдера. Anthropic убран из выбора: своего ключа
+// нет, а платить за токены незачем — клиент под него остаётся в storage.py,
+// вернуть можно строкой здесь и опцией в index.html.
 const LLM_MODELS = {
-  anthropic: [
-    { id: 'claude-sonnet-4-5-20250929', label: 'Claude Sonnet 4.5' },
-    { id: 'claude-haiku-4-5-20250929', label: 'Claude Haiku 4.5' },
-    { id: 'claude-opus-4-5-20250929', label: 'Claude Opus 4.5' },
-  ],
   openai: [
-    { id: 'gpt-4o', label: 'GPT-4o' },
-    { id: 'gpt-4o-mini', label: 'GPT-4o mini' },
-    { id: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+    { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   ],
   deepseek: [
-    { id: 'deepseek-chat', label: 'Deepseek Chat' },
-    { id: 'deepseek-reasoner', label: 'Deepseek Reasoner' },
+    { id: 'deepseek-v4-pro', label: 'DeepSeek V4-Pro' },
   ],
 };
 
 function updateModelOptions() {
-  const provider = document.getElementById('s-provider').value;
+  const providerSel = document.getElementById('s-provider');
+  // Сохранённый конфиг может ссылаться на провайдера, которого больше нет
+  // в списке (так ушёл Anthropic). Тогда select не примет значение и станет
+  // пустым — откатываемся на первого доступного, иначе падаем на .map.
+  if (!LLM_MODELS[providerSel.value]) {
+    providerSel.value = Object.keys(LLM_MODELS)[0];
+  }
   const sel = document.getElementById('s-model');
-  sel.innerHTML = LLM_MODELS[provider].map(m =>
+  sel.innerHTML = LLM_MODELS[providerSel.value].map(m =>
     `<option value="${m.id}">${m.label}</option>`).join('');
 }
 
@@ -1641,6 +1642,7 @@ async function loadLlmSettings() {
       document.getElementById('s-provider').value = cfg.provider;
       updateModelOptions();
       document.getElementById('s-model').value = cfg.model;
+      if (cfg.effort) document.getElementById('s-effort').value = cfg.effort;
       document.getElementById('s-key-current').textContent = `(текущий: ${cfg.api_key_masked})`;
       document.getElementById('s-api-key').placeholder = 'оставьте пустым чтобы не менять ключ';
     }
@@ -1651,6 +1653,7 @@ async function saveLlmConfig() {
   const provider = document.getElementById('s-provider').value;
   const model = document.getElementById('s-model').value;
   const apiKeyInput = document.getElementById('s-api-key').value.trim();
+  const effort = document.getElementById('s-effort').value;
   const msg = document.getElementById('settings-msg');
 
   // Если ключ не введён — берём текущий с бэка (нельзя — нет реального ключа на фронте).
@@ -1666,7 +1669,7 @@ async function saveLlmConfig() {
     const res = await fetch(API_URL + 'config/llm', {
       method: 'POST',
       headers: authHeaders({'Content-Type':'application/json'}),
-      body: JSON.stringify({ provider, model, api_key: apiKeyInput }),
+      body: JSON.stringify({ provider, model, api_key: apiKeyInput, effort }),
     });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) {
