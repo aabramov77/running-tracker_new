@@ -1393,13 +1393,10 @@ function renderAdjust() {
 
 // ── LLM Settings ──────────────────────────────────────────────────────────────
 
-// По одному варианту на провайдера. Идентификаторы сверены с документацией
-// провайдеров 16.08.2026 — прежний список был набит в мае и успел устареть
-// (у OpenAI оставались GPT-4o, у DeepSeek — снятые с поддержки алиасы).
+// По одному варианту на провайдера. Anthropic убран из выбора: своего ключа
+// нет, а платить за токены незачем — клиент под него остаётся в storage.py,
+// вернуть можно строкой здесь и опцией в index.html.
 const LLM_MODELS = {
-  anthropic: [
-    { id: 'claude-opus-5', label: 'Claude Opus 5' },
-  ],
   openai: [
     { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   ],
@@ -1409,9 +1406,15 @@ const LLM_MODELS = {
 };
 
 function updateModelOptions() {
-  const provider = document.getElementById('s-provider').value;
+  const providerSel = document.getElementById('s-provider');
+  // Сохранённый конфиг может ссылаться на провайдера, которого больше нет
+  // в списке (так ушёл Anthropic). Тогда select не примет значение и станет
+  // пустым — откатываемся на первого доступного, иначе падаем на .map.
+  if (!LLM_MODELS[providerSel.value]) {
+    providerSel.value = Object.keys(LLM_MODELS)[0];
+  }
   const sel = document.getElementById('s-model');
-  sel.innerHTML = LLM_MODELS[provider].map(m =>
+  sel.innerHTML = LLM_MODELS[providerSel.value].map(m =>
     `<option value="${m.id}">${m.label}</option>`).join('');
 }
 
