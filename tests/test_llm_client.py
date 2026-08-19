@@ -187,3 +187,46 @@ def test_config_version_without_effort_gets_default(storage_module, fake_bucket)
     storage_module.write_llm_config_version(fake_bucket, "openai", "gpt-5.6-luna", "sk-test")
     cfg = storage_module.read_llm_config_full(fake_bucket)
     assert cfg["effort"] == storage_module.LLM_DEFAULT_EFFORT
+
+
+# ── отказ и обрыв (#38, фаза 3) ───────────────────────────────────────────────
+
+def test_refusal_field_raises(storage_module, captured):
+    """Отказ приходит как HTTP 200: content = null, заполнено message.refusal."""
+    captured["replies"].append(FakeResponse({
+        "choices": [{"message": {"content": None, "refusal": "Не могу дать медицинский совет"},
+                     "finish_reason": "stop"}]}))
+    with pytest.raises(storage_module.LLMRefused, match="медицинский совет"):
+        _call(storage_module)
+
+
+def test_content_filter_raises_refusal(storage_module, captured):
+    captured["replies"].append(FakeResponse({
+        "choices": [{"message": {"content": None}, "finish_reason": "content_filter"}]}))
+    with pytest.raises(storage_module.LLMRefused, match="фильтр"):
+        _call(storage_module)
+
+
+def test_length_finish_raises_truncated(storage_module, captured):
+    """Обрыв по бюджету — не отказ: лечится настройкой, а не переформулировкой."""
+    captured["replies"].append(FakeResponse({
+        "choices": [{"message": {"content": '{"assessment": "оборва'},
+                     "finish_reason": "length"}]}))
+    with pytest.raises(storage_module.LLMTruncated):
+        _call(storage_module)
+
+
+def test_empty_content_raises_value_error(storage_module, captured):
+    captured["replies"].append(FakeResponse({
+        "choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}))
+    with pytest.raises(ValueError, match="пустой ответ"):
+        _call(storage_module)
+
+
+def test_normal_answer_is_not_mistaken_for_refusal(storage_module, captured):
+    """refusal = null в обычном ответе присутствует и не должен ничего ломать."""
+    captured["replies"].append(FakeResponse({
+        "choices": [{"message": {"content": '{"assessment": "ok"}', "refusal": None},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}}))
+    assert _call(storage_module)["text"] == '{"assessment": "ok"}'

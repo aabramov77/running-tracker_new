@@ -270,3 +270,32 @@ def test_llm_config_without_effort_gets_default(api):
         "provider": "openai", "model": "gpt-5.6-luna", "api_key": "sk-test"}), **ADMIN)
     cfg = json.loads(api(FakeRequest("GET", "/config/llm"), **ADMIN)[0])
     assert cfg["effort"] == cfg["default_effort"] == "medium"
+
+
+def _seed_advice_prerequisites(api, patched_api, fake_bucket):
+    """Для /advise нужны конфиг LLM и хотя бы одна пробежка."""
+    patched_api.write_llm_config_version(fake_bucket, "openai", "gpt-5.6-luna", "sk-test")
+    api(FakeRequest("POST", "/", json_body={"date": "2026-08-16", "dist": 10.0}))
+
+
+def test_advise_surfaces_refusal_as_422(api, patched_api, fake_bucket, monkeypatch):
+    _seed_advice_prerequisites(api, patched_api, fake_bucket)
+
+    def refuse(*a, **kw):
+        raise patched_api.LLMRefused("нет медицинских рекомендаций")
+
+    monkeypatch.setattr(patched_api, "call_llm", refuse)
+    body, code, _ = api(FakeRequest("POST", "/advise"))
+    assert code == 422
+    assert "отклонила" in body and "медицинских" in body
+
+
+def test_advise_surfaces_truncation_with_a_fix_hint(api, patched_api, fake_bucket, monkeypatch):
+    _seed_advice_prerequisites(api, patched_api, fake_bucket)
+
+    def truncate(*a, **kw):
+        raise patched_api.LLMTruncated("оборвано")
+
+    monkeypatch.setattr(patched_api, "call_llm", truncate)
+    body, code, _ = api(FakeRequest("POST", "/advise"))
+    assert code == 502 and "глубину рассуждения" in body

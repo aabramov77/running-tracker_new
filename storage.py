@@ -907,6 +907,20 @@ def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500)
     }
 
 
+class LLMRefused(Exception):
+    """Провайдер не стал отвечать: сработал фильтр или модель отклонила запрос.
+
+    Приходит как HTTP 200, поэтому raise_for_status молчит: в ответе либо
+    заполнено message.refusal при content = null, либо finish_reason =
+    content_filter. Без явной обработки это доезжало до парсера JSON и
+    превращалось в невнятную пятисотку. #38
+    """
+
+
+class LLMTruncated(Exception):
+    """Ответ упёрся в бюджет вывода (finish_reason = length) и оборван."""
+
+
 # Имя параметра лимита вывода. У моделей с рассуждением OpenAI старый
 # max_tokens отклоняет, а новый покрывает и рассуждение, и видимый ответ.
 # Провайдер, знающий только старое имя, ответит 400 с упоминанием нового —
@@ -945,7 +959,22 @@ def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt
         res = _post_chat(base_url, api_key, {**body, LEGACY_BUDGET_PARAM: budget})
     res.raise_for_status()
     data = res.json()
-    text = data["choices"][0]["message"]["content"]
+
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    finish = choice.get("finish_reason")
+
+    if message.get("refusal"):
+        raise LLMRefused(message["refusal"])
+    if finish == "content_filter":
+        raise LLMRefused("сработал фильтр безопасности провайдера")
+    if finish == "length":
+        raise LLMTruncated("ответ не поместился в бюджет вывода")
+
+    text = message.get("content")
+    if not text:
+        raise ValueError("провайдер вернул пустой ответ без объяснения")
+
     usage = data.get("usage", {})
     return {
         "text": text,

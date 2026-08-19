@@ -16,7 +16,8 @@ from config import (ADMIN_DAILY_ADVISE_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_ADVISE_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
-from storage import (RegistrationClosed, _fmt_duration, _fmt_pace, archive_plan,
+from storage import (LLMRefused, LLMTruncated, RegistrationClosed,
+                     _fmt_duration, _fmt_pace, archive_plan,
                      attach_fit_details_to_run, build_llm_context, call_llm,
                      clean_athlete_profile, clean_effort, cleanup_old_tmp,
                      compute_athlete_derived, create_plan, find_plan,
@@ -204,6 +205,8 @@ def h_llm_config_test(c):
             "output_tokens": res["output_tokens"],
             "sample_response": res["text"][:200],
         }, 200)
+    except LLMRefused as e:
+        return jresp({"ok": False, "error": f"Модель отклонила запрос: {str(e)[:200]}"}, 200)
     except httpx.HTTPStatusError as e:
         return jresp({"ok": False, "error": f"Provider {e.response.status_code}: {e.response.text[:200]}"}, 200)
     except Exception as e:
@@ -238,6 +241,11 @@ def h_advise_post(c):
     try:
         llm_res = call_llm(cfg["provider"], cfg["model"], cfg["api_key"],
                            SYSTEM_PROMPT, user_prompt, effort=cfg.get("effort"))
+    except LLMRefused as e:
+        return jresp({"error": f"Модель отклонила запрос: {str(e)[:300]}"}, 422)
+    except LLMTruncated:
+        return jresp({"error": "Ответ не поместился в лимит токенов — "
+                               "понизьте глубину рассуждения в настройках."}, 502)
     except httpx.HTTPStatusError as e:
         return jresp({"error": f"Provider {e.response.status_code}: {e.response.text[:300]}"}, 502)
     except Exception as e:
