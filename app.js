@@ -1393,20 +1393,18 @@ function renderAdjust() {
 
 // ── LLM Settings ──────────────────────────────────────────────────────────────
 
+// По одному варианту на провайдера. Идентификаторы сверены с документацией
+// провайдеров 16.08.2026 — прежний список был набит в мае и успел устареть
+// (у OpenAI оставались GPT-4o, у DeepSeek — снятые с поддержки алиасы).
 const LLM_MODELS = {
   anthropic: [
-    { id: 'claude-sonnet-4-5-20250929', label: 'Claude Sonnet 4.5' },
-    { id: 'claude-haiku-4-5-20250929', label: 'Claude Haiku 4.5' },
-    { id: 'claude-opus-4-5-20250929', label: 'Claude Opus 4.5' },
+    { id: 'claude-opus-5', label: 'Claude Opus 5' },
   ],
   openai: [
-    { id: 'gpt-4o', label: 'GPT-4o' },
-    { id: 'gpt-4o-mini', label: 'GPT-4o mini' },
-    { id: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+    { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   ],
   deepseek: [
-    { id: 'deepseek-chat', label: 'Deepseek Chat' },
-    { id: 'deepseek-reasoner', label: 'Deepseek Reasoner' },
+    { id: 'deepseek-v4-pro', label: 'DeepSeek V4-Pro' },
   ],
 };
 
