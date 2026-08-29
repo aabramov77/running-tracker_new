@@ -19,6 +19,7 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
+from compliance import current_week_idx
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 
@@ -1021,19 +1022,15 @@ def parse_llm_json(text):
 # ── Advice context + storage ─────────────────────────────────────────────────
 
 
-def current_plan_week_idx(plan_start=None, weeks_count=0):
-    """0-based индекс текущей недели плана от его plan_start.
-    Без plan_start — исторический дефолт 2026-05-10; без длины плана — 13 недель.
+def current_plan_week_idx(plan_start=None, weeks_count=0, weeks=None):
+    """0-based индекс текущей недели плана.
+
+    Тонкая обёртка над `compliance.current_week_idx` (#41): раньше здесь была
+    своя арифметика, отсчитывавшая семидневки от plan_start, из-за чего
+    подсвечивалась соседняя неделя (#40). Недели передаём, чтобы отсчёт шёл
+    от подписи первой строки, а не от разошедшегося с ней plan_start.
     """
-    start = datetime(2026, 5, 10)
-    if plan_start:
-        try:
-            start = datetime.strptime(plan_start[:10], "%Y-%m-%d")
-        except (ValueError, TypeError):
-            pass
-    n = weeks_count if weeks_count else 13
-    diff = (datetime.utcnow() - start).days // 7
-    return max(0, min(n - 1, diff))
+    return current_week_idx(plan_start, weeks_count, weeks=weeks)
 
 
 def compute_hr_drift(details):
@@ -1117,7 +1114,7 @@ def build_llm_context(bucket, sub):
                 plan_version = plan_data["version"]
 
     week_idx = current_plan_week_idx(active_plan.get("plan_start") if active_plan else None,
-                                     len(plan) if plan else 0)
+                                     len(plan) if plan else 0, weeks=plan)
     current_week = plan[week_idx] if plan and 0 <= week_idx < len(plan) else None
     next_week = plan[week_idx + 1] if plan and (week_idx + 1) < len(plan) else None
 

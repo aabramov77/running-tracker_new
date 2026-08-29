@@ -109,8 +109,45 @@ let isOnline = false;
 
 // ── Планы (#25): реестр, активный план, данные гонки ──
 function planWeeks() { return (PLAN && PLAN.length) ? PLAN.length : 13; }
+
+// Дата из 'YYYY-MM-DD' в ЛОКАЛЬНОЙ полуночи. new Date('2026-05-10') разбирает
+// строку как UTC, а new Date() — локальное время; их разность уезжала на
+// смещение часового пояса и на границе недели давала лишнюю неделю (#40).
+function localDate(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
+}
 function planStartDate() {
-  return ACTIVE_PLAN?.plan_start ? new Date(ACTIVE_PLAN.plan_start) : new Date('2026-05-10');
+  return localDate(ACTIVE_PLAN?.plan_start) || localDate('2026-05-10');
+}
+// Понедельник недели, в которую попадает d. Недели плана — пн→вс, а plan_start
+// может приходиться на любой день; без нормализации границы уезжают (#40).
+function mondayOf(d) {
+  const shift = (d.getDay() + 6) % 7;              // вс=0 → 6, пн=1 → 0
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - shift);
+}
+// Подпись недели «11.05» / «11.05.2026» / «2026-05-11» → Date. Год у первого
+// формата отсутствует — берём ближайший к plan_start, чтобы план через
+// Новый год не разъезжался.
+function labelToDate(label, hint) {
+  const iso = localDate(label);
+  if (iso) return iso;
+  const m = /^\s*(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\s*$/.exec(label || '');
+  if (!m) return null;
+  const day = +m[1], month = +m[2] - 1;
+  if (m[3]) { const y = +m[3]; return new Date(y < 100 ? y + 2000 : y, month, day); }
+  const base = hint || localDate('2026-05-10');
+  return [-1, 0, 1]
+    .map(s => new Date(base.getFullYear() + s, month, day))
+    .sort((a, b) => Math.abs(a - base) - Math.abs(b - base))[0];
+}
+// Понедельник недели 0. Приоритет — подпись первой строки: её человек
+// заполняет по календарю и с ней же сверяет подсветку, тогда как plan_start
+// мог остаться с прежних времён и указывать на другой день недели (#40).
+function planAnchor() {
+  const start = planStartDate();
+  const labelled = PLAN && PLAN.length ? labelToDate(PLAN[0].start, start) : null;
+  return mondayOf(labelled || start);
 }
 function activePlanId() { return ACTIVE_PLAN ? ACTIVE_PLAN.id : null; }
 // Кэш недель — свой у каждого плана, иначе планы затирали бы друг друга
@@ -536,8 +573,12 @@ async function loadRunsFromCloud() {
 }
 
 function getCurrentWeek() {
-  const diff = Math.floor((new Date() - planStartDate()) / (7 * 24 * 3600 * 1000));
-  return Math.max(0, Math.min(planWeeks() - 1, diff));
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  // Считаем в целых сутках от понедельника недели старта, а не делением
+  // миллисекунд: так перевод часов и часовой пояс не сдвигают границу (#40).
+  const days = Math.round((today - planAnchor()) / 86400000);
+  return Math.max(0, Math.min(planWeeks() - 1, Math.floor(days / 7)));
 }
 function parsePace(s) {
   if (!s) return null;
