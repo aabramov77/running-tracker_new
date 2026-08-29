@@ -178,3 +178,36 @@ def test_index_references_cachebusted_assets():
     # versions are integers (sanity — they're parsed as such by the regex)
     assert int(js.group(1)) >= 1
     assert int(css.group(1)) >= 1
+
+
+def test_plan_table_columns_match_colspan():
+    """Шапка таблицы плана и PLAN_COLSPAN обязаны совпадать.
+
+    Расхождение ломает пустое состояние и строку «+ Неделя» молча — ячейка
+    с colspan просто встаёт не на всю ширину, ошибок в консоли нет.
+    """
+    html = INDEX.read_text(encoding="utf-8")
+    thead = re.search(r'<table class="plan">\s*<thead><tr>(.*?)</tr>', html, re.S)
+    assert thead, "не найдена шапка таблицы плана"
+    columns = len(re.findall(r"<th[ >]", thead.group(1)))
+
+    js = APP_JS.read_text(encoding="utf-8")
+    fixed = re.search(r"const PLAN_COLSPAN\s*=\s*(\d+)\s*\+\s*PLAN_DAYS\.length", js)
+    assert fixed, "PLAN_COLSPAN не найден или записан иначе"
+    days_decl = re.search(r"const PLAN_DAYS = \[(.*?)\];", js, re.S)
+    assert days_decl, "PLAN_DAYS не найден"
+    days = days_decl.group(1).count("[")
+
+    assert int(fixed.group(1)) + days == columns, (
+        f"в шапке {columns} колонок, PLAN_COLSPAN даёт {int(fixed.group(1)) + days}")
+
+
+def test_frontend_reads_the_statuses_backend_emits():
+    """Статусы дня — контракт между compliance.py и отрисовкой плана (#41).
+    Переименование на бэкенде без правки фронта убрало бы все отметки разом.
+    """
+    import compliance
+
+    js = APP_JS.read_text(encoding="utf-8")
+    for status in (compliance.DONE, compliance.MISSED, compliance.EXTRA):
+        assert f"'{status}'" in js, f"фронт не знает статуса {status!r}"

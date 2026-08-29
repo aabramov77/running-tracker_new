@@ -224,6 +224,7 @@ async function switchPlan(planId) {
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     cancelPlanEdit();
+    COMPLIANCE = null;      // факт прежнего плана к новому не относится
     await loadPlans();
     await loadPlan();       // недели нового активного плана
     renderAll();
@@ -407,14 +408,15 @@ async function loadPlan() {
       localStorage.setItem(planCacheKey(), JSON.stringify(PLAN));
       renderPlan();
       applyProfileToHeader();  // «план N недель» зависит от длины плана
+      loadCompliance();        // план/факт — отдельным запросом, не блокирует таблицу
     } else if (!PLAN) {
       document.getElementById('plan-body').innerHTML =
-        '<tr><td colspan="8" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>';
+        `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>`;
     }
   } catch (e) {
     if (!PLAN) {
       document.getElementById('plan-body').innerHTML =
-        '<tr><td colspan="8" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>';
+        `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>`;
     }
   }
 }
@@ -564,6 +566,7 @@ async function loadRunsFromCloud() {
     isOnline = true;
     setStatus('✓ Синхронизировано с GCS');
     renderAll();
+    loadCompliance();   // пробежки изменились — факт в таблице плана устарел
   } catch (e) {
     isOnline = false;
     // Из кэша тоже фильтруем — на случай если кэш старый (до soft delete)
@@ -664,7 +667,46 @@ function clearLog() {
 const PLAN_TYPES = [['dev','Развитие'],['peak','Пик'],['taper','Тейпер'],['load','Разгрузка'],['race','Старт']];
 // Порядок дней недели плана (7 дней, Пн→Вс). #23
 const PLAN_DAYS = [['mon','Пн'],['tue','Вт'],['wed','Ср'],['thu','Чт'],['fri','Пт'],['sat','Сб'],['sun','Вс']];
-const PLAN_COLSPAN = 3 + PLAN_DAYS.length;   // Нед + Даты + Акцент + дни = 10
+const PLAN_COLSPAN = 4 + PLAN_DAYS.length;   // Нед + Даты + Акцент + км + дни = 11
+
+// План против факта (#41). Считается на бэкенде, здесь только отображается.
+let COMPLIANCE = null;
+
+const km1 = v => Number(v).toFixed(1).replace(/\.0$/, '');
+
+async function loadCompliance() {
+  const pid = activePlanId();
+  if (!pid) { COMPLIANCE = null; return; }
+  try {
+    const res = await fetch(`${API_URL}plans/${pid}/compliance`, { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { COMPLIANCE = null; return; }
+    const data = await res.json();
+    // План могли переключить, пока запрос был в пути — чужой ответ не берём.
+    COMPLIANCE = (data && data.plan_id === activePlanId()) ? data : null;
+  } catch (e) {
+    COMPLIANCE = null;
+  }
+  renderPlan();
+}
+
+// Недели, размеченные наугад, фактом не заполняем: разложить пробежки по
+// придуманным датам значит показать правдоподобную неверную цифру.
+function compliantWeeks() {
+  return (COMPLIANCE && COMPLIANCE.dated && COMPLIANCE.plan_id === activePlanId())
+    ? COMPLIANCE.weeks : null;
+}
+
+function renderComplianceNote() {
+  const el = document.getElementById('plan-compliance-note');
+  if (!el) return;
+  const undated = COMPLIANCE && !COMPLIANCE.dated && PLAN?.length;
+  el.style.display = undated ? 'block' : 'none';
+  if (undated) {
+    el.textContent = '⚠ У плана нет дат: заполните «Начало» у первой недели '
+      + 'или «Старт плана» в карточке гонки — тогда появится сравнение с фактом.';
+  }
+}
 
 function renderPlan() {
   const body = document.getElementById('plan-body');
@@ -688,6 +730,7 @@ function renderPlan() {
         </td>
         <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
         <td class="editable" style="min-width:96px">${inp(i,'accent',r.accent)}${typeSel(i,r.type)}</td>
+        <td></td>
         ${PLAN_DAYS.map(([f]) => dayCell(i, f, r[f])).join('')}
       </tr>`).join('') +
       `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:10px">
@@ -707,15 +750,59 @@ function renderPlan() {
 
   // ── Обычный просмотр ──
   const cw = getCurrentWeek();
-  const dayCell = (val, day) =>
-    `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${escapeHtml(val ?? '')}</td>`;
-  body.innerHTML = PLAN.map((r,i) => `
+  const weeks = compliantWeeks();
+  renderComplianceNote();
+
+  // Факт показываем только для прошедших и текущей недели: у будущих его
+  // быть не может, и прочерки там читались бы как пропуски.
+  const factCell = (day, past) => {
+    if (!day || !past) return '';
+    if (day.status === 'done')
+      return `<div style="font-size:11px;color:var(--c-accent)">✓ ${km1(day.actual_km)}</div>`;
+    if (day.status === 'missed')
+      return `<div style="font-size:11px;opacity:.45">—</div>`;
+    if (day.status === 'extra')
+      return `<div style="font-size:11px;color:var(--c-blue)" title="Не было в плане">+${km1(day.actual_km)}</div>`;
+    return '';
+  };
+
+  const kmCell = (week, past) => {
+    if (!week) return '<td></td>';
+    // «34+» — плановый объём неполный: в неделе есть ячейка, которую нельзя
+    // перевести в километры, и занижать её молча нельзя.
+    const planned = week.planned_km
+      ? `${km1(week.planned_km)}${week.complete ? '' : '+'}`
+      : (week.complete ? '' : '?');
+    const title = week.complete ? ''
+      : ` title="Плановый объём неполный — ячеек без километров: ${week.unparsed}"`;
+    const head = `<div style="font-weight:500"${title}>${planned}</div>`;
+    if (!past) return `<td style="font-size:12px;white-space:nowrap">${head}</td>`;
+    const over = week.complete && week.delta_km > 0;
+    const color = week.complete
+      ? (over ? 'var(--c-blue)' : 'var(--c-accent)') : 'var(--text-muted)';
+    const pct = week.pct === null ? '' :
+      `<div style="font-size:10px;opacity:.6">${week.pct}%</div>`;
+    return `<td style="font-size:12px;white-space:nowrap">${head}
+      <div style="color:${color}">${km1(week.actual_km)}</div>${pct}</td>`;
+  };
+
+  const dayCell = (val, day, fact) =>
+    `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${escapeHtml(val ?? '')}${fact}</td>`;
+
+  body.innerHTML = PLAN.map((r,i) => {
+    const week = weeks ? weeks[i] : null;
+    const past = i <= cw;
+    const byField = {};
+    (week?.days || []).forEach(d => { byField[d.field] = d; });
+    return `
     <tr class="${i===cw?'current-week':''} ${r.type==='race'?'race-week':''}">
       <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w ?? i+1}</td>
       <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${escapeHtml(r.start ?? '')}<br>${escapeHtml(r.end ?? '')}</td>
       <td><span class="badge ${badgeMap[r.type]||''}">${labelMap[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
-      ${PLAN_DAYS.map(([f]) => dayCell(r[f], f)).join('')}
-    </tr>`).join('');
+      ${kmCell(week, past)}
+      ${PLAN_DAYS.map(([f]) => dayCell(r[f], f, factCell(byField[f], past))).join('')}
+    </tr>`;
+  }).join('');
 }
 
 function togglePlanEdit() {
