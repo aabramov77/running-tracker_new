@@ -201,7 +201,7 @@ def test_week_range_is_always_seven_days():
     ("длительный 21 км", 21.0),
 ])
 def test_single_distance_is_parsed(text, km):
-    assert c.parse_planned_day(text) == {"kind": c.KM, "km": km}
+    assert c.parse_planned_day(text) == {"kind": c.KM, "km": km, "exact": True}
 
 
 @pytest.mark.parametrize("text", ["", None, "   ", "отдых", "Отдых", "выходной", "rest", "-", "—"])
@@ -221,12 +221,51 @@ def test_rest_days(text):
 ])
 def test_unparseable_days_are_not_guessed(text):
     """Правдоподобная, но неверная цифра хуже честного «не знаю»."""
-    assert c.parse_planned_day(text) == {"kind": c.UNPARSED, "km": None}
+    assert c.parse_planned_day(text) == {"kind": c.UNPARSED, "km": None, "exact": False}
+
+
+@pytest.mark.parametrize("text,low", [
+    ("14–16 км легко", 14.0),      # en dash
+    ("14—16 км", 14.0),            # em dash
+    ("6-8 км очень легко", 6.0),   # hyphen
+    ("10,5–12 км", 10.5),
+])
+def test_range_takes_the_lower_bound_and_is_marked_inexact(text, low):
+    """«14–16 км» — это не 16. Округление вверх выглядит точным числом,
+    не будучи им; берём нижнюю границу и помечаем как неточную."""
+    assert c.parse_planned_day(text) == {"kind": c.KM, "km": low, "exact": False}
+
+
+def test_range_with_intervals_stays_unparsed():
+    """«6–8 км + 4×80» — интервалы съедают любую попытку посчитать объём."""
+    assert c.parse_planned_day("6–8 км очень легко + 4×80")["kind"] == c.UNPARSED
+
+
+def test_reversed_range_is_not_trusted():
+    assert c.parse_planned_day("16–14 км")["kind"] == c.UNPARSED
+
+
+def test_inexact_week_reports_a_lower_bound_without_percentage():
+    """Строка из реального плана: два интервальных дня и один диапазон."""
+    week = {"mon": "8 км легко", "tue": "3×1 км по 4:30–4:35",
+            "wed": "6–8 км очень легко + 4×80", "thu": "СТАРТ 10 км",
+            "sat": "14–16 км легко, пульс до 150"}
+    result = c.week_compliance(week, date(2026, 5, 25), {})
+    assert result["planned_km"] == 32.0      # 8 + 10 + 14 (нижняя граница)
+    assert result["unparsed"] == 2
+    assert result["approx"] == 1
+    assert result["complete"] is False
+    assert result["pct"] is None and result["delta_km"] is None
 
 
 def test_interval_notation_is_not_mistaken_for_distance():
     """«6х800м» не должно дать «00 м» или 800 км."""
     assert c.parse_planned_day("6х800м")["km"] is None
+
+
+def test_rest_is_exact():
+    """День отдыха — точный ноль, а не неизвестность."""
+    assert c.parse_planned_day("отдых")["exact"] is True
 
 
 # ── Сопоставление недели ──────────────────────────────────────────────────────

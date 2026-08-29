@@ -784,13 +784,17 @@ function renderPlan() {
 
   const kmCell = (week, past) => {
     if (!week) return '<td></td>';
-    // «34+» — плановый объём неполный: в неделе есть ячейка, которую нельзя
-    // перевести в километры, и занижать её молча нельзя.
+    // «≥32» — точный объём из текста плана не вывести, показана нижняя
+    // граница. Это свойство записи в плане, а не выполнения.
     const planned = week.planned_km
-      ? `${km1(week.planned_km)}${week.complete ? '' : '+'}`
+      ? `${week.complete ? '' : '≥'}${km1(week.planned_km)}`
       : (week.complete ? '' : '?');
-    const title = week.complete ? ''
-      : ` title="Плановый объём неполный — ячеек без километров: ${week.unparsed}"`;
+    const reasons = [];
+    if (week.unparsed) reasons.push(`${week.unparsed} с интервалами или временем`);
+    if (week.approx) reasons.push(`${week.approx} с диапазоном`);
+    const title = week.complete ? '' : ` title="Точный объём из текста плана не вывести`
+      + `${reasons.length ? ' (' + reasons.join(', ') + ')' : ''}, показана нижняя граница. `
+      + `Это про запись в плане, а не про выполнение тренировок."`;
     const head = `<div style="font-weight:500"${title}>${planned}</div>`;
     if (!past) return `<td style="font-size:12px;white-space:nowrap">${head}</td>`;
     const over = week.complete && week.delta_km > 0;

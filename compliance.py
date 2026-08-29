@@ -195,6 +195,11 @@ _REST_WORDS = {"отдых", "выходной", "выходные", "rest", "of
 # другого числа («6х800м» не должно дать «00 м»).
 _KM_RE = re.compile(r"(?<![\d,.])(\d+(?:[.,]\d+)?)\s*(?:км|km)\b", re.IGNORECASE)
 
+# Диапазон: «14–16 км», «6-8 км». Дефис, минус и оба тире.
+_RANGE_RE = re.compile(
+    r"(?<![\d,.])(\d+(?:[.,]\d+)?)\s*[-–—]\s*(\d+(?:[.,]\d+)?)\s*(?:км|km)\b",
+    re.IGNORECASE)
+
 # Интервалы: «6×800», «6x800», «6х800» (латинская x и кириллическая х).
 _INTERVAL_RE = re.compile(r"\d\s*[×xх*]\s*\d", re.IGNORECASE)
 
@@ -202,28 +207,52 @@ _INTERVAL_RE = re.compile(r"\d\s*[×xх*]\s*\d", re.IGNORECASE)
 _DURATION_RE = re.compile(r"\d+\s*(?:мин|минут\w*|min|ч\b|час\w*|h\b)", re.IGNORECASE)
 
 
-def parse_planned_day(text):
-    """Ячейка дня плана → {"kind": rest|km|unparsed, "km": float|None}.
+def _to_km(text):
+    try:
+        return float(text.replace(",", "."))
+    except (ValueError, AttributeError):
+        return None
 
-    Исходов ровно три, и «примерно столько-то километров» среди них нет.
-    Несколько чисел с «км» в одной ячейке тоже дают unparsed: «10 км (5 км
-    в темпе)» — это 10, а не 15, и отличить такое от «2 км + 2 км» разбором
-    текста нельзя.
+
+def parse_planned_day(text):
+    """Ячейка дня плана → {"kind": rest|km|unparsed, "km", "exact"}.
+
+    `km` — это всегда **нижняя граница** планового объёма ячейки, а `exact`
+    говорит, точна ли она. Отсюда единый и честный смысл у суммы за неделю:
+    «не меньше N километров». Он верен и когда ячейка не разобралась вовсе
+    (вносит 0), и когда в ней диапазон (вносит нижнюю границу).
+
+    Округлять «14–16 км» до 16 нельзя: это выглядит точным числом, не будучи
+    им. Догадываться об объёме интервалов — тоже: «3×1 км» без разминки и
+    заминки не километраж тренировки.
+
+    Несколько отдельных чисел с «км» дают unparsed: «10 км (5 км в темпе)» —
+    это 10, а не 15, и отличить такое от «2 км + 2 км» разбором текста нельзя.
     """
     raw = (text or "").strip()
     if not raw or raw.lower() in _REST_WORDS:
-        return {"kind": REST, "km": None}
+        return {"kind": REST, "km": None, "exact": True}
+
+    # Интервалы и длительности идут до разбора чисел: в такой ячейке любое
+    # найденное число описывает отрезок, а не объём тренировки.
+    if _INTERVAL_RE.search(raw) or _DURATION_RE.search(raw):
+        return {"kind": UNPARSED, "km": None, "exact": False}
+
+    span = _RANGE_RE.search(raw)
+    if span:
+        low, high = _to_km(span.group(1)), _to_km(span.group(2))
+        if low is not None and high is not None and low <= high:
+            return {"kind": KM, "km": low, "exact": False}
+        return {"kind": UNPARSED, "km": None, "exact": False}
 
     matches = _KM_RE.findall(raw)
     if len(matches) != 1:
-        return {"kind": UNPARSED, "km": None}
-    if _INTERVAL_RE.search(raw) or _DURATION_RE.search(raw):
-        return {"kind": UNPARSED, "km": None}
+        return {"kind": UNPARSED, "km": None, "exact": False}
 
-    try:
-        return {"kind": KM, "km": float(matches[0].replace(",", "."))}
-    except ValueError:
-        return {"kind": UNPARSED, "km": None}
+    km = _to_km(matches[0])
+    if km is None:
+        return {"kind": UNPARSED, "km": None, "exact": False}
+    return {"kind": KM, "km": km, "exact": True}
 
 
 # ── Сопоставление ────────────────────────────────────────────────────────────
@@ -264,6 +293,7 @@ def week_compliance(week, week_start, runs_by_date):
     days = []
     planned_km = 0.0
     unparsed = 0
+    approx = 0
     planned_sessions = 0
     actual_km = 0.0
     actual_sessions = 0
@@ -279,6 +309,8 @@ def week_compliance(week, week_start, runs_by_date):
         if plan["kind"] == KM:
             planned_km += plan["km"]
             planned_sessions += 1
+            if not plan["exact"]:
+                approx += 1
         elif plan["kind"] == UNPARSED:
             unparsed += 1
             planned_sessions += 1
@@ -302,16 +334,19 @@ def week_compliance(week, week_start, runs_by_date):
             "planned_text": (week or {}).get(field) or "",
             "planned_kind": plan["kind"],
             "planned_km": plan["km"],
+            "planned_exact": plan["exact"],
             "actual_km": day_km if day_runs else None,
             "runs": len(day_runs),
             "status": status,
         })
 
-    complete = unparsed == 0
+    # `complete` — плановый объём известен точно. Иначе planned_km это
+    # нижняя граница: «не меньше N».
+    complete = unparsed == 0 and approx == 0
     planned_km = round(planned_km, 2)
     actual_km = round(actual_km, 2)
-    # Процент показываем только когда плановый объём известен целиком —
-    # иначе он занижен на нераспознанные ячейки и вводит в заблуждение.
+    # Процент и дельту показываем только от точного плана — от нижней
+    # границы они завышают выполнение и вводят в заблуждение.
     pct = round(actual_km / planned_km * 100) if complete and planned_km > 0 else None
 
     return {
@@ -323,6 +358,7 @@ def week_compliance(week, week_start, runs_by_date):
         "pct": pct,
         "complete": complete,
         "unparsed": unparsed,
+        "approx": approx,
         "planned_sessions": planned_sessions,
         "actual_sessions": actual_sessions,
         "missed": missed,
@@ -359,6 +395,7 @@ def plan_compliance(weeks, runs, plan_start=None, plan_id=None):
                     if complete and planned_km > 0 else None),
             "complete": complete,
             "unparsed": sum(r["unparsed"] for r in rows),
+            "approx": sum(r["approx"] for r in rows),
             "missed": sum(r["missed"] for r in rows),
             "extra": sum(r["extra"] for r in rows),
             "weeks_total": len(rows),
