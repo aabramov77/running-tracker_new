@@ -392,3 +392,13 @@ def test_compliance_does_not_write_anything(api, patched_api, fake_bucket):
         FakeRequest("GET", f"/plans/{plan_id}/compliance"))
     assert code == 200
     assert fake_bucket._store == before
+
+
+def test_advise_preview_includes_plan_compliance(api, patched_api, fake_bucket):
+    """Выполнение плана доезжает до промпта (#41, фаза 4)."""
+    _seed_plan_with_runs(api, patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("GET", "/advise/preview"))
+    assert code == 200
+    text = json.loads(body)["prompt"]
+    assert "Выполнение плана по неделям" in text
+    assert "факт 17.5 км" in text

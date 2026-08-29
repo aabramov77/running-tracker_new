@@ -1151,7 +1151,24 @@ def build_llm_context(bucket, sub):
         total_km += float(r.get("dist", 0) or 0)
     avg_pace = (sum(paces) / len(paces)) if paces else None
 
+    # Выполнение плана (#41). Считаем по всем пробежкам плана, а не по
+    # последним 14: недельные итоги должны быть полными. В промпт уходят
+    # последние 4 недели — на большем горизонте это уже история, а не то,
+    # от чего отталкиваются на ближайшей неделе.
+    compliance = None
+    if plan:
+        full = plan_compliance(plan, all_runs,
+                               (active_plan or {}).get("plan_start"), plan_id)
+        if full["dated"]:
+            first = max(0, week_idx - 3)
+            compliance = {
+                "weeks": [dict(w, idx=i)
+                          for i, w in enumerate(full["weeks"])][first:week_idx + 1],
+                "totals": full["totals"],
+            }
+
     return {
+        "compliance": compliance,
         "profile": profile,
         "profile_derived": compute_athlete_derived(profile),
         "profile_version": profile_version,

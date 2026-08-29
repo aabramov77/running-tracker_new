@@ -704,6 +704,7 @@ async function loadCompliance() {
     COMPLIANCE = null;
   }
   renderPlan();
+  if (document.getElementById('tab-stats').classList.contains('active')) renderCharts();
 }
 
 // Недели, размеченные наугад, фактом не заполняем: разложить пробежки по
@@ -1510,16 +1511,60 @@ function closeRunDetail(event) {
   destroyDetailCharts();
 }
 
+// Раскладка пробежек по неделям плана — по тем же окнам, что и в таблице
+// (#41). Прежняя формула делила миллисекунды на семь суток от plan_start и
+// с подписями недель не совпадала.
+function weekBuckets(runsList, n) {
+  const bounds = Array.from({length: n}, (_, i) => {
+    const s = weekStart(i);
+    return [s, new Date(s.getFullYear(), s.getMonth(), s.getDate() + 6)];
+  });
+  const km = Array(n).fill(0);
+  runsList.forEach(r => {
+    const d = localDate(r.date);
+    if (!d) return;
+    for (let i = 0; i < n; i++) {
+      if (d >= bounds[i][0] && d <= bounds[i][1]) { km[i] += (+r.dist || 0); break; }
+    }
+  });
+  return km.map(v => +v.toFixed(1));
+}
+
 let wChart=null,pChart=null;
 function renderCharts() {
   const activeRuns = scopedRuns();
   const n = planWeeks();
-  const start = planStartDate();
-  const weekKm={};
-  activeRuns.forEach(r=>{const w=Math.floor((new Date(r.date)-start)/(7*24*3600*1000))+1;if(w>=1&&w<=n)weekKm[w]=(weekKm[w]||0)+r.dist;});
-  const sortedRuns=[...activeRuns].sort((a,b)=>a.date.localeCompare(b.date));
+  // План берём из compliance — он же считает и «не меньше» для неточных
+  // недель. При области «все» пробежки идут из разных планов, и плановая
+  // линия к ним не относится.
+  const weeks = (runScope === 'plan') ? compliantWeeks() : null;
+  const actual = weeks ? weeks.map(w => w.actual_km) : weekBuckets(activeRuns, n);
+  const planned = weeks ? weeks.map(w => w.planned_km || null) : null;
+  const exact = weeks ? weeks.map(w => w.complete) : null;
+  const sortedRuns = [...activeRuns].sort((a,b) => a.date.localeCompare(b.date));
+
+  const datasets = [];
+  if (planned) datasets.push({
+    label: 'план',
+    data: planned,
+    // Неточные недели — бледнее: там нижняя граница, а не плановый объём.
+    backgroundColor: exact.map(e => e ? 'rgba(24,95,165,0.40)' : 'rgba(24,95,165,0.15)'),
+    borderRadius: 4,
+  });
+  datasets.push({label:'факт', data: actual, backgroundColor:'#1D9E75', borderRadius:4});
+
   if(wChart)wChart.destroy();
-  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{type:'bar',data:{labels:Array.from({length:n},(_,i)=>`Нед ${i+1}`),datasets:[{label:'км',data:Array.from({length:n},(_,i)=>+((weekKm[i+1]||0).toFixed(1))),backgroundColor:'#1D9E75',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
+  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{
+    type:'bar',
+    data:{labels:Array.from({length:n},(_,i)=>`Нед ${i+1}`),datasets},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:datasets.length>1,labels:{boxWidth:12,font:{size:11}}},
+        tooltip:{callbacks:{label:ctx=>{
+          const v=ctx.parsed.y;
+          if(ctx.dataset.label!=='план') return `факт ${v} км`;
+          return exact && exact[ctx.dataIndex] ? `план ${v} км` : `план не меньше ${v} км`;
+        }}}},
+      scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
   if(pChart)pChart.destroy();
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>r.date.slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
 }
