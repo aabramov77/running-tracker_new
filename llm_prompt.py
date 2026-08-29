@@ -94,6 +94,43 @@ def _week_days_str(week):
     parts = [f"{label}={week.get(field)}" for field, label in PLAN_DAYS if week.get(field)]
     return "; ".join(parts) if parts else "(пусто)"
 
+def format_compliance_block(compliance):
+    """Выполнение плана по неделям (#41).
+
+    Плановый объём подаётся как «не меньше N» там, где точнее из текста не
+    вывести: ячейки с интервалами, временем или диапазоном. Модель не должна
+    принимать нижнюю границу за план и делать вывод о недоборе, которого нет.
+    """
+    if not compliance or not compliance.get("weeks"):
+        return []
+
+    lines = ["Выполнение плана по неделям (план / факт):"]
+    for week in compliance["weeks"]:
+        planned = week["planned_km"]
+        if week["complete"]:
+            plan_str = f"план {planned:g} км"
+            tail = f", {week['pct']}%" if week.get("pct") is not None else ""
+        else:
+            plan_str = (f"план не меньше {planned:g} км" if planned
+                        else "плановый объём из текста не вывести")
+            tail = ""
+        parts = [f"  - неделя {week['idx'] + 1} ({week['start']}–{week['end']}): "
+                 f"{plan_str}, факт {week['actual_km']:g} км{tail}"]
+        marks = []
+        if week["missed"]:
+            marks.append(f"пропущено дней: {week['missed']}")
+        if week["extra"]:
+            marks.append(f"вне плана: {week['extra']}")
+        if marks:
+            parts.append("; " + ", ".join(marks))
+        lines.append("".join(parts))
+
+    if not all(w["complete"] for w in compliance["weeks"]):
+        lines.append("  (там, где сказано «не меньше», точный плановый объём "
+                     "из текста плана не выводится — не считай это недобором)")
+    return lines
+
+
 def format_context_for_llm(ctx):
     """Превращает контекст в текстовый user prompt."""
     lines = []
@@ -124,6 +161,11 @@ def format_context_for_llm(ctx):
     if nw:
         lines.append("План следующей недели:")
         lines.append("  " + _week_days_str(nw))
+
+    compliance_block = format_compliance_block(ctx.get("compliance"))
+    if compliance_block:
+        lines.append("")
+        lines.extend(compliance_block)
 
     lines.append("")
     lines.append("Последние 14 тренировок (сначала свежие):")

@@ -18,7 +18,8 @@ from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 from storage import (LLMRefused, LLMTruncated, RegistrationClosed,
                      _fmt_duration, _fmt_pace, archive_plan,
-                     attach_fit_details_to_run, build_llm_context, call_llm,
+                     attach_fit_details_to_run, build_llm_context,
+                     build_plan_compliance, call_llm,
                      clean_athlete_profile, clean_effort, cleanup_old_tmp,
                      compute_athlete_derived, create_plan, find_plan,
                      get_active_plan, get_storage_client,
@@ -371,6 +372,13 @@ def h_plan_weeks_get(c):
     return jresp(read_plan_weeks(c.bucket, c.sub, plan_id), 200)
 
 
+def h_plan_compliance(c):
+    result = build_plan_compliance(c.bucket, c.sub, c.args[0])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(result, 200)
+
+
 def h_plan_weeks_post(c):
     plan_id = c.args[0]
     if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
@@ -496,6 +504,7 @@ ROUTES = [
     ("POST",   r"^/plans/([\w-]+)/archive$",     h_plan_archive,         False),
     ("GET",    r"^/plans/([\w-]+)/weeks$",       h_plan_weeks_get,       False),
     ("POST",   r"^/plans/([\w-]+)/weeks$",       h_plan_weeks_post,      False),
+    ("GET",    r"^/plans/([\w-]+)/compliance$",  h_plan_compliance,      False),
 
     ("GET",    r"^/plan$",                       h_active_plan_weeks_get,  False),
     ("POST",   r"^/plan$",                       h_active_plan_weeks_post, False),

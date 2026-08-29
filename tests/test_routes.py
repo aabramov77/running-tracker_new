@@ -57,6 +57,7 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("POST",   "/plans/abc-123/archive", "h_plan_archive"),
     ("GET",    "/plans/abc-123/weeks",   "h_plan_weeks_get"),
     ("POST",   "/plans/abc-123/weeks",   "h_plan_weeks_post"),
+    ("GET",    "/plans/abc-123/compliance", "h_plan_compliance"),
     ("GET",    "/plan",                  "h_active_plan_weeks_get"),
     ("POST",   "/runs/parse-fit",        "h_parse_fit"),
     ("GET",    "/runs/12345/details",    "h_run_details"),
@@ -299,3 +300,105 @@ def test_advise_surfaces_truncation_with_a_fix_hint(api, patched_api, fake_bucke
     monkeypatch.setattr(patched_api, "call_llm", truncate)
     body, code, _ = api(FakeRequest("POST", "/advise"))
     assert code == 502 and "глубину рассуждения" in body
+
+
+# ── План против факта (#41) ───────────────────────────────────────────────────
+
+def _seed_plan_with_runs(api, patched_api, fake_bucket, sub="u1"):
+    """План на две недели с подписями по понедельникам и парой пробежек."""
+    plan = patched_api.create_plan(fake_bucket, sub,
+                                   {"race_name": "HM", "plan_start": "2026-08-17"})
+    patched_api.save_plan_weeks(fake_bucket, sub, plan["id"], [
+        {"w": 1, "start": "17.08", "mon": "10 км", "wed": "8 км", "sun": "16 км"},
+        {"w": 2, "start": "24.08", "mon": "12 км", "wed": "интервалы 6×800м"},
+    ], "seed")
+    # id проставляем явно: h_runs_post выводит его из datetime.now() в
+    # миллисекундах, и два подряд идущих POST получают один и тот же.
+    api(FakeRequest("POST", "/", json_body={"id": 1, "date": "2026-08-17", "dist": 10.0}))
+    api(FakeRequest("POST", "/", json_body={"id": 2, "date": "2026-08-19", "dist": 7.5}))
+    return plan["id"]
+
+
+def test_compliance_unknown_plan_is_404(api):
+    body, code, _ = api(FakeRequest("GET", "/plans/no-such-plan/compliance"))
+    assert code == 404 and "plan not found" in body
+
+
+def test_compliance_matches_runs_to_the_right_week(api, patched_api, fake_bucket):
+    plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("GET", f"/plans/{plan_id}/compliance"))
+    assert code == 200
+    data = json.loads(body)
+
+    assert data["plan_id"] == plan_id
+    assert data["anchor"] == "2026-08-17"
+    assert data["anchor_source"] == "label"
+    first, second = data["weeks"]
+    assert first["planned_km"] == 34.0
+    assert first["actual_km"] == 17.5
+    assert second["actual_km"] == 0
+
+
+def test_compliance_reports_day_statuses(api, patched_api, fake_bucket):
+    plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
+    data = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/compliance"))[0])
+    by_field = {d["field"]: d["status"] for d in data["weeks"][0]["days"]}
+    assert by_field["mon"] == "done"        # 10 км по плану, 10 км в факте
+    assert by_field["wed"] == "done"        # 8 км по плану, 7.5 в факте
+    assert by_field["sun"] == "missed"      # длительная не сделана
+    assert by_field["tue"] == "empty"
+
+
+def test_compliance_hides_percentage_for_an_unparsed_week(api, patched_api, fake_bucket):
+    plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
+    data = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/compliance"))[0])
+    assert data["weeks"][0]["pct"] is not None      # неделя разобрана целиком
+    assert data["weeks"][1]["pct"] is None          # «интервалы 6×800м»
+    assert data["weeks"][1]["complete"] is False
+    assert data["totals"]["pct"] is None            # и весь план вместе с ней
+
+
+def test_compliance_ignores_runs_of_another_plan(api, patched_api, fake_bucket):
+    plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
+    other = patched_api.create_plan(fake_bucket, "u1", {"race_name": "Другой"})
+    api(FakeRequest("POST", "/", json_body={"id": 3, "date": "2026-08-18", "dist": 99.0,
+                                            "plan_id": other["id"]}))
+    data = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/compliance"))[0])
+    assert data["weeks"][0]["actual_km"] == 17.5
+
+
+def test_compliance_flags_an_undated_plan(api, patched_api, fake_bucket):
+    """Ни подписи, ни plan_start — даты недель угаданы, факт по ним не кладём."""
+    plan = patched_api.create_plan(fake_bucket, "u1", {"race_name": "Без дат"})
+    patched_api.save_plan_weeks(fake_bucket, "u1", plan["id"],
+                                [{"w": 1, "mon": "10 км"}], "seed")
+    data = json.loads(api(FakeRequest("GET", f"/plans/{plan['id']}/compliance"))[0])
+    assert data["anchor_source"] == "default"
+    assert data["dated"] is False
+
+
+def test_compliance_does_not_write_anything(api, patched_api, fake_bucket):
+    """Производные величины считаются на чтении — новых версий возникать
+    не должно (политика хранения из CLAUDE.md).
+
+    Запрос идёт мимо фикстуры `api`: она на каждом вызове перерегистрирует
+    пользователя и обновляет реестр, и эти записи — её, а не эндпоинта.
+    Пользователь уже одобрен на этапе подготовки данных, verify_token
+    подменён там же.
+    """
+    plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
+    before = dict(fake_bucket._store)
+    body, code, _ = patched_api.handle_request(
+        FakeRequest("GET", f"/plans/{plan_id}/compliance"))
+    assert code == 200
+    assert fake_bucket._store == before
+
+
+def test_advise_preview_includes_plan_compliance(api, patched_api, fake_bucket):
+    """Выполнение плана доезжает до промпта (#41, фаза 4)."""
+    _seed_plan_with_runs(api, patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("GET", "/advise/preview"))
+    assert code == 200
+    text = json.loads(body)["prompt"]
+    assert "Выполнение плана по неделям" in text
+    assert "факт 17.5 км" in text

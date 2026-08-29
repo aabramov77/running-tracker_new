@@ -243,3 +243,71 @@ def test_parse_real_fit_if_present(storage_module):
     assert summary["dist_km"] > 0
     assert summary["avg_cadence"] is not None and summary["avg_cadence"] > 150
     assert len(parsed["laps"]) > 1
+
+
+# ── Выполнение плана в промпте (#41) ──────────────────────────────────────────
+
+def _week(idx, planned, actual, complete=True, pct=None, missed=0, extra=0):
+    return {"idx": idx, "start": "2026-05-17", "end": "2026-05-23",
+            "planned_km": planned, "actual_km": actual, "pct": pct,
+            "complete": complete, "missed": missed, "extra": extra}
+
+
+def test_compliance_block_prints_plan_and_fact():
+    lines = llm_prompt.format_compliance_block(
+        {"weeks": [_week(1, 30.0, 28.5, pct=95, missed=1)]})
+    text = "\n".join(lines)
+    assert "неделя 2" in text            # idx 0-based, в промпте — с единицы
+    assert "план 30 км" in text and "факт 28.5 км" in text
+    assert "95%" in text
+    assert "пропущено дней: 1" in text
+
+
+def test_compliance_block_marks_a_lower_bound():
+    """Нижнюю границу нельзя подавать как план — модель решит, что недобор."""
+    lines = llm_prompt.format_compliance_block(
+        {"weeks": [_week(0, 32.0, 49.4, complete=False)]})
+    text = "\n".join(lines)
+    assert "план не меньше 32 км" in text
+    assert "%" not in text
+    assert "не считай это недобором" in text
+
+
+def test_compliance_block_handles_a_week_without_any_kilometres():
+    lines = llm_prompt.format_compliance_block(
+        {"weeks": [_week(0, 0, 12.0, complete=False)]})
+    assert "плановый объём из текста не вывести" in "\n".join(lines)
+
+
+def test_compliance_block_stays_silent_when_all_weeks_are_exact():
+    lines = llm_prompt.format_compliance_block(
+        {"weeks": [_week(0, 30.0, 30.0, pct=100)]})
+    assert "не считай это недобором" not in "\n".join(lines)
+
+
+@pytest.mark.parametrize("compliance", [None, {}, {"weeks": []}])
+def test_compliance_block_is_empty_without_data(compliance):
+    assert llm_prompt.format_compliance_block(compliance) == []
+
+
+def test_context_carries_the_compliance_block():
+    ctx = {
+        "last_runs": [], "last_races": [], "current_week": None,
+        "next_week": None, "week_idx": 1, "weeks_total": 4,
+        "compliance": {"weeks": [_week(1, 30.0, 28.5, pct=95)]},
+        "heuristics": {"avg_pace_min_per_km": None, "hard_or_bad_count": 0,
+                       "total_km_last_14": 0},
+    }
+    text = llm_prompt.format_context_for_llm(ctx)
+    assert "Выполнение плана по неделям" in text
+    assert "план 30 км" in text
+
+
+def test_context_without_compliance_has_no_block():
+    ctx = {
+        "last_runs": [], "last_races": [], "current_week": None,
+        "next_week": None, "week_idx": 0, "weeks_total": 0,
+        "heuristics": {"avg_pace_min_per_km": None, "hard_or_bad_count": 0,
+                       "total_km_last_14": 0},
+    }
+    assert "Выполнение плана" not in llm_prompt.format_context_for_llm(ctx)

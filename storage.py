@@ -19,6 +19,7 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
+from compliance import current_week_idx, plan_compliance
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 
@@ -1021,19 +1022,34 @@ def parse_llm_json(text):
 # ── Advice context + storage ─────────────────────────────────────────────────
 
 
-def current_plan_week_idx(plan_start=None, weeks_count=0):
-    """0-based индекс текущей недели плана от его plan_start.
-    Без plan_start — исторический дефолт 2026-05-10; без длины плана — 13 недель.
+def current_plan_week_idx(plan_start=None, weeks_count=0, weeks=None):
+    """0-based индекс текущей недели плана.
+
+    Тонкая обёртка над `compliance.current_week_idx` (#41): раньше здесь была
+    своя арифметика, отсчитывавшая семидневки от plan_start, из-за чего
+    подсвечивалась соседняя неделя (#40). Недели передаём, чтобы отсчёт шёл
+    от подписи первой строки, а не от разошедшегося с ней plan_start.
     """
-    start = datetime(2026, 5, 10)
-    if plan_start:
-        try:
-            start = datetime.strptime(plan_start[:10], "%Y-%m-%d")
-        except (ValueError, TypeError):
-            pass
-    n = weeks_count if weeks_count else 13
-    diff = (datetime.utcnow() - start).days // 7
-    return max(0, min(n - 1, diff))
+    return current_week_idx(plan_start, weeks_count, weeks=weeks)
+
+
+def build_plan_compliance(bucket, sub, plan_id):
+    """План против факта для одного плана; None — плана нет (#41).
+
+    Читающая операция: всё производное и считается на лету, в GCS ничего
+    не пишется, версий не создаётся.
+    """
+    plan = find_plan(read_plans_index(bucket, sub), plan_id)
+    if not plan:
+        return None
+
+    weeks = read_plan_weeks(bucket, sub, plan_id)
+    plan_start = plan.get("plan_start")
+    result = plan_compliance(weeks, read_runs(bucket, sub), plan_start, plan_id)
+    result["plan_id"] = plan_id
+    result["plan_start"] = plan_start or ""
+    result["current_week"] = current_week_idx(plan_start, len(weeks), weeks=weeks)
+    return result
 
 
 def compute_hr_drift(details):
@@ -1117,7 +1133,7 @@ def build_llm_context(bucket, sub):
                 plan_version = plan_data["version"]
 
     week_idx = current_plan_week_idx(active_plan.get("plan_start") if active_plan else None,
-                                     len(plan) if plan else 0)
+                                     len(plan) if plan else 0, weeks=plan)
     current_week = plan[week_idx] if plan and 0 <= week_idx < len(plan) else None
     next_week = plan[week_idx + 1] if plan and (week_idx + 1) < len(plan) else None
 
@@ -1135,7 +1151,24 @@ def build_llm_context(bucket, sub):
         total_km += float(r.get("dist", 0) or 0)
     avg_pace = (sum(paces) / len(paces)) if paces else None
 
+    # Выполнение плана (#41). Считаем по всем пробежкам плана, а не по
+    # последним 14: недельные итоги должны быть полными. В промпт уходят
+    # последние 4 недели — на большем горизонте это уже история, а не то,
+    # от чего отталкиваются на ближайшей неделе.
+    compliance = None
+    if plan:
+        full = plan_compliance(plan, all_runs,
+                               (active_plan or {}).get("plan_start"), plan_id)
+        if full["dated"]:
+            first = max(0, week_idx - 3)
+            compliance = {
+                "weeks": [dict(w, idx=i)
+                          for i, w in enumerate(full["weeks"])][first:week_idx + 1],
+                "totals": full["totals"],
+            }
+
     return {
+        "compliance": compliance,
         "profile": profile,
         "profile_derived": compute_athlete_derived(profile),
         "profile_version": profile_version,

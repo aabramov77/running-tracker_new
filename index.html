@@ -148,9 +148,10 @@
         <button class="btn-sm" onclick="cancelPlanEdit()">Отмена</button>
         <span id="plan-save-msg" class="save-msg"></span>
       </div>
+      <div id="plan-compliance-note" class="hint" style="display:none;margin:0 0 8px"></div>
       <div style="overflow-x:auto">
         <table class="plan">
-          <thead><tr><th>Нед</th><th>Даты</th><th>Акцент</th><th>Пн</th><th>Вт</th><th>Ср</th><th>Чт</th><th>Пт</th><th>Сб</th><th>Вс</th></tr></thead>
+          <thead><tr><th>Нед</th><th>Даты</th><th>Акцент</th><th title="План и факт за неделю, км">км</th><th>Пн</th><th>Вт</th><th>Ср</th><th>Чт</th><th>Пт</th><th>Сб</th><th>Вс</th></tr></thead>
           <tbody id="plan-body"></tbody>
         </table>
       </div>
@@ -302,7 +303,7 @@
         </div>
       </div>
     </div>
-    <div class="card"><div class="card-title">Недельный объём (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
+    <div class="card"><div class="card-title">Недельный объём: план и факт (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
     <div class="card" style="margin-top:12px"><div class="card-title">Динамика темпа (мин/км)</div><div class="chart-wrap"><canvas id="paceChart"></canvas></div></div>
   </div>
 
@@ -571,6 +572,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=26"></script>
+<script src="app.js?v=32"></script>
 </body>
 </html>
