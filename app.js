@@ -120,12 +120,6 @@ function localDate(iso) {
 function planStartDate() {
   return localDate(ACTIVE_PLAN?.plan_start) || localDate('2026-05-10');
 }
-// Понедельник недели, в которую попадает d. Недели плана — пн→вс, а plan_start
-// может приходиться на любой день; без нормализации границы уезжают (#40).
-function mondayOf(d) {
-  const shift = (d.getDay() + 6) % 7;              // вс=0 → 6, пн=1 → 0
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - shift);
-}
 // Подпись недели «11.05» / «11.05.2026» / «2026-05-11» → Date. Год у первого
 // формата отсутствует — берём ближайший к plan_start, чтобы план через
 // Новый год не разъезжался.
@@ -141,13 +135,22 @@ function labelToDate(label, hint) {
     .map(s => new Date(base.getFullYear() + s, month, day))
     .sort((a, b) => Math.abs(a - base) - Math.abs(b - base))[0];
 }
-// Понедельник недели 0. Приоритет — подпись первой строки: её человек
-// заполняет по календарю и с ней же сверяет подсветку, тогда как plan_start
-// мог остаться с прежних времён и указывать на другой день недели (#40).
+// День, с которого начинается план. Приоритет — подпись первой строки: её
+// человек заполняет по календарю, тогда как plan_start мог остаться с прежних
+// времён и указывать на другой день (#40). К понедельнику ничего не
+// притягивается: планы размечают и пн→вс, и вс→сб.
 function planAnchor() {
   const start = planStartDate();
   const labelled = PLAN && PLAN.length ? labelToDate(PLAN[0].start, start) : null;
-  return mondayOf(labelled || start);
+  return labelled || start;
+}
+// Первый день строки i — из её собственной подписи, чтобы подпись и расчёт
+// не разъезжались. Без подписи отсчитываем по семь дней от начала плана.
+function weekStart(i) {
+  const anchor = planAnchor();
+  const labelled = (PLAN && PLAN[i]) ? labelToDate(PLAN[i].start, anchor) : null;
+  return labelled ||
+    new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 7 * i);
 }
 function activePlanId() { return ACTIVE_PLAN ? ACTIVE_PLAN.id : null; }
 // Кэш недель — свой у каждого плана, иначе планы затирали бы друг друга
@@ -578,10 +581,23 @@ async function loadRunsFromCloud() {
 function getCurrentWeek() {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  // Считаем в целых сутках от понедельника недели старта, а не делением
-  // миллисекунд: так перевод часов и часовой пояс не сдвигают границу (#40).
+  const n = planWeeks();
+  if (PLAN && PLAN.length) {
+    // Идём по окнам строк: подписи могут идти не ровно через семь дней,
+    // поэтому арифметикой индекс не вычислить.
+    let latest = 0;
+    for (let i = 0; i < PLAN.length; i++) {
+      const s = weekStart(i);
+      const e = new Date(s.getFullYear(), s.getMonth(), s.getDate() + 6);
+      if (today >= s && today <= e) return Math.min(i, n - 1);
+      if (today >= s) latest = i;
+    }
+    return Math.min(latest, n - 1);
+  }
+  // Плана нет — считаем в целых сутках от его начала, а не делением
+  // миллисекунд: так часовой пояс не сдвигает границу (#40).
   const days = Math.round((today - planAnchor()) / 86400000);
-  return Math.max(0, Math.min(planWeeks() - 1, Math.floor(days / 7)));
+  return Math.max(0, Math.min(n - 1, Math.floor(days / 7)));
 }
 function parsePace(s) {
   if (!s) return null;

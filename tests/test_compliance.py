@@ -11,25 +11,88 @@ import compliance as c
 
 # ── Границы недель (#40) ──────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("start,expected", [
-    ("2026-05-04", date(2026, 5, 4)),   # понедельник — сам себе начало
-    ("2026-05-05", date(2026, 5, 4)),   # вторник
-    ("2026-05-06", date(2026, 5, 4)),   # среда
-    ("2026-05-07", date(2026, 5, 4)),   # четверг
-    ("2026-05-08", date(2026, 5, 4)),   # пятница
-    ("2026-05-09", date(2026, 5, 4)),   # суббота
-    ("2026-05-10", date(2026, 5, 4)),   # воскресенье
+# Разметка недель бывает разной: у одних планов строки идут пн→вс, у других
+# вс→сб. Ни к какому дню недели даты не притягиваются — окно строки берётся
+# из её подписи, иначе в строке «24.05–30.05» показался бы объём другой недели.
+
+SUNDAY_PLAN = [{"start": d} for d in
+               ["10.05", "17.05", "24.05", "31.05", "07.06", "14.06"]]
+MONDAY_PLAN = [{"start": d} for d in
+               ["11.05", "18.05", "25.05", "01.06", "08.06", "15.06"]]
+
+
+@pytest.mark.parametrize("weeks,idx,expected", [
+    (SUNDAY_PLAN, 0, (date(2026, 5, 10), date(2026, 5, 16))),
+    (SUNDAY_PLAN, 2, (date(2026, 5, 24), date(2026, 5, 30))),
+    (MONDAY_PLAN, 0, (date(2026, 5, 11), date(2026, 5, 17))),
+    (MONDAY_PLAN, 2, (date(2026, 5, 25), date(2026, 5, 31))),
 ])
-def test_week_zero_is_monday_for_any_start_weekday(start, expected):
-    """plan_start может быть любым днём, недели плана — всегда пн→вс."""
-    assert c.plan_week_zero(start) == expected
+def test_window_equals_the_label_it_is_shown_under(weeks, idx, expected):
+    """Подпись строки и окно расчёта обязаны совпадать по построению."""
+    assert c.week_window(weeks, idx, "2026-05-10") == expected
 
 
-def test_sunday_belongs_to_the_week_that_is_ending():
-    """Регрессия #40: 23.08.2026 — воскресенье, и это конец недели 17–23.08,
-    а не начало следующей. Старая арифметика подсвечивала неделю с 24.08."""
-    idx = c.current_week_idx("2026-05-10", 20, "2026-08-23")
-    assert c.plan_week_range("2026-05-10", idx) == (date(2026, 8, 17), date(2026, 8, 23))
+def test_sunday_labelled_row_covers_its_own_seven_days():
+    """Строка «24.05–30.05» — воскресенье→суббота. Прежний код брал
+    понедельник её недели и считал объём за 18–24.05."""
+    start, end = c.week_window(SUNDAY_PLAN, 2, "2026-05-10")
+    assert (start.weekday(), end.weekday()) == (6, 5)   # вс → сб
+
+
+@pytest.mark.parametrize("field,expected", [
+    ("sun", date(2026, 5, 24)),   # первый день окна вс→сб
+    ("mon", date(2026, 5, 25)),
+    ("sat", date(2026, 5, 30)),   # последний
+])
+def test_day_columns_map_inside_the_window(field, expected):
+    """В семи подряд идущих днях каждый день недели ровно один — колонки
+    раскладываются однозначно при любом дне начала строки."""
+    start, _ = c.week_window(SUNDAY_PLAN, 2, "2026-05-10")
+    assert c.day_date(start, field) == expected
+
+
+@pytest.mark.parametrize("weeks", [SUNDAY_PLAN, MONDAY_PLAN])
+def test_day_columns_stay_within_the_window(weeks):
+    start, end = c.week_window(weeks, 1, "2026-05-10")
+    for field in c.DAY_FIELDS:
+        assert start <= c.day_date(start, field) <= end
+
+
+def test_week_zero_is_the_plan_start_itself():
+    """Никакого притягивания к понедельнику: план начинается тогда,
+    когда сказано."""
+    assert c.plan_week_zero("2026-05-10") == date(2026, 5, 10)
+    assert c.plan_week_zero("2026-05-13") == date(2026, 5, 13)
+
+
+@pytest.mark.parametrize("day,expected", [
+    ("2026-05-24", 2),   # первый день строки 3
+    ("2026-05-27", 2),   # середина
+    ("2026-05-30", 2),   # последний день
+    ("2026-05-31", 3),   # уже следующая
+    ("2026-05-23", 1),   # ещё предыдущая
+])
+def test_current_week_follows_the_labelled_windows(day, expected):
+    assert c.current_week_idx("2026-05-10", 6, day, weeks=SUNDAY_PLAN) == expected
+
+
+def test_day_before_the_plan_gives_the_first_row():
+    assert c.current_week_idx("2026-05-10", 6, "2026-01-01", weeks=SUNDAY_PLAN) == 0
+
+
+def test_day_after_the_plan_gives_the_last_row():
+    assert c.current_week_idx("2026-05-10", 6, "2026-12-31", weeks=SUNDAY_PLAN) == 5
+
+
+def test_irregular_labels_do_not_shift_later_rows():
+    """Вставленная неделя или опечатка в дате раньше уводила все строки
+    ниже — теперь каждая строка стоит на своей подписи."""
+    weeks = [{"start": "10.05"}, {"start": "17.05"},
+             {"start": "24.05"}, {"start": "07.06"}]   # разрыв: 31.05 пропущена
+    assert c.week_window(weeks, 3, "2026-05-10")[0] == date(2026, 6, 7)
+    assert c.current_week_idx("2026-05-10", 4, "2026-06-08", weeks=weeks) == 3
+    # день в разрыве относится к последней начавшейся строке
+    assert c.current_week_idx("2026-05-10", 4, "2026-06-03", weeks=weeks) == 2
 
 
 # ── Якорь по подписи первой недели (#40) ──────────────────────────────────────
@@ -45,8 +108,7 @@ def test_label_anchor_beats_a_stale_plan_start():
     подсвечивал строку 24.08, когда сегодня ещё 23.08."""
     idx = c.current_week_idx("2026-05-10", 20, "2026-08-23", weeks=LABELLED)
     assert idx == 14
-    assert c.plan_week_range("2026-05-10", idx, weeks=LABELLED) == \
-        (date(2026, 8, 17), date(2026, 8, 23))
+    assert c.plan_week_range("2026-05-10", idx, weeks=LABELLED) ==         (date(2026, 8, 17), date(2026, 8, 23))
 
 
 def test_stale_plan_start_alone_would_point_at_the_next_row():
@@ -78,12 +140,6 @@ def test_broken_labels_fall_back_to_plan_start(label):
     assert c.plan_week_zero("2026-05-10", weeks) == c.plan_week_zero("2026-05-10")
 
 
-def test_label_anchor_survives_a_non_monday_label():
-    """Подпись «10.05» (вс) означает неделю 04–10.05, а не 11–17.05."""
-    weeks = [{"start": "10.05"}]
-    assert c.plan_week_zero("2026-05-10", weeks) == date(2026, 5, 4)
-
-
 @pytest.mark.parametrize("plan_start,weeks,expected", [
     ("2026-05-10", [{"start": "11.05"}], c.LABEL),
     ("2026-05-10", [{"start": ""}],      c.PLAN_START),
@@ -111,18 +167,11 @@ def test_dated_plan_carries_its_anchor():
     assert result["dated"] is True
 
 
-def test_monday_starts_the_next_week():
-    sunday = c.current_week_idx("2026-05-10", 20, "2026-08-23")
-    monday = c.current_week_idx("2026-05-10", 20, "2026-08-24")
-    assert monday == sunday + 1
-
-
-@pytest.mark.parametrize("day", [
-    "2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20",
-    "2026-08-21", "2026-08-22", "2026-08-23",
-])
-def test_every_day_of_a_week_maps_to_the_same_index(day):
-    assert c.current_week_idx("2026-05-10", 20, day) == 15
+def test_windows_without_labels_step_by_seven_from_plan_start():
+    """Без подписей отсчитываем по семь дней от plan_start — как есть,
+    не притягивая к понедельнику."""
+    assert c.plan_week_range("2026-05-10", 0) == (date(2026, 5, 10), date(2026, 5, 16))
+    assert c.plan_week_range("2026-05-10", 2) == (date(2026, 5, 24), date(2026, 5, 30))
 
 
 def test_index_is_clamped_to_plan_bounds():
@@ -135,10 +184,10 @@ def test_missing_plan_start_falls_back_to_historic_default():
     assert c.plan_week_zero("не дата") == c.plan_week_zero(None)
 
 
-def test_week_range_is_seven_days_monday_to_sunday():
-    start, end = c.plan_week_range("2026-05-04", 3)
-    assert start.weekday() == 0 and end.weekday() == 6
-    assert (end - start).days == 6
+def test_week_range_is_always_seven_days():
+    for start_date in ("2026-05-04", "2026-05-10", "2026-05-13"):
+        start, end = c.plan_week_range(start_date, 3)
+        assert (end - start).days == 6
 
 
 # ── Разбор планового дня ──────────────────────────────────────────────────────

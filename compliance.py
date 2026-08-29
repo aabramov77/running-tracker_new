@@ -45,11 +45,6 @@ def to_date(value):
         return None
 
 
-def monday_of(day):
-    """Понедельник недели, в которую попадает day."""
-    return day - timedelta(days=day.weekday())
-
-
 # Подпись недели: «11.05», «11.05.2026» или ISO «2026-05-11».
 _LABEL_RE = re.compile(r"^\s*(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\s*$")
 
@@ -83,22 +78,48 @@ def _safe_date(year, month, day):
 
 
 def plan_week_zero(plan_start=None, weeks=None):
-    """Понедельник недели, с которой начинается план.
+    """День, с которого начинается первая строка плана.
 
-    Приоритет — подпись первой строки плана. Её человек заполняет по
-    календарю, и именно с ней сверяет подсветку текущей недели; `plan_start`
-    же нередко остался с прежних времён и указывает на другой день недели.
-    Расхождение между ними и есть #40: отсчёт от plan_start уводил подсветку
-    на строку вперёд. Подпись — запасной вариант наоборот: если её нет,
-    отсчитываем от plan_start, нормализованного к понедельнику.
+    Приоритет — подпись первой строки: её человек заполняет по календарю и
+    с ней же сверяет цифры. `plan_start` нередко остался с прежних времён и
+    указывает на другой день — расхождение между ними и есть #40.
+
+    Ни к какому дню недели дата не притягивается. Планы размечают
+    по-разному: бывают строки пн→вс, бывают вс→сб. Навязывать понедельник
+    значит считать факт по окну, которое не совпадает с подписью строки, —
+    в строке «24.05–30.05» показался бы объём недели 18–24.05.
     """
     first = (weeks or [None])[0]
     if first:
         labelled = label_to_date((first or {}).get("start"), plan_start)
         if labelled:
-            return monday_of(labelled)
-    start = to_date(plan_start) or to_date(DEFAULT_PLAN_START)
-    return monday_of(start)
+            return labelled
+    return to_date(plan_start) or to_date(DEFAULT_PLAN_START)
+
+
+def week_window(weeks, idx, plan_start=None):
+    """(первый день, последний день) строки idx — 7 дней от её подписи.
+
+    Окно берётся из подписи каждой строки, а не отсчитывается от первой:
+    так подпись и расчёт совпадают по построению и не разъезжаются на
+    вставленной неделе, опечатке в дате или смене разметки посреди плана.
+    Строка без подписи получает окно от якоря плана.
+    """
+    row = weeks[idx] if weeks and 0 <= idx < len(weeks) else None
+    labelled = label_to_date((row or {}).get("start"), plan_start) if row else None
+    first = labelled or (plan_week_zero(plan_start, weeks) + timedelta(days=7 * idx))
+    return first, first + timedelta(days=6)
+
+
+def day_date(week_start, field):
+    """Дата колонки дня внутри окна строки.
+
+    В семи подряд идущих днях каждый день недели встречается ровно один
+    раз, поэтому колонки Пн–Вс раскладываются однозначно при любом дне
+    начала: у строки вс→сб «Вс» окажется первым днём окна, а не последним.
+    """
+    weekday = DAY_FIELDS.index(field)
+    return week_start + timedelta(days=(weekday - week_start.weekday()) % 7)
 
 
 LABEL = "label"
@@ -121,9 +142,8 @@ def anchor_source(plan_start=None, weeks=None):
 
 
 def plan_week_range(plan_start, idx, weeks=None):
-    """(понедельник, воскресенье) недели idx, 0-based."""
-    first = plan_week_zero(plan_start, weeks) + timedelta(days=7 * idx)
-    return first, first + timedelta(days=6)
+    """(первый день, последний день) недели idx, 0-based."""
+    return week_window(weeks, idx, plan_start)
 
 
 def week_index_of(plan_start, day, weeks=None):
@@ -140,8 +160,24 @@ def current_week_idx(plan_start=None, weeks_count=0, today=None, weeks=None):
     `today` — параметр, а не utcnow() внутри: иначе поведение на границе
     недели невоспроизводимо в тестах, а именно на границе всё и ломалось.
     """
+    day = to_date(today) or date.today()
     n = weeks_count or (len(weeks) if weeks else 0) or DEFAULT_WEEKS
-    idx = week_index_of(plan_start, to_date(today) or date.today(), weeks)
+
+    if weeks:
+        # Идём по окнам строк: подписи могут идти не ровно через семь дней,
+        # поэтому арифметикой индекс не вычислить.
+        latest_started = None
+        for i in range(len(weeks)):
+            start, end = week_window(weeks, i, plan_start)
+            if start <= day <= end:
+                return min(i, n - 1)
+            if start <= day:
+                latest_started = i
+        # День вне окон: до плана — первая строка, в разрыве или после
+        # плана — последняя начавшаяся.
+        return min(latest_started if latest_started is not None else 0, n - 1)
+
+    idx = week_index_of(plan_start, day, weeks)
     if idx is None:
         return 0
     return max(0, min(n - 1, idx))
@@ -234,10 +270,10 @@ def week_compliance(week, week_start, runs_by_date):
     missed = 0
     extra = 0
 
-    for offset, field in enumerate(DAY_FIELDS):
-        day_date = week_start + timedelta(days=offset)
+    for field in DAY_FIELDS:
+        this_day = day_date(week_start, field)
         plan = parse_planned_day((week or {}).get(field))
-        day_runs = runs_by_date.get(day_date, [])
+        day_runs = runs_by_date.get(this_day, [])
         day_km = _run_km(day_runs)
 
         if plan["kind"] == KM:
@@ -262,7 +298,7 @@ def week_compliance(week, week_start, runs_by_date):
 
         days.append({
             "field": field,
-            "date": day_date.isoformat(),
+            "date": this_day.isoformat(),
             "planned_text": (week or {}).get(field) or "",
             "planned_kind": plan["kind"],
             "planned_km": plan["km"],
@@ -301,7 +337,7 @@ def plan_compliance(weeks, runs, plan_start=None, plan_id=None):
     runs_by_date = _runs_by_date(runs, plan_id)
     zero = plan_week_zero(plan_start, weeks)
 
-    rows = [week_compliance(week, zero + timedelta(days=7 * i), runs_by_date)
+    rows = [week_compliance(week, week_window(weeks, i, plan_start)[0], runs_by_date)
             for i, week in enumerate(weeks)]
 
     complete = all(r["complete"] for r in rows) if rows else True
