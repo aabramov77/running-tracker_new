@@ -790,11 +790,15 @@ function renderPlan() {
       ? `${week.complete ? '' : '≥'}${km1(week.planned_km)}`
       : (week.complete ? '' : '?');
     const reasons = [];
-    if (week.unparsed) reasons.push(`${week.unparsed} с интервалами или временем`);
-    if (week.approx) reasons.push(`${week.approx} с диапазоном`);
-    const title = week.complete ? '' : ` title="Точный объём из текста плана не вывести`
-      + `${reasons.length ? ' (' + reasons.join(', ') + ')' : ''}, показана нижняя граница. `
-      + `Это про запись в плане, а не про выполнение тренировок."`;
+    if (week.unparsed) reasons.push(`интервалы или время (${week.unparsed})`);
+    if (week.approx) reasons.push(`диапазон (${week.approx})`);
+    const why = reasons.length ? ` — ${reasons.join(', ')}` : '';
+    // «Минимум», а не «прогноз»: число ошибается только в одну сторону,
+    // и на этой односторонности всё держится.
+    const title = week.complete ? ''
+      : week.planned_km
+        ? ` title="Минимум по плану: ${km1(week.planned_km)} км. Точнее из текста не вывести${why}."`
+        : ` title="Объём из текста плана не вывести${why}."`;
     const head = `<div style="font-weight:500"${title}>${planned}</div>`;
     if (!past) return `<td style="font-size:12px;white-space:nowrap">${head}</td>`;
     const over = week.complete && week.delta_km > 0;
