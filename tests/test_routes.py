@@ -379,8 +379,16 @@ def test_compliance_flags_an_undated_plan(api, patched_api, fake_bucket):
 
 def test_compliance_does_not_write_anything(api, patched_api, fake_bucket):
     """Производные величины считаются на чтении — новых версий возникать
-    не должно (политика хранения из CLAUDE.md)."""
+    не должно (политика хранения из CLAUDE.md).
+
+    Запрос идёт мимо фикстуры `api`: она на каждом вызове перерегистрирует
+    пользователя и обновляет реестр, и эти записи — её, а не эндпоинта.
+    Пользователь уже одобрен на этапе подготовки данных, verify_token
+    подменён там же.
+    """
     plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
     before = dict(fake_bucket._store)
-    api(FakeRequest("GET", f"/plans/{plan_id}/compliance"))
+    body, code, _ = patched_api.handle_request(
+        FakeRequest("GET", f"/plans/{plan_id}/compliance"))
+    assert code == 200
     assert fake_bucket._store == before
