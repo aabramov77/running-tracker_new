@@ -101,6 +101,25 @@ def plan_week_zero(plan_start=None, weeks=None):
     return monday_of(start)
 
 
+LABEL = "label"
+PLAN_START = "plan_start"
+DEFAULT = "default"
+
+
+def anchor_source(plan_start=None, weeks=None):
+    """Откуда взялся якорь недели 0.
+
+    `default` означает, что план не датирован ничем — ни подписью первой
+    строки, ни `plan_start`, — и недели разложены по историческому умолчанию.
+    Показывать по такому плану факт нельзя: он лёг бы на произвольные даты,
+    поэтому интерфейсу нужно не число, а объяснение, чего не хватает.
+    """
+    first = (weeks or [None])[0]
+    if first and label_to_date((first or {}).get("start"), plan_start):
+        return LABEL
+    return PLAN_START if to_date(plan_start) else DEFAULT
+
+
 def plan_week_range(plan_start, idx, weeks=None):
     """(понедельник, воскресенье) недели idx, 0-based."""
     first = plan_week_zero(plan_start, weeks) + timedelta(days=7 * idx)
@@ -288,8 +307,13 @@ def plan_compliance(weeks, runs, plan_start=None, plan_id=None):
     complete = all(r["complete"] for r in rows) if rows else True
     planned_km = round(sum(r["planned_km"] for r in rows), 2)
     actual_km = round(sum(r["actual_km"] for r in rows), 2)
+    source = anchor_source(plan_start, weeks)
 
     return {
+        "anchor": zero.isoformat(),
+        "anchor_source": source,
+        # Даты недель угаданы — факт по ним раскладывать бессмысленно.
+        "dated": source != DEFAULT,
         "weeks": rows,
         "totals": {
             "planned_km": planned_km,

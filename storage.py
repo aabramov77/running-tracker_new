@@ -19,7 +19,7 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
-from compliance import current_week_idx
+from compliance import current_week_idx, plan_compliance
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 
@@ -1031,6 +1031,25 @@ def current_plan_week_idx(plan_start=None, weeks_count=0, weeks=None):
     от подписи первой строки, а не от разошедшегося с ней plan_start.
     """
     return current_week_idx(plan_start, weeks_count, weeks=weeks)
+
+
+def build_plan_compliance(bucket, sub, plan_id):
+    """План против факта для одного плана; None — плана нет (#41).
+
+    Читающая операция: всё производное и считается на лету, в GCS ничего
+    не пишется, версий не создаётся.
+    """
+    plan = find_plan(read_plans_index(bucket, sub), plan_id)
+    if not plan:
+        return None
+
+    weeks = read_plan_weeks(bucket, sub, plan_id)
+    plan_start = plan.get("plan_start")
+    result = plan_compliance(weeks, read_runs(bucket, sub), plan_start, plan_id)
+    result["plan_id"] = plan_id
+    result["plan_start"] = plan_start or ""
+    result["current_week"] = current_week_idx(plan_start, len(weeks), weeks=weeks)
+    return result
 
 
 def compute_hr_drift(details):

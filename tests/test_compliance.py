@@ -84,6 +84,33 @@ def test_label_anchor_survives_a_non_monday_label():
     assert c.plan_week_zero("2026-05-10", weeks) == date(2026, 5, 4)
 
 
+@pytest.mark.parametrize("plan_start,weeks,expected", [
+    ("2026-05-10", [{"start": "11.05"}], c.LABEL),
+    ("2026-05-10", [{"start": ""}],      c.PLAN_START),
+    ("2026-05-10", None,                 c.PLAN_START),
+    (None,         [{"start": "11.05"}], c.LABEL),
+    (None,         [{"start": ""}],      c.DEFAULT),
+    (None,         None,                 c.DEFAULT),
+])
+def test_anchor_source_is_reported(plan_start, weeks, expected):
+    """`default` значит, что недели разложены наугад — интерфейсу нужно
+    показать не цифры, а объяснение, чего не хватает."""
+    assert c.anchor_source(plan_start, weeks) == expected
+
+
+def test_undated_plan_is_marked_not_dated():
+    result = c.plan_compliance([{"mon": "10 км"}], [])
+    assert result["anchor_source"] == c.DEFAULT
+    assert result["dated"] is False
+
+
+def test_dated_plan_carries_its_anchor():
+    result = c.plan_compliance([{"start": "17.08", "mon": "10 км"}], [],
+                               plan_start="2026-08-17")
+    assert result["anchor"] == "2026-08-17"
+    assert result["dated"] is True
+
+
 def test_monday_starts_the_next_week():
     sunday = c.current_week_idx("2026-05-10", 20, "2026-08-23")
     monday = c.current_week_idx("2026-05-10", 20, "2026-08-24")
