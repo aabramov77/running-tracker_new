@@ -16,23 +16,27 @@ from config import (ADMIN_DAILY_ADVISE_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_ADVISE_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
-from storage import (LLMRefused, LLMTruncated, RegistrationClosed,
-                     _fmt_duration, _fmt_pace, archive_plan,
-                     attach_fit_details_to_run, build_llm_context,
-                     build_plan_compliance, call_llm,
+from storage import (ChatError, CoachLinkError, LLMRefused, LLMTruncated,
+                     RegistrationClosed, _fmt_duration, _fmt_pace,
+                     active_coach_sub, append_chat_message, archive_plan,
+                     attach_fit_details_to_run,
+                     build_llm_context, build_plan_compliance, call_llm,
+                     chat_unread, mark_chat_read, read_chat,
                      clean_athlete_profile, clean_effort, cleanup_old_tmp,
-                     compute_athlete_derived, create_plan, find_plan,
-                     get_active_plan, get_storage_client,
-                     increment_advice_usage, mask_key, migrate_legacy_to_user,
-                     parse_fit_file, parse_llm_json, read_advice_usage,
-                     read_athlete_history, read_athlete_profile,
-                     read_latest_advice, read_llm_config_full, read_plan_weeks,
-                     read_plans_index, read_races, read_registry,
-                     read_run_details, read_runs, resolve_user, save_plan_weeks,
-                     set_active_plan, set_user_status, update_plan_meta,
-                     write_advice_version, write_athlete_version,
-                     write_llm_config_version, write_parsed_fit_to_tmp,
-                     write_races, write_runs)
+                     coach_can_access, compute_athlete_derived, create_plan,
+                     current_coach, find_plan, get_active_plan,
+                     get_storage_client, increment_advice_usage,
+                     list_athletes_of, list_coaches, mask_key,
+                     migrate_legacy_to_user, parse_fit_file, parse_llm_json,
+                     read_advice_usage, read_athlete_history,
+                     read_athlete_profile, read_latest_advice,
+                     read_llm_config_full, read_plan_weeks, read_plans_index,
+                     read_races, read_registry, read_run_details, read_runs,
+                     resolve_user, save_plan_weeks, set_active_plan,
+                     set_coach_flag, set_user_coach, set_user_status,
+                     update_plan_meta, write_advice_version,
+                     write_athlete_version, write_llm_config_version,
+                     write_parsed_fit_to_tmp, write_races, write_runs)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -100,6 +104,159 @@ def h_admin_user_status(c):
     return jresp({"ok": True, "user": rec}, 200)
 
 
+def h_admin_user_coach(c):
+    body = c.body()
+    target = body.get("sub")
+    if not target or not isinstance(body.get("is_coach"), bool):
+        return jresp({"error": "Missing sub or is_coach"}, 400)
+    rec = set_coach_flag(c.bucket, target, body["is_coach"], c.sub)
+    if not rec:
+        return jresp({"error": "user not found"}, 404)
+    return jresp({"ok": True, "user": rec}, 200)
+
+
+# ── Тренер (#44): выбор тренера спортсменом ───────────────────────────────────
+
+def h_coaches(c):
+    # Себя в списке нет: выбрать себя тренером всё равно нельзя.
+    coaches = [coach for coach in list_coaches(c.bucket) if coach["sub"] != c.sub]
+    return jresp({"coaches": coaches}, 200)
+
+
+def h_my_coach_get(c):
+    coach = current_coach(c.bucket, c.sub)
+    unread = chat_unread(c.bucket, c.sub, coach["sub"], "athlete") if coach else 0
+    return jresp({"coach": coach, "unread": unread}, 200)
+
+
+def h_my_coach_post(c):
+    body = c.body()
+    if "coach_sub" not in body:
+        return jresp({"error": "Missing coach_sub"}, 400)
+    try:
+        set_user_coach(c.bucket, c.sub, body["coach_sub"])
+    except CoachLinkError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
+
+
+# ── Тренер (#44): просмотр данных спортсмена ──────────────────────────────────
+# Только чтение. Профиль спортсмена сюда не входит намеренно: тренеру открыты
+# планы, выполнение и журнал — но не вес, пульс и травмы.
+
+class Forbidden(Exception):
+    """Нет права на чужие данные → 403 (см. handle_request)."""
+
+
+def _coached_athlete(c):
+    """sub спортсмена из пути — если текущий пользователь его тренер.
+
+    Ответ одинаков для чужого спортсмена и для несуществующего sub, поэтому
+    перебором идентификаторов ничего не узнать.
+    """
+    athlete = c.args[0]
+    if not coach_can_access(c.bucket, c.sub, athlete):
+        raise Forbidden()
+    return athlete
+
+
+def h_coach_athletes(c):
+    athletes = list_athletes_of(c.bucket, c.sub)
+    if athletes is None:
+        raise Forbidden()
+    for athlete in athletes:
+        athlete["unread"] = chat_unread(c.bucket, athlete["sub"], c.sub, "coach")
+    return jresp({"athletes": athletes}, 200)
+
+
+def h_coach_plans(c):
+    return jresp(read_plans_index(c.bucket, _coached_athlete(c)), 200)
+
+
+def h_coach_plan_weeks(c):
+    athlete, plan_id = _coached_athlete(c), c.args[1]
+    if not find_plan(read_plans_index(c.bucket, athlete), plan_id):
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(read_plan_weeks(c.bucket, athlete, plan_id), 200)
+
+
+def h_coach_plan_compliance(c):
+    result = build_plan_compliance(c.bucket, _coached_athlete(c), c.args[1])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(result, 200)
+
+
+def h_coach_runs(c):
+    runs = read_runs(c.bucket, _coached_athlete(c))
+    return jresp([r for r in runs if not r.get("deleted", False)], 200)
+
+
+def h_coach_run_details(c):
+    # Скрытую спортсменом пробежку тренер не видит ни в журнале, ни по id.
+    return _run_details_response(c.bucket, _coached_athlete(c), int(c.args[1]),
+                                 include_deleted=False)
+
+
+# ── Тренер (#44): чат ─────────────────────────────────────────────────────────
+# Ветку задаёт пара (спортсмен, тренер). Обе стороны ходят в одни и те же
+# функции; отличается только то, как пара получается из запроса.
+
+class NoCoach(Exception):
+    """У спортсмена нет действующего тренера → 409 (см. handle_request)."""
+
+
+def _my_thread(c):
+    """Ветка спортсмена с его нынешним тренером."""
+    coach = active_coach_sub(c.bucket, c.sub)
+    if not coach:
+        raise NoCoach()
+    return c.sub, coach, "athlete"
+
+
+def _athlete_thread(c):
+    """Ветка тренера со спортсменом из пути."""
+    return _coached_athlete(c), c.sub, "coach"
+
+
+def _chat_get(c, thread):
+    athlete, coach, _ = thread
+    args = c.request.args
+    try:
+        page = read_chat(c.bucket, athlete, coach,
+                         after=args.get("after"), before=args.get("before"))
+    except ChatError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp(page, 200)
+
+
+def _chat_post(c, thread):
+    athlete, coach, role = thread
+    try:
+        message = append_chat_message(c.bucket, athlete, coach, c.sub, role,
+                                      c.body().get("text"))
+    except ChatError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp({"message": message}, 201)
+
+
+def _chat_read(c, thread):
+    athlete, coach, role = thread
+    try:
+        mark_chat_read(c.bucket, athlete, coach, role, c.body().get("last_id"))
+    except ChatError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp({"unread": chat_unread(c.bucket, athlete, coach, role)}, 200)
+
+
+def h_my_chat_get(c):       return _chat_get(c, _my_thread(c))
+def h_my_chat_post(c):      return _chat_post(c, _my_thread(c))
+def h_my_chat_read(c):      return _chat_read(c, _my_thread(c))
+def h_coach_chat_get(c):    return _chat_get(c, _athlete_thread(c))
+def h_coach_chat_post(c):   return _chat_post(c, _athlete_thread(c))
+def h_coach_chat_read(c):   return _chat_read(c, _athlete_thread(c))
+
+
 def h_admin_migrate_legacy(c):
     return jresp(migrate_legacy_to_user(c.bucket, c.sub), 200)
 
@@ -138,17 +295,21 @@ def h_parse_fit(c):
     }, 200)
 
 
-def h_run_details(c):
-    run_id = int(c.args[0])
+def _run_details_response(bucket, sub, run_id, include_deleted=True):
     # Ownership: run_id должен быть в runs.json пользователя (иначе ленивый
     # fallback мог бы утащить чужие/legacy данные в чужой namespace).
-    own_ids = {r.get("id") for r in read_runs(c.bucket, c.sub)}
+    own_ids = {r.get("id") for r in read_runs(bucket, sub)
+               if include_deleted or not r.get("deleted", False)}
     if run_id not in own_ids:
         return jresp({"error": "Run details not found"}, 404)
-    details = read_run_details(c.bucket, c.sub, run_id)
+    details = read_run_details(bucket, sub, run_id)
     if not details:
         return jresp({"error": "Run details not found"}, 404)
     return jresp(details, 200)
+
+
+def h_run_details(c):
+    return _run_details_response(c.bucket, c.sub, int(c.args[0]))
 
 
 def h_llm_config_get(c):
@@ -476,7 +637,25 @@ def h_runs_delete(c):
 ROUTES = [
     ("GET",    r"^/admin/users$",                h_admin_users,          True),
     ("POST",   r"^/admin/users/(approve|reject)$", h_admin_user_status,  True),
+    ("POST",   r"^/admin/users/coach$",          h_admin_user_coach,     True),
     ("POST",   r"^/admin/migrate-legacy$",       h_admin_migrate_legacy, True),
+
+    ("GET",    r"^/coaches$",                    h_coaches,              False),
+    ("GET",    r"^/my/coach$",                   h_my_coach_get,         False),
+    ("POST",   r"^/my/coach$",                   h_my_coach_post,        False),
+    ("GET",    r"^/my/coach/chat$",              h_my_chat_get,          False),
+    ("POST",   r"^/my/coach/chat$",              h_my_chat_post,         False),
+    ("POST",   r"^/my/coach/chat/read$",         h_my_chat_read,         False),
+
+    ("GET",    r"^/coach/athletes$",                                    h_coach_athletes,        False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans$",                     h_coach_plans,           False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",      h_coach_plan_weeks,      False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/chat$",                      h_coach_chat_get,        False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/chat$",                      h_coach_chat_post,       False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/chat/read$",                 h_coach_chat_read,       False),
 
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
@@ -556,7 +735,9 @@ def handle_request(request):
     # именно из него фронт узнаёт, что заявка ещё на рассмотрении.
     if path == "/me":
         return jresp({"status": user["status"], "role": user["role"],
-                      "email": user.get("email"), "name": user.get("name")}, 200)
+                      "email": user.get("email"), "name": user.get("name"),
+                      "is_coach": bool(user.get("is_coach")),
+                      "coach": current_coach(bucket, user["sub"])}, 200)
 
     # Не одобрен → 403 на всё остальное, ещё до разбора маршрута: иначе по коду
     # ответа можно было бы перебирать существующие пути.
@@ -578,5 +759,9 @@ def handle_request(request):
 
     try:
         return handler(Ctx(request, bucket, user, match.groups()))
+    except Forbidden:
+        return jresp({"error": "forbidden"}, 403)
+    except NoCoach:
+        return jresp({"error": "no_coach"}, 409)
     except Exception as e:
         return jresp({"error": str(e)}, 500)

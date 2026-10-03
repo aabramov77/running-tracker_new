@@ -10,7 +10,8 @@ import json
 import re
 import secrets as secrets_mod
 import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import httpx
 from fitparse import FitFile
@@ -50,6 +51,10 @@ def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
 def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
 def p_tmp_fit(sub, token):     return f"tmp/{sub}/{token}/activity.fit"
 def p_tmp_details(sub, token): return f"tmp/{sub}/{token}/details.json"
+# Чат с тренером (#44) — в namespace спортсмена, ветка на каждого тренера
+def p_chat_prefix(athlete, coach):      return f"{upfx(athlete)}coach_chat/{coach}/m/"
+def p_chat_msg(athlete, coach, msg_id): return f"{p_chat_prefix(athlete, coach)}{msg_id}.json"
+def p_chat_read(athlete, coach, role):  return f"{upfx(athlete)}coach_chat/{coach}/read/{role}.json"
 
 # Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
 LEGACY_RUNS = "runs.json"
@@ -1302,14 +1307,26 @@ def write_registry(bucket, registry):
     _registry_cache["ts"] = time.time()
 
 
-def append_user_event(bucket, sub, event, actor):
-    """Append-only аудит переходов (register/approve/reject)."""
+def _fresh_registry(bucket):
+    """Реестр мимо кэша. Кэш живёт REGISTRY_TTL_SEC на каждом инстансе, и
+    запись поверх устаревшей копии затёрла бы чужое изменение."""
+    data = _load_registry(bucket)
+    _registry_cache["data"] = data
+    _registry_cache["ts"] = time.time()
+    return data
+
+
+def append_user_event(bucket, sub, event, actor, details=None):
+    """Append-only аудит переходов (register/approve/reject, тренер #44)."""
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+    payload = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "sub": sub, "event": event, "actor": actor,
+    }
+    if details:
+        payload["details"] = details
     bucket.blob(f"users/events/{ts}-{sub}-{event}.json").upload_from_string(
-        json.dumps({
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "sub": sub, "event": event, "actor": actor,
-        }, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
 
@@ -1329,6 +1346,12 @@ def resolve_user(bucket, token_info):
     registry = read_registry(bucket)
     users = registry.setdefault("users", {})
 
+    if sub in users:
+        return users[sub]
+
+    # Записи в кэше нет — перед записью берём свежий реестр (см. _fresh_registry).
+    registry = _fresh_registry(bucket)
+    users = registry.setdefault("users", {})
     if sub in users:
         return users[sub]
 
@@ -1354,7 +1377,7 @@ def resolve_user(bucket, token_info):
 
 def set_user_status(bucket, target_sub, status, actor_sub):
     """Меняет статус пользователя (lifecycle-метаданные). Возвращает запись или None."""
-    registry = read_registry(bucket)
+    registry = _fresh_registry(bucket)
     users = registry.get("users", {})
     if target_sub not in users:
         return None
@@ -1366,6 +1389,258 @@ def set_user_status(bucket, target_sub, status, actor_sub):
     write_registry(bucket, registry)
     append_user_event(bucket, target_sub, status, actor_sub)
     return rec
+
+
+# ── Тренер (#44): роль и связь «спортсмен → тренер» ──────────────────────────
+# Обе отметки живут в реестре, а не в профиле: реестр и так читается на каждый
+# запрос, а список спортсменов тренера получается фильтром, без обхода чужих
+# профилей. Это авторизационные метаданные; история — в users/events/.
+
+class CoachLinkError(ValueError):
+    """Этого тренера выбрать нельзя. Код причины — str(исключения)."""
+
+
+def _is_active_coach(rec):
+    return bool(rec and rec.get("is_coach") and rec.get("status") == "approved")
+
+
+def set_coach_flag(bucket, target_sub, is_coach, actor_sub):
+    """Админ назначает или снимает тренера. Возвращает запись или None.
+
+    Снятие заодно отвязывает его спортсменов: иначе у них в профиле остался бы
+    тренер, которого уже нет, а при повторном назначении доступ вернулся бы
+    без их ведома.
+    """
+    registry = _fresh_registry(bucket)
+    users = registry.get("users", {})
+    rec = users.get(target_sub)
+    if rec is None:
+        return None
+
+    now = datetime.utcnow().isoformat() + "Z"
+    rec["is_coach"] = bool(is_coach)
+    rec["updated_at"] = now
+    released = []
+    if not is_coach:
+        for user in users.values():
+            if user.get("coach_sub") == target_sub:
+                user["coach_sub"] = None
+                user["updated_at"] = now
+                released.append(user["sub"])
+
+    write_registry(bucket, registry)
+    append_user_event(bucket, target_sub,
+                      "coach_grant" if is_coach else "coach_revoke", actor_sub)
+    for sub in released:
+        append_user_event(bucket, sub, "coach_clear", actor_sub,
+                          {"previous": target_sub, "reason": "coach_revoked"})
+    return rec
+
+
+def set_user_coach(bucket, sub, coach_sub):
+    """Спортсмен выбирает тренера или отказывается от него (coach_sub=None).
+
+    Доступ к данным даёт именно эта запись, поэтому ставит её только сам
+    владелец данных. Поднимает CoachLinkError, если выбрать нельзя.
+    """
+    coach_sub = coach_sub or None
+    registry = _fresh_registry(bucket)
+    users = registry.get("users", {})
+    rec = users.get(sub)
+    if rec is None:
+        raise CoachLinkError("user_not_found")
+    if coach_sub:
+        if coach_sub == sub:
+            raise CoachLinkError("cannot_coach_yourself")
+        if not _is_active_coach(users.get(coach_sub)):
+            raise CoachLinkError("not_a_coach")
+
+    previous = rec.get("coach_sub")
+    if previous == coach_sub:
+        return rec
+
+    rec["coach_sub"] = coach_sub
+    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    write_registry(bucket, registry)
+    append_user_event(bucket, sub, "coach_select" if coach_sub else "coach_clear", sub,
+                      {"coach_sub": coach_sub, "previous": previous})
+    return rec
+
+
+def _coach_card(rec):
+    """Что о тренере видят остальные: имя, но не почта."""
+    return {"sub": rec["sub"], "name": rec.get("name") or "Тренер"}
+
+
+def list_coaches(bucket):
+    """Кого сейчас можно выбрать тренером."""
+    users = read_registry(bucket).get("users", {})
+    cards = [_coach_card(u) for u in users.values() if _is_active_coach(u)]
+    return sorted(cards, key=lambda card: card["name"].lower())
+
+
+def current_coach(bucket, sub):
+    """Действующий тренер пользователя или None.
+
+    Связь на тренера, которого с тех пор отклонили, считается недействующей —
+    запись в реестре остаётся, но доступа она не даёт.
+    """
+    users = read_registry(bucket).get("users", {})
+    coach = users.get((users.get(sub) or {}).get("coach_sub"))
+    return _coach_card(coach) if _is_active_coach(coach) else None
+
+
+def _is_coached_by(athlete, coach_sub):
+    return bool(athlete and athlete.get("status") == "approved"
+                and athlete.get("coach_sub") == coach_sub)
+
+
+def coach_can_access(bucket, coach_sub, athlete_sub):
+    """Единственная проверка права тренера на данные спортсмена.
+
+    Реестр читается мимо кэша: спортсмен, снявший тренера, закрывает доступ
+    сразу, а не через REGISTRY_TTL_SEC на соседнем инстансе.
+    """
+    users = _fresh_registry(bucket).get("users", {})
+    return (_is_active_coach(users.get(coach_sub))
+            and _is_coached_by(users.get(athlete_sub), coach_sub))
+
+
+def list_athletes_of(bucket, coach_sub):
+    """Спортсмены тренера: [{sub, name}]. None — пользователь не тренер."""
+    users = _fresh_registry(bucket).get("users", {})
+    if not _is_active_coach(users.get(coach_sub)):
+        return None
+    athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен"}
+                for u in users.values() if _is_coached_by(u, coach_sub)]
+    return sorted(athletes, key=lambda a: a["name"].lower())
+
+
+def active_coach_sub(bucket, sub):
+    """sub действующего тренера пользователя или None — по свежему реестру."""
+    users = _fresh_registry(bucket).get("users", {})
+    coach_sub = (users.get(sub) or {}).get("coach_sub")
+    return coach_sub if _is_active_coach(users.get(coach_sub)) else None
+
+
+# ── Чат тренера и спортсмена (#44) ───────────────────────────────────────────
+# Ветка одна на пару и лежит в namespace спортсмена: при смене тренера она
+# остаётся в хранилище, но новому тренеру не видна — у него своя.
+# Сообщение — отдельный неизменяемый объект. Ничего не перезаписывается, и
+# одновременная отправка с двух сторон ничего не теряет: общего файла,
+# который читали бы и писали обратно, просто нет.
+
+CHAT_TEXT_MAX = 2000
+CHAT_PAGE = 50
+CHAT_ROLES = ("athlete", "coach")
+# Идентификатор = время + автор + случайный хвост. Время впереди, поэтому
+# сортировка имён объектов и есть порядок сообщений; автор в имени позволяет
+# считать непрочитанные одним list_blobs, не скачивая сообщения.
+_CHAT_ID_RE = re.compile(r"^\d{8}T\d{12}-(athlete|coach)-[0-9a-f]{8}$")
+
+
+class ChatError(ValueError):
+    """Сообщение или курсор не приняты. Код причины — str(исключения)."""
+
+
+def _check_chat_cursor(cursor):
+    if cursor and not _CHAT_ID_RE.match(str(cursor)):      # пустой курсор = его нет
+        raise ChatError("bad_cursor")
+
+
+def _chat_ids(bucket, athlete, coach):
+    prefix = p_chat_prefix(athlete, coach)
+    ids = (blob.name[len(prefix):-len(".json")]
+           for blob in bucket.list_blobs(prefix=prefix) if blob.name.endswith(".json"))
+    return sorted(i for i in ids if _CHAT_ID_RE.match(i))
+
+
+def append_chat_message(bucket, athlete, coach, from_sub, role, text):
+    """Пишет сообщение новым объектом и возвращает его."""
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        raise ChatError("empty_message")
+    if len(text) > CHAT_TEXT_MAX:
+        raise ChatError("message_too_long")
+    now = datetime.utcnow()
+    # Время в идентификаторе строго растёт внутри ветки: иначе при грубых или
+    # разошедшихся часах инстансов новое сообщение встало бы раньше уже
+    # показанного, и опрос по курсору after его бы пропустил.
+    ids = _chat_ids(bucket, athlete, coach)
+    if ids:
+        last = datetime.strptime(ids[-1][:21], "%Y%m%dT%H%M%S%f")
+        if now <= last:
+            now = last + timedelta(microseconds=1)
+    msg_id = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}"
+    message = {"id": msg_id, "ts": now.isoformat() + "Z",
+               "from_sub": from_sub, "from_role": role, "text": text}
+    bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
+        json.dumps(message, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return message
+
+
+def read_chat(bucket, athlete, coach, after=None, before=None, limit=CHAT_PAGE):
+    """Страница ветки: последние `limit` сообщений из подходящих под курсоры.
+
+    after — только новее этого id (опрос), before — только старше («показать
+    более ранние»). has_more — за пределами страницы остались более ранние.
+    """
+    _check_chat_cursor(after)
+    _check_chat_cursor(before)
+    ids = _chat_ids(bucket, athlete, coach)
+    if after:
+        ids = [i for i in ids if i > after]
+    if before:
+        ids = [i for i in ids if i < before]
+    page = ids[-limit:]
+
+    def load(msg_id):
+        return json.loads(bucket.blob(p_chat_msg(athlete, coach, msg_id)).download_as_text())
+
+    # Объект на сообщение — это запрос на сообщение; читаем параллельно.
+    if len(page) > 1:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            messages = list(pool.map(load, page))
+    else:
+        messages = [load(i) for i in page]
+    return {"messages": messages, "has_more": len(ids) > len(page)}
+
+
+def _chat_last_read(bucket, athlete, coach, role):
+    blob = bucket.blob(p_chat_read(athlete, coach, role))
+    if not blob.exists():
+        return ""
+    return json.loads(blob.download_as_text()).get("last_read_id") or ""
+
+
+def chat_unread(bucket, athlete, coach, reader_role):
+    """Сколько сообщений собеседника читатель ещё не видел."""
+    last = _chat_last_read(bucket, athlete, coach, reader_role)
+    mine = f"-{reader_role}-"
+    return sum(1 for i in _chat_ids(bucket, athlete, coach) if i > last and mine not in i)
+
+
+def mark_chat_read(bucket, athlete, coach, reader_role, last_id=None):
+    """Сдвигает отметку «прочитано до» и возвращает её. Только вперёд и не
+    дальше последнего существующего сообщения — «прочитать» ещё не
+    написанное нельзя. Отметка — lifecycle-метаданные, не бизнес-запись."""
+    _check_chat_cursor(last_id)
+    ids = _chat_ids(bucket, athlete, coach)
+    current = _chat_last_read(bucket, athlete, coach, reader_role)
+    if not ids:
+        return current
+    target = min(last_id, ids[-1]) if last_id else ids[-1]
+    if target <= current:
+        return current
+    bucket.blob(p_chat_read(athlete, coach, reader_role)).upload_from_string(
+        json.dumps({"last_read_id": target,
+                    "updated_at": datetime.utcnow().isoformat() + "Z"},
+                   ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return target
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────

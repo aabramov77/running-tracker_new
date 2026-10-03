@@ -17,6 +17,8 @@ let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
 let currentRole = null;
 let currentUser = {};
+let currentIsCoach = false; // #44: назначен ли пользователь тренером
+let myCoach = null;         // #44: выбранный тренер {sub, name} или null
 let PLANS = [];             // все планы пользователя (#25)
 let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
 let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
@@ -51,6 +53,8 @@ function showAccessScreen(id) {
 function applyRole(role) {
   const isAdmin = role === 'admin';
   document.getElementById('nav-users-btn').style.display = isAdmin ? '' : 'none';
+  // #44: вкладка «Тренер» нужна и тренеру, и спортсмену, у которого тренер есть
+  document.getElementById('nav-coach-btn').style.display = (currentIsCoach || myCoach) ? '' : 'none';
   document.getElementById('llm-settings-card').style.display = isAdmin ? '' : 'none';
   document.getElementById('llm-settings-note').style.display = isAdmin ? 'none' : '';
 }
@@ -65,9 +69,12 @@ async function checkAccessAndInit() {
     if (me.status === 'approved') {
       currentRole = me.role;
       currentUser = { name: me.name, email: me.email };
+      currentIsCoach = !!me.is_coach;
+      myCoach = me.coach || null;
       hideAccessScreens();
       document.getElementById('signout-btn').style.display = 'inline-flex';
       applyRole(me.role);
+      refreshCoachBadge();
       initApp();
     } else if (me.status === 'pending') {
       showAccessScreen('pending-screen');
@@ -727,8 +734,6 @@ function renderComplianceNote() {
 
 function renderPlan() {
   const body = document.getElementById('plan-body');
-  const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
-  const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
 
   // ── Режим конструктора (может быть 0 строк) ──
   if (planEditMode) {
@@ -766,9 +771,16 @@ function renderPlan() {
   }
 
   // ── Обычный просмотр ──
-  const cw = getCurrentWeek();
-  const weeks = compliantWeeks();
   renderComplianceNote();
+  body.innerHTML = planViewRowsHtml(PLAN, compliantWeeks(), getCurrentWeek());
+}
+
+// Строки таблицы плана с план/фактом. Зависит только от аргументов, поэтому
+// ею же рисуется план спортсмена на экране тренера (#44).
+//   plan  — недели плана; weeks — недели compliance или null; cw — индекс текущей.
+function planViewRowsHtml(plan, weeks, cw) {
+  const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
+  const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
 
   // Факт показываем только для прошедших и текущей недели: у будущих его
   // быть не может, и прочерки там читались бы как пропуски.
@@ -814,7 +826,7 @@ function renderPlan() {
   const dayCell = (val, day, fact) =>
     `<td style="font-size:12px${day==='wed'?';color:var(--c-blue)':''}${day==='sat'?';font-weight:500':''}">${escapeHtml(val ?? '')}${fact}</td>`;
 
-  body.innerHTML = PLAN.map((r,i) => {
+  return plan.map((r,i) => {
     const week = weeks ? weeks[i] : null;
     const past = i <= cw;
     const byField = {};
@@ -1231,22 +1243,31 @@ function renderLog() {
   }
   const planName = {};
   PLANS.forEach(p => { planName[p.id] = planLabel(p); });
+  el.innerHTML = activeRuns.map(r => runItemHtml(r, {
+    onclick: `showRunDetail(${r.id})`,
+    weekLabel: getWeekLabel(r.date),
+    planName: runScope === 'all' ? planName[r.plan_id] : '',
+    deletable: true,
+  })).join('');
+}
+
+// Строка журнала. Зависит только от аргументов — ею же рисуется журнал
+// спортсмена на экране тренера (#44), там без кнопки удаления.
+function runItemHtml(r, { onclick, weekLabel = '', planName = '', deletable = false }) {
   const typeLabels = {easy:'Лёгкий',interval:'Интервалы',tempo:'Темповый',long:'Длительный',race:'Соревнование',recovery:'Восстановление'};
   const feelEmoji = {great:'😊',good:'🙂',ok:'😐',hard:'😓',bad:'😔'};
-  el.innerHTML = activeRuns.map(r => {
-    const pace = parsePace(r.pace);
-    const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
-    return `<div class="run-item" onclick="showRunDetail(${r.id})" style="cursor:pointer">
-      <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${getWeekLabel(r.date)}</span></div>
+  const pace = parsePace(r.pace);
+  const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
+  return `<div class="run-item" onclick="${onclick}" style="cursor:pointer">
+      <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${weekLabel}</span></div>
       <div class="run-info">
         <div class="run-title">${typeLabels[r.type] || escapeHtml(r.type)} — ${escapeHtml(String(r.dist))} км ${feelEmoji[r.feel]||''}</div>
         <div class="run-meta">${r.pace?`<span class="${pc}">${escapeHtml(r.pace)}/км</span> · `:''}${r.time?escapeHtml(r.time)+' · ':''}${r.hr?r.hr+' уд/мин':''}</div>
-        ${runScope==='all'&&r.plan_id&&planName[r.plan_id]?`<div class="run-meta" style="opacity:.65">📋 ${escapeHtml(planName[r.plan_id])}</div>`:''}
+        ${planName?`<div class="run-meta" style="opacity:.65">📋 ${escapeHtml(planName)}</div>`:''}
         ${r.notes?`<div class="run-note">${escapeHtml(r.notes)}</div>`:''}
       </div>
-      <button class="btn-sm" onclick="event.stopPropagation();deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
+      ${deletable?`<button class="btn-sm" onclick="event.stopPropagation();deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>`:''}
     </div>`;
-  }).join('');
 }
 
 // ── RACES ─────────────────────────────────────────────────────────────────────
@@ -1350,6 +1371,15 @@ function renderRaces() {
 function showRunDetail(id) {
   const run = runs.find(r => r.id === id);
   if (!run) return;
+  openRunDetail(run, {
+    detailsUrl: `${API_URL}runs/${id}/details`,
+    onDelete: () => { closeRunDetail(); deleteRun(id); },
+  });
+}
+
+// Карточка пробежки. Источник задаётся снаружи: своя пробежка или пробежка
+// спортсмена на экране тренера (#44) — там без onDelete, кнопка скрыта.
+function openRunDetail(run, { detailsUrl, onDelete = null }) {
   const typeLabels = {easy:'Лёгкий бег',interval:'Интервалы',tempo:'Темповый',
                       long:'Длительный',race:'Соревнование',recovery:'Восстановительный'};
   const feelLabels = {great:'Отлично 😊',good:'Хорошо 🙂',ok:'Нормально 😐',
@@ -1374,7 +1404,9 @@ function showRunDetail(id) {
          <span style="text-align:right">${val}</span>
        </div>`)
     .join('');
-  document.getElementById('rd-delete-btn').onclick = () => { closeRunDetail(); deleteRun(id); };
+  const deleteBtn = document.getElementById('rd-delete-btn');
+  deleteBtn.style.display = onDelete ? '' : 'none';
+  deleteBtn.onclick = onDelete;
   document.getElementById('run-detail-overlay').classList.add('active');
 
   // Графики из FIT-данных (если есть)
@@ -1382,7 +1414,7 @@ function showRunDetail(id) {
   const chartsEl = document.getElementById('rd-charts');
   if (run.details_available) {
     chartsEl.innerHTML = '<div class="empty" style="padding:1rem">⏳ Загружаю детали тренировки…</div>';
-    loadRunDetailCharts(id);
+    loadRunDetailCharts(detailsUrl);
   } else {
     chartsEl.innerHTML = '';
   }
@@ -1394,10 +1426,10 @@ function destroyDetailCharts() {
   detailCharts = [];
 }
 
-async function loadRunDetailCharts(id) {
+async function loadRunDetailCharts(detailsUrl) {
   const chartsEl = document.getElementById('rd-charts');
   try {
-    const res = await fetch(`${API_URL}runs/${id}/details`, { headers: authHeaders() });
+    const res = await fetch(detailsUrl, { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const details = await res.json();
@@ -1530,6 +1562,31 @@ function weekBuckets(runsList, n) {
   return km.map(v => +v.toFixed(1));
 }
 
+// Конфигурация недельного графика «план и факт». planned/exact могут быть
+// null — тогда рисуется один факт. Используется и на экране тренера (#44).
+function weekChartConfig(n, planned, exact, actual) {
+  const datasets = [];
+  if (planned) datasets.push({
+    label: 'план',
+    data: planned,
+    // Неточные недели — бледнее: там нижняя граница, а не плановый объём.
+    backgroundColor: exact.map(e => e ? 'rgba(24,95,165,0.40)' : 'rgba(24,95,165,0.15)'),
+    borderRadius: 4,
+  });
+  datasets.push({label:'факт', data: actual, backgroundColor:'#1D9E75', borderRadius:4});
+  return {
+    type:'bar',
+    data:{labels:Array.from({length:n},(_,i)=>`Нед ${i+1}`),datasets},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:datasets.length>1,labels:{boxWidth:12,font:{size:11}}},
+        tooltip:{callbacks:{label:ctx=>{
+          const v=ctx.parsed.y;
+          if(ctx.dataset.label!=='план') return `факт ${v} км`;
+          return exact && exact[ctx.dataIndex] ? `план ${v} км` : `план не меньше ${v} км`;
+        }}}},
+      scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}};
+}
+
 let wChart=null,pChart=null;
 function renderCharts() {
   const activeRuns = scopedRuns();
@@ -1543,28 +1600,9 @@ function renderCharts() {
   const exact = weeks ? weeks.map(w => w.complete) : null;
   const sortedRuns = [...activeRuns].sort((a,b) => a.date.localeCompare(b.date));
 
-  const datasets = [];
-  if (planned) datasets.push({
-    label: 'план',
-    data: planned,
-    // Неточные недели — бледнее: там нижняя граница, а не плановый объём.
-    backgroundColor: exact.map(e => e ? 'rgba(24,95,165,0.40)' : 'rgba(24,95,165,0.15)'),
-    borderRadius: 4,
-  });
-  datasets.push({label:'факт', data: actual, backgroundColor:'#1D9E75', borderRadius:4});
-
   if(wChart)wChart.destroy();
-  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),{
-    type:'bar',
-    data:{labels:Array.from({length:n},(_,i)=>`Нед ${i+1}`),datasets},
-    options:{responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:datasets.length>1,labels:{boxWidth:12,font:{size:11}}},
-        tooltip:{callbacks:{label:ctx=>{
-          const v=ctx.parsed.y;
-          if(ctx.dataset.label!=='план') return `факт ${v} км`;
-          return exact && exact[ctx.dataIndex] ? `план ${v} км` : `план не меньше ${v} км`;
-        }}}},
-      scales:{x:{ticks:{font:{size:10},autoSkip:false,maxRotation:45}},y:{beginAtZero:true}}}});
+  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),
+                   weekChartConfig(n, planned, exact, actual));
   if(pChart)pChart.destroy();
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>r.date.slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
 }
@@ -1991,8 +2029,10 @@ function showTab(name,btn){
   if(name==='stats')renderCharts();
   if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
   if(name==='races')renderRaces();
-  if(name==='profile'){loadProfile(); loadLlmSettings();}   // #32; loadLlmSettings сам пропустит не-админа
+  if(name==='profile'){loadProfile(); loadLlmSettings(); loadMyCoach();}   // #32; loadLlmSettings сам пропустит не-админа
   if(name==='users')loadUsers();
+  // #44: открытого спортсмена перерисовываем (график в скрытой вкладке не имел размера)
+  if(name==='coach')openCoachTab();
 }
 
 // ── Admin: управление пользователями ──
@@ -2023,15 +2063,517 @@ function renderUsers(users) {
       ? `<button class="btn-sm" onclick="userAction('approve','${sub}')" style="color:var(--c-accent)">Одобрить</button>` : '';
     const rejectBtn = (u.status !== 'rejected' && u.role !== 'admin')
       ? `<button class="btn-sm" onclick="userAction('reject','${sub}')" style="color:var(--c-danger)">Отклонить</button>` : '';
+    // Тренером (#44) назначаем только одобренных: остальных всё равно нельзя выбрать.
+    const coachBtn = u.status !== 'approved' ? ''
+      : u.is_coach
+        ? `<button class="btn-sm" onclick="coachAction('${sub}',false)">Снять тренера</button>`
+        : `<button class="btn-sm" onclick="coachAction('${sub}',true)">Сделать тренером</button>`;
     return `<div class="run-item">
       <div class="run-info">
-        <div class="run-title">${escapeHtml(u.name || u.email || u.sub)} ${u.role === 'admin' ? '<span class="badge badge-load">админ</span>' : ''}</div>
+        <div class="run-title">${escapeHtml(u.name || u.email || u.sub)} ${u.role === 'admin' ? '<span class="badge badge-load">админ</span>' : ''} ${u.is_coach ? '<span class="badge badge-dev">тренер</span>' : ''}</div>
         <div class="run-meta">${escapeHtml(u.email || '')} · ${statusLabel[u.status] || escapeHtml(u.status)}</div>
       </div>
-      <div style="display:flex;gap:6px;flex-shrink:0">${approveBtn}${rejectBtn}</div>
+      <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">${coachBtn}${approveBtn}${rejectBtn}</div>
     </div>`;
   }).join('');
 }
+
+async function coachAction(sub, isCoach) {
+  if (!isCoach && !confirm('Снять роль тренера? Его спортсмены останутся без тренера, и доступ к их данным закроется.')) return;
+  try {
+    const res = await fetch(API_URL + 'admin/users/coach', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ sub, is_coach: isCoach }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { alert('Ошибка: ' + res.status); return; }
+    loadUsers();
+  } catch (e) { alert('Ошибка: ' + e.message); }
+}
+
+// ── Мой тренер (#44): выбор тренера в Профиле ──
+let _coachMsgTimer = null;
+function flashCoachMsg(text, ok, sticky) {
+  const msg = document.getElementById('coach-msg');
+  clearTimeout(_coachMsgTimer);
+  msg.style.display = text ? 'inline' : 'none';
+  msg.style.color = ok ? 'var(--text-muted)' : 'var(--c-danger)';
+  msg.textContent = text;
+  if (sticky || !text) return;   // пустой список сам не наполнится — подпись не прячем
+  _coachMsgTimer = setTimeout(() => { msg.style.display = 'none'; }, ok ? 2500 : 6000);
+}
+
+function renderMyCoach(coaches) {
+  const select = document.getElementById('coach-select');
+  // Действующий тренер остаётся в списке, даже если его там почему-то нет:
+  // иначе «Сохранить» молча сняло бы его.
+  const options = coaches.slice();
+  if (myCoach && !options.some(c => c.sub === myCoach.sub)) options.unshift(myCoach);
+  select.innerHTML = '<option value="">— без тренера —</option>' + options.map(c =>
+    `<option value="${escapeHtml(c.sub)}">${escapeHtml(c.name)}</option>`).join('');
+  select.value = myCoach ? myCoach.sub : '';
+  const empty = !options.length;
+  select.disabled = empty;
+  document.getElementById('coach-save-btn').disabled = empty;
+  flashCoachMsg(empty ? 'Тренеров пока нет — их назначает администратор.' : '', true, true);
+}
+
+async function loadMyCoach() {
+  try {
+    const [coachesRes, mineRes] = await Promise.all([
+      fetch(API_URL + 'coaches', { headers: authHeaders() }),
+      fetch(API_URL + 'my/coach', { headers: authHeaders() }),
+    ]);
+    if (coachesRes.status === 401 || mineRes.status === 401) { handleAuthError(); return; }
+    if (!coachesRes.ok || !mineRes.ok) throw new Error('HTTP ' + (coachesRes.ok ? mineRes.status : coachesRes.status));
+    myCoach = (await mineRes.json()).coach || null;
+    renderMyCoach((await coachesRes.json()).coaches || []);
+  } catch (e) {
+    flashCoachMsg('⚠ Не удалось загрузить список тренеров', false);
+  }
+}
+
+async function saveMyCoach() {
+  const select = document.getElementById('coach-select');
+  const coachSub = select.value || null;
+  const current = myCoach ? myCoach.sub : null;
+  if (coachSub === current) { flashCoachMsg('Без изменений', true); return; }
+  if (current && !confirm(coachSub
+      ? 'Сменить тренера? Прежний потеряет доступ к вашим данным.'
+      : 'Отказаться от тренера? Он потеряет доступ к вашим данным.')) {
+    select.value = current;
+    return;
+  }
+  try {
+    const res = await fetch(API_URL + 'my/coach', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ coach_sub: coachSub }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    const data = await res.json();
+    if (!res.ok) {
+      flashCoachMsg(data.error === 'not_a_coach'
+        ? '⚠ Этот пользователь больше не тренер' : '⚠ Не удалось сохранить', false);
+      loadMyCoach();
+      return;
+    }
+    myCoach = data.coach || null;
+    select.value = myCoach ? myCoach.sub : '';
+    applyRole(currentRole);      // вкладка «Тренер» появляется и пропадает вместе с тренером
+    refreshCoachBadge();
+    flashCoachMsg(myCoach ? '✓ Тренер выбран' : '✓ Тренер снят', true);
+  } catch (e) {
+    flashCoachMsg('⚠ ' + e.message, false);
+  }
+}
+
+// ── Тренер (#44): спортсмены и их данные, только просмотр ──
+// Всё состояние экрана живёт здесь. Свои runs / PLAN / COMPLIANCE и
+// localStorage не трогаем: чужие пробежки не должны попасть ни в кэш, ни в
+// офлайн-синхронизацию.
+const COACH = { athletes: [], athlete: null, plans: [], planId: null,
+                weeks: [], compliance: null, runs: [], runScope: 'plan', error: '' };
+let coachChart = null;
+
+function coachUrl(tail) {
+  return `${API_URL}coach/athletes/${encodeURIComponent(COACH.athlete.sub)}/${tail}`;
+}
+
+// GET данных открытого спортсмена. 403 значит, что он снял тренера, пока
+// экран был открыт: возвращаемся к списку, ошибка помечается accessLost.
+async function coachGet(tail) {
+  const res = await fetch(coachUrl(tail), { headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (res.status === 403) throw coachAccessLost();
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// Запросы идут пачкой, и 403 приходит на каждый — сообщаем один раз.
+function coachAccessLost() {
+  if (COACH.athlete) {
+    closeCoachAthlete();
+    alert('Спортсмен закрыл доступ к своим данным.');
+  }
+  const err = new Error('forbidden');
+  err.accessLost = true;
+  return err;
+}
+
+async function loadCoachAthletes() {
+  const el = document.getElementById('coach-athletes-list');
+  el.innerHTML = '<div class="empty">Загрузка…</div>';
+  try {
+    const res = await fetch(API_URL + 'coach/athletes', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (res.status === 403) { el.innerHTML = '<div class="empty">Вы не назначены тренером</div>'; return; }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    COACH.athletes = (await res.json()).athletes || [];
+    el.innerHTML = COACH.athletes.length
+      // В onclick идёт индекс, а не sub: так в разметку не попадает чужая строка.
+      ? COACH.athletes.map((a, i) => `<div class="run-item" onclick="openCoachAthlete(${i})" style="cursor:pointer">
+          <div class="run-info"><div class="run-title">${escapeHtml(a.name)} ${a.unread ? `<span class="nav-badge" title="Непрочитанные сообщения">${a.unread}</span>` : ''}</div></div>
+          <span class="btn-sm" style="flex-shrink:0">Открыть →</span>
+        </div>`).join('')
+      : '<div class="empty">Пока никто не выбрал вас тренером. Спортсмен делает это в своём Профиле.</div>';
+  } catch (e) {
+    el.innerHTML = '<div class="empty">Ошибка загрузки</div>';
+  }
+}
+
+// Что показывать на вкладке: спортсмену — диалог с тренером, тренеру — список
+// или открытого спортсмена. Пользователь может быть и тем и другим сразу.
+function syncCoachTab() {
+  const viewing = !!COACH.athlete;
+  document.getElementById('mychat-card').style.display = (myCoach && !viewing) ? '' : 'none';
+  if (myCoach) document.getElementById('mychat-title').textContent = `Диалог с тренером — ${myCoach.name}`;
+  document.getElementById('coach-list-card').style.display = (currentIsCoach && !viewing) ? '' : 'none';
+  document.getElementById('coach-athlete-view').style.display = viewing ? '' : 'none';
+}
+
+function openCoachTab() {
+  syncCoachTab();
+  if (COACH.athlete) {
+    renderCoachAthlete();     // график в скрытой вкладке не имел размера
+    chatPull('coach');
+    return;
+  }
+  if (currentIsCoach) loadCoachAthletes();
+  if (myCoach) chatOpen('my');
+}
+
+async function openCoachAthlete(index) {
+  const athlete = COACH.athletes[index];
+  if (!athlete) return;
+  Object.assign(COACH, { athlete, plans: [], planId: null, weeks: [], compliance: null,
+                         runs: [], runScope: 'plan', error: 'Загрузка…' });
+  chatClose('my');
+  syncCoachTab();
+  document.getElementById('coach-athlete-name').textContent = athlete.name;
+  renderCoachAthlete();
+  chatOpen('coach');
+  try {
+    const [index_, runs_] = await Promise.all([coachGet('plans'), coachGet('runs')]);
+    if (COACH.athlete !== athlete) return;          // успели открыть другого
+    COACH.plans = (index_.plans || []).filter(p => !p.archived);
+    COACH.runs = (Array.isArray(runs_) ? runs_ : [])
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const active = COACH.plans.find(p => p.id === index_.active_plan_id) || COACH.plans[0];
+    if (active) { await selectCoachPlan(active.id); return; }
+    COACH.error = '';
+  } catch (e) {
+    if (e.accessLost) return;
+    COACH.error = '⚠ Не удалось загрузить данные спортсмена';
+  }
+  renderCoachAthlete();
+}
+
+async function selectCoachPlan(planId) {
+  const athlete = COACH.athlete;
+  Object.assign(COACH, { planId, weeks: [], compliance: null, error: 'Загрузка…' });
+  renderCoachAthlete();
+  try {
+    const [weeks, compliance] = await Promise.all([
+      coachGet(`plans/${encodeURIComponent(planId)}/weeks`),
+      coachGet(`plans/${encodeURIComponent(planId)}/compliance`),
+    ]);
+    // Пока грузилось, могли открыть другого спортсмена или другой план.
+    if (COACH.athlete !== athlete || COACH.planId !== planId) return;
+    COACH.weeks = Array.isArray(weeks) ? weeks : [];
+    COACH.compliance = compliance;
+    COACH.error = '';
+  } catch (e) {
+    if (e.accessLost) return;
+    COACH.error = '⚠ Не удалось загрузить план';
+  }
+  renderCoachAthlete();
+}
+
+function closeCoachAthlete() {
+  chatClose('coach');
+  COACH.athlete = null;
+  if (coachChart) { coachChart.destroy(); coachChart = null; }
+  openCoachTab();
+}
+
+function setCoachRunScope(scope) {
+  COACH.runScope = scope;
+  renderCoachAthlete();
+}
+
+function coachSummaryText() {
+  if (COACH.error) return COACH.error;
+  const plan = COACH.plans.find(p => p.id === COACH.planId);
+  if (!plan) return COACH.plans.length ? '' : 'У спортсмена пока нет плана.';
+  const parts = [];
+  if (plan.race_date) parts.push(`старт ${plan.race_date}`);
+  if (plan.target_time) parts.push(`цель ${plan.target_time}`);
+  const c = COACH.compliance;
+  if (c && c.weeks.length) {
+    parts.push(`неделя ${c.current_week + 1} из ${c.weeks.length}`);
+    if (c.dated) {
+      // Только завершённые недели: в текущей и будущих «нет пробежки» ещё не пропуск.
+      const done = c.weeks.slice(0, c.current_week);
+      const km = c.weeks.slice(0, c.current_week + 1).reduce((s, w) => s + w.actual_km, 0);
+      parts.push(`набегано ${km1(km)} км`);
+      const missed = done.reduce((s, w) => s + w.missed, 0);
+      if (done.length) parts.push(`пропущено тренировок: ${missed}`);
+    } else {
+      parts.push('у плана нет дат — сравнение с фактом недоступно');
+    }
+  }
+  return parts.join(' · ');
+}
+
+function renderCoachAthlete() {
+  if (!COACH.athlete) return;
+  const sel = document.getElementById('coach-plan-select');
+  sel.innerHTML = COACH.plans.map(p =>
+    `<option value="${escapeHtml(p.id)}"${p.id === COACH.planId ? ' selected' : ''}>${escapeHtml(planLabel(p))}</option>`).join('');
+  sel.style.display = COACH.plans.length > 1 ? '' : 'none';
+  document.getElementById('coach-summary').textContent = coachSummaryText();
+
+  // Таблица плана — тем же кодом, что и своя, но без кнопок правки.
+  const c = COACH.compliance;
+  const dated = !!(c && c.dated);
+  document.getElementById('coach-plan-head').innerHTML =
+    `<tr><th>Нед</th><th>Даты</th><th>Акцент</th><th title="План и факт за неделю, км">км</th>${
+      PLAN_DAYS.map(([, label]) => `<th>${label}</th>`).join('')}</tr>`;
+  document.getElementById('coach-plan-body').innerHTML = COACH.weeks.length
+    ? planViewRowsHtml(COACH.weeks, dated ? c.weeks : null, c ? c.current_week : -1)
+    : `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:2rem"><div class="empty" style="padding:0">План пуст</div></td></tr>`;
+
+  if (coachChart) { coachChart.destroy(); coachChart = null; }
+  document.getElementById('coach-chart-card').style.display = dated ? '' : 'none';
+  if (dated) {
+    coachChart = new Chart(document.getElementById('coachWeekChart').getContext('2d'),
+      weekChartConfig(c.weeks.length, c.weeks.map(w => w.planned_km || null),
+                      c.weeks.map(w => w.complete), c.weeks.map(w => w.actual_km)));
+  }
+
+  const byPlan = COACH.runScope === 'plan' && COACH.planId;
+  document.getElementById('coach-scope-plan').classList.toggle('active', COACH.runScope === 'plan');
+  document.getElementById('coach-scope-all').classList.toggle('active', COACH.runScope === 'all');
+  const list = byPlan ? COACH.runs.filter(r => r.plan_id === COACH.planId) : COACH.runs;
+  const planName = {};
+  COACH.plans.forEach(p => { planName[p.id] = planLabel(p); });
+  document.getElementById('coach-run-log').innerHTML = list.length
+    ? list.map(r => runItemHtml(r, {
+        onclick: `showCoachRunDetail(${Number(r.id)})`,
+        planName: byPlan ? '' : planName[r.plan_id],
+      })).join('')
+    : `<div class="empty">${byPlan ? 'В этом плане пробежек пока нет' : 'Пробежек пока нет'}</div>`;
+}
+
+function showCoachRunDetail(id) {
+  const run = COACH.runs.find(r => r.id === id);
+  if (!run || !COACH.athlete) return;
+  openRunDetail(run, { detailsUrl: coachUrl(`runs/${id}/details`) });
+}
+
+// ── Чат тренера и спортсмена (#44) ──
+// Два экземпляра одного и того же: 'my' — спортсмен со своим тренером,
+// 'coach' — тренер с открытым спортсменом. Различаются адресом и ролью.
+// Push-уведомлений нет: открытый диалог опрашивается, бейдж — тоже.
+const CHAT_POLL_MS = 30000;
+const COACH_BADGE_MS = 120000;
+const CHATS = {
+  my:    { prefix: 'mychat',    role: 'athlete', url: () => API_URL + 'my/coach/chat' },
+  coach: { prefix: 'coachchat', role: 'coach',   url: () => coachUrl('chat') },
+};
+// session растёт при каждом открытии и закрытии: ответ, пришедший в уже
+// другой диалог (сменили спортсмена, ушли со вкладки), отбрасывается.
+Object.values(CHATS).forEach(chat =>
+  Object.assign(chat, { messages: [], hasMore: false, open: false, session: 0 }));
+
+function chatEl(chat, name) { return document.getElementById(`${chat.prefix}-${name}`); }
+
+function chatNote(chat, text) {
+  const el = chatEl(chat, 'msg');
+  el.style.display = text ? 'inline' : 'none';
+  el.style.color = 'var(--c-danger)';
+  el.textContent = text;
+  if (text) setTimeout(() => { if (el.textContent === text) el.style.display = 'none'; }, 6000);
+}
+
+// Запрос к ветке. Ошибки, которые уже показаны пользователю, помечены handled.
+async function chatFetch(key, { suffix = '', query = '', method = 'GET', body = null } = {}) {
+  const chat = CHATS[key];
+  const res = await fetch(chat.url() + suffix + query, {
+    method,
+    headers: authHeaders(body ? { 'Content-Type': 'application/json' } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { handleAuthError(); throw Object.assign(new Error('Unauthorized'), { handled: true }); }
+  if (res.status === 403 && key === 'coach') throw Object.assign(coachAccessLost(), { handled: true });
+  if (res.status === 409 && key === 'my') {
+    // Тренера больше нет: сняли роль или отказались в другой вкладке.
+    myCoach = null;
+    chatClose('my');
+    applyRole(currentRole);
+    syncCoachTab();
+    alert('Тренер больше не назначен — диалог закрыт.');
+    throw Object.assign(new Error('no_coach'), { handled: true });
+  }
+  const data = await res.json();
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.error });
+  return data;
+}
+
+function chatTime(ts) {
+  const d = new Date(ts);
+  return isNaN(d) ? '' : d.toLocaleString('ru-RU',
+    { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function chatRender(chat, scrollToEnd) {
+  const log = chatEl(chat, 'log');
+  chatEl(chat, 'earlier').style.display = chat.hasMore ? '' : 'none';
+  log.innerHTML = chat.messages.length
+    ? chat.messages.map(m =>
+        `<div class="chat-msg${m.from_role === chat.role ? ' mine' : ''}">${escapeHtml(m.text)}<span class="chat-time">${chatTime(m.ts)}</span></div>`).join('')
+    : '<div class="empty">Сообщений пока нет</div>';
+  if (scrollToEnd) log.scrollTop = log.scrollHeight;
+}
+
+async function chatOpen(key) {
+  const chat = CHATS[key];
+  const session = ++chat.session;
+  Object.assign(chat, { open: true, messages: [], hasMore: false });
+  chatEl(chat, 'log').innerHTML = '<div class="empty">Загрузка…</div>';
+  chatEl(chat, 'earlier').style.display = 'none';
+  try {
+    const page = await chatFetch(key);
+    if (chat.session !== session) return;
+    chat.messages = page.messages || [];
+    chat.hasMore = !!page.has_more;
+    chatRender(chat, true);
+    chatMarkRead(key);
+  } catch (e) {
+    if (!e.handled && chat.session === session)
+      chatEl(chat, 'log').innerHTML = '<div class="empty">Не удалось загрузить диалог</div>';
+  }
+}
+
+function chatClose(key) {
+  const chat = CHATS[key];
+  chat.open = false;
+  chat.session++;
+}
+
+// Добирает сообщения новее последнего показанного — и по таймеру, и после
+// отправки своего: между ними могло прийти чужое, порядок задаёт сервер.
+async function chatPull(key) {
+  const chat = CHATS[key];
+  if (!chat.open) return;
+  const session = chat.session;
+  const last = chat.messages.length ? chat.messages[chat.messages.length - 1].id : '';
+  let page;
+  try {
+    page = await chatFetch(key, { query: last ? `?after=${encodeURIComponent(last)}` : '' });
+  } catch (e) { return; }
+  if (chat.session !== session) return;
+  const known = new Set(chat.messages.map(m => m.id));
+  const fresh = (page.messages || []).filter(m => !known.has(m.id));
+  if (!fresh.length) return;
+  const log = chatEl(chat, 'log');
+  const wasAtEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  if (!last) chat.hasMore = !!page.has_more;
+  chat.messages = chat.messages.concat(fresh);
+  // К новому прокручиваем, только если человек и так был внизу или написал сам.
+  chatRender(chat, wasAtEnd || fresh.some(m => m.from_role === chat.role));
+  if (fresh.some(m => m.from_role !== chat.role)) chatMarkRead(key);
+}
+
+async function chatEarlier(key) {
+  const chat = CHATS[key];
+  if (!chat.open || !chat.messages.length) return;
+  const session = chat.session;
+  try {
+    const page = await chatFetch(key, { query: `?before=${encodeURIComponent(chat.messages[0].id)}` });
+    if (chat.session !== session) return;
+    const log = chatEl(chat, 'log');
+    const fromBottom = log.scrollHeight - log.scrollTop;
+    chat.messages = (page.messages || []).concat(chat.messages);
+    chat.hasMore = !!page.has_more;
+    chatRender(chat, false);
+    log.scrollTop = log.scrollHeight - fromBottom;     // остаёмся на том же сообщении
+  } catch (e) {
+    if (!e.handled) chatNote(chat, '⚠ Не удалось загрузить');
+  }
+}
+
+async function chatSend(key) {
+  const chat = CHATS[key];
+  const input = chatEl(chat, 'input');
+  const text = input.value.trim();
+  if (!text || !chat.open) return;
+  const button = chatEl(chat, 'send');
+  const session = chat.session;
+  button.disabled = true;
+  try {
+    await chatFetch(key, { method: 'POST', body: { text } });
+    if (chat.session !== session) return;
+    input.value = '';
+    await chatPull(key);
+  } catch (e) {
+    if (!e.handled) chatNote(chat, e.code === 'message_too_long'
+      ? '⚠ Сообщение длиннее 2000 символов' : '⚠ Не удалось отправить, попробуйте ещё раз');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function chatKey(event, key) {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); chatSend(key); }
+}
+
+async function chatMarkRead(key) {
+  const chat = CHATS[key];
+  const last = chat.messages[chat.messages.length - 1];
+  if (!last) return;
+  try {
+    await chatFetch(key, { suffix: '/read', method: 'POST', body: { last_id: last.id } });
+    refreshCoachBadge();
+  } catch (e) {}
+}
+
+function coachTabVisible() {
+  return !document.hidden && document.getElementById('tab-coach').classList.contains('active');
+}
+
+// Число непрочитанных на кнопке «Тренер»: у спортсмена — от тренера,
+// у тренера — сумма по спортсменам.
+async function refreshCoachBadge() {
+  const badge = document.getElementById('nav-coach-badge');
+  if (!idToken || (!myCoach && !currentIsCoach)) { badge.style.display = 'none'; return; }
+  let total = 0;
+  try {
+    if (myCoach) {
+      const res = await fetch(API_URL + 'my/coach', { headers: authHeaders() });
+      if (res.ok) total += (await res.json()).unread || 0;
+    }
+    if (currentIsCoach) {
+      const res = await fetch(API_URL + 'coach/athletes', { headers: authHeaders() });
+      if (res.ok) total += ((await res.json()).athletes || []).reduce((s, a) => s + (a.unread || 0), 0);
+    }
+  } catch (e) { return; }
+  badge.textContent = total > 99 ? '99+' : total;
+  badge.style.display = total ? '' : 'none';
+}
+
+setInterval(() => {
+  if (!coachTabVisible()) return;
+  Object.keys(CHATS).forEach(key => chatPull(key));
+}, CHAT_POLL_MS);
+setInterval(() => { if (!document.hidden) refreshCoachBadge(); }, COACH_BADGE_MS);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  refreshCoachBadge();
+  if (coachTabVisible()) Object.keys(CHATS).forEach(key => chatPull(key));
+});
 
 async function userAction(action, sub) {
   if (action === 'reject' && !confirm('Отклонить доступ этому пользователю?')) return;

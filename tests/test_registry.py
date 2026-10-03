@@ -182,3 +182,201 @@ def test_lazy_migration_noop_for_fresh_user(storage_module, fake_bucket):
     index = storage_module.read_plans_index(fake_bucket, "u-fresh")
     assert index["plans"] == [] and index["active_plan_id"] is None
     assert storage_module.get_active_plan(fake_bucket, "u-fresh") is None
+
+
+# ── Тренер (#44): роль и связь «спортсмен → тренер» ──────────────────────────
+
+COACH_TOKEN = {"sub": "c1", "email": "coach@example.com", "name": "Пётр Тренер"}
+
+
+def _approved(storage_module, fake_bucket, token):
+    storage_module.resolve_user(fake_bucket, token)
+    storage_module.set_user_status(fake_bucket, token["sub"], "approved", "admin-sub")
+
+
+def _coach_and_athlete(storage_module, fake_bucket):
+    _approved(storage_module, fake_bucket, COACH_TOKEN)
+    _approved(storage_module, fake_bucket, USER_TOKEN)
+    storage_module.set_coach_flag(fake_bucket, "c1", True, "admin-sub")
+
+
+def _events(fake_bucket):
+    return [b.name for b in fake_bucket.list_blobs(prefix="users/events/")]
+
+
+def test_admin_grants_and_revokes_coach(storage_module, fake_bucket):
+    _approved(storage_module, fake_bucket, COACH_TOKEN)
+    assert storage_module.list_coaches(fake_bucket) == []
+
+    rec = storage_module.set_coach_flag(fake_bucket, "c1", True, "admin-sub")
+    assert rec["is_coach"] is True
+    assert [c["sub"] for c in storage_module.list_coaches(fake_bucket)] == ["c1"]
+
+    storage_module.set_coach_flag(fake_bucket, "c1", False, "admin-sub")
+    assert storage_module.list_coaches(fake_bucket) == []
+    events = _events(fake_bucket)
+    assert any("c1-coach_grant" in n for n in events)
+    assert any("c1-coach_revoke" in n for n in events)
+
+
+def test_coach_flag_unknown_user(storage_module, fake_bucket):
+    assert storage_module.set_coach_flag(fake_bucket, "ghost", True, "admin-sub") is None
+
+
+def test_coach_card_shows_name_but_not_email(storage_module, fake_bucket):
+    """Список тренеров видят все одобренные пользователи — почту не раздаём."""
+    _coach_and_athlete(storage_module, fake_bucket)
+    (card,) = storage_module.list_coaches(fake_bucket)
+    assert card == {"sub": "c1", "name": "Пётр Тренер"}
+
+
+def test_unapproved_coach_cannot_be_selected(storage_module, fake_bucket):
+    storage_module.resolve_user(fake_bucket, COACH_TOKEN)          # pending
+    storage_module.set_coach_flag(fake_bucket, "c1", True, "admin-sub")
+    _approved(storage_module, fake_bucket, USER_TOKEN)
+
+    assert storage_module.list_coaches(fake_bucket) == []
+    with pytest.raises(storage_module.CoachLinkError, match="not_a_coach"):
+        storage_module.set_user_coach(fake_bucket, "u1", "c1")
+
+
+def test_athlete_selects_and_clears_coach(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    assert storage_module.current_coach(fake_bucket, "u1") is None
+
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert storage_module.current_coach(fake_bucket, "u1") == {"sub": "c1", "name": "Пётр Тренер"}
+
+    storage_module.set_user_coach(fake_bucket, "u1", None)
+    assert storage_module.current_coach(fake_bucket, "u1") is None
+
+    events = _events(fake_bucket)
+    assert any("u1-coach_select" in n for n in events)
+    assert any("u1-coach_clear" in n for n in events)
+
+
+def test_coach_select_event_records_who_was_chosen(storage_module, fake_bucket):
+    import json
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    (name,) = [n for n in _events(fake_bucket) if "u1-coach_select" in n]
+    event = json.loads(fake_bucket.blob(name).download_as_text())
+    assert event["actor"] == "u1"
+    assert event["details"] == {"coach_sub": "c1", "previous": None}
+
+
+@pytest.mark.parametrize("target,reason", [
+    ("u1", "cannot_coach_yourself"),
+    ("admin-sub", "not_a_coach"),      # одобрен, но тренером не назначен
+    ("ghost", "not_a_coach"),
+])
+def test_coach_selection_is_validated(storage_module, fake_bucket, target, reason):
+    storage_module.resolve_user(fake_bucket, ADMIN_TOKEN)
+    _coach_and_athlete(storage_module, fake_bucket)
+    with pytest.raises(storage_module.CoachLinkError, match=reason):
+        storage_module.set_user_coach(fake_bucket, "u1", target)
+    assert storage_module.current_coach(fake_bucket, "u1") is None
+
+
+def test_selecting_the_same_coach_again_is_a_noop(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert len([n for n in _events(fake_bucket) if "coach_select" in n]) == 1
+
+
+def test_revoking_coach_releases_athletes_for_good(storage_module, fake_bucket):
+    """Снятие роли отвязывает спортсменов, и повторное назначение доступ
+    не возвращает: выбрать тренера снова может только сам спортсмен."""
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+
+    storage_module.set_coach_flag(fake_bucket, "c1", False, "admin-sub")
+    assert storage_module.read_registry(fake_bucket)["users"]["u1"]["coach_sub"] is None
+    assert any("u1-coach_clear" in n for n in _events(fake_bucket))
+
+    storage_module.set_coach_flag(fake_bucket, "c1", True, "admin-sub")
+    assert storage_module.current_coach(fake_bucket, "u1") is None
+
+
+def test_rejected_coach_stops_being_anyones_coach(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_user_status(fake_bucket, "c1", "rejected", "admin-sub")
+    assert storage_module.current_coach(fake_bucket, "u1") is None
+    assert storage_module.list_coaches(fake_bucket) == []
+
+
+def test_coach_writes_do_not_clobber_another_instances_change(storage_module, fake_bucket):
+    """Кэш реестра у каждого инстанса свой. Запись по устаревшей копии
+    затёрла бы пользователя, зарегистрированного на соседнем инстансе."""
+    import json
+    _coach_and_athlete(storage_module, fake_bucket)      # кэш этого «инстанса» прогрет
+
+    blob = fake_bucket.blob("users/registry.json")
+    remote = json.loads(blob.download_as_text())
+    remote["users"]["u9"] = {"sub": "u9", "status": "pending", "role": "user"}
+    blob.upload_from_string(json.dumps(remote))          # «соседний инстанс»
+
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_coach_flag(fake_bucket, "c1", True, "admin-sub")
+
+    stored = json.loads(blob.download_as_text())["users"]
+    assert "u9" in stored
+    assert stored["u1"]["coach_sub"] == "c1"
+
+
+# ── Тренер (#44): право на данные спортсмена ─────────────────────────────────
+
+def test_coach_can_access_only_the_athlete_who_chose_them(storage_module, fake_bucket):
+    storage_module.resolve_user(fake_bucket, ADMIN_TOKEN)
+    _coach_and_athlete(storage_module, fake_bucket)
+    can = storage_module.coach_can_access
+
+    assert not can(fake_bucket, "c1", "u1")               # ещё не выбрал
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert can(fake_bucket, "c1", "u1")
+
+    assert not can(fake_bucket, "u1", "c1")               # связь не симметрична
+    assert not can(fake_bucket, "admin-sub", "u1")        # админ — не тренер
+    assert not can(fake_bucket, "c1", "admin-sub")
+    assert not can(fake_bucket, "c1", "ghost")
+    assert not can(fake_bucket, "ghost", "u1")
+    assert not can(fake_bucket, "c1", "c1")
+
+
+@pytest.mark.parametrize("who", ["c1", "u1"])
+def test_rejecting_either_side_closes_access(storage_module, fake_bucket, who):
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_user_status(fake_bucket, who, "rejected", "admin-sub")
+    assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
+
+
+def test_stale_instance_does_not_bring_a_dropped_coach_back(storage_module, fake_bucket):
+    """Спортсмен снял тренера на одном инстансе, а на другом — с ещё прогретым
+    кэшем — админ одобрил новичка. Запись реестра из кэша вернула бы связь."""
+    import json
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")           # кэш помнит связь
+
+    blob = fake_bucket.blob("users/registry.json")
+    remote = json.loads(blob.download_as_text())
+    remote["users"]["u1"]["coach_sub"] = None
+    blob.upload_from_string(json.dumps(remote))                      # «соседний инстанс»
+    storage_module._registry_cache["ts"] = __import__("time").time() # кэш всё ещё «свежий»
+
+    storage_module.resolve_user(fake_bucket, {"sub": "u7", "email": "n@example.com", "name": "N"})
+    storage_module.set_user_status(fake_bucket, "u7", "approved", "admin-sub")
+
+    assert json.loads(blob.download_as_text())["users"]["u1"]["coach_sub"] is None
+    assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
+
+
+def test_list_athletes_of(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    assert storage_module.list_athletes_of(fake_bucket, "u1") is None      # не тренер
+    assert storage_module.list_athletes_of(fake_bucket, "c1") == []
+
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert storage_module.list_athletes_of(fake_bucket, "c1") == [{"sub": "u1", "name": "Runner"}]
