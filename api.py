@@ -16,10 +16,12 @@ from config import (ADMIN_DAILY_ADVISE_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_ADVISE_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
-from storage import (CoachLinkError, LLMRefused, LLMTruncated,
+from storage import (ChatError, CoachLinkError, LLMRefused, LLMTruncated,
                      RegistrationClosed, _fmt_duration, _fmt_pace,
-                     archive_plan, attach_fit_details_to_run,
+                     active_coach_sub, append_chat_message, archive_plan,
+                     attach_fit_details_to_run,
                      build_llm_context, build_plan_compliance, call_llm,
+                     chat_unread, mark_chat_read, read_chat,
                      clean_athlete_profile, clean_effort, cleanup_old_tmp,
                      coach_can_access, compute_athlete_derived, create_plan,
                      current_coach, find_plan, get_active_plan,
@@ -122,7 +124,9 @@ def h_coaches(c):
 
 
 def h_my_coach_get(c):
-    return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
+    coach = current_coach(c.bucket, c.sub)
+    unread = chat_unread(c.bucket, c.sub, coach["sub"], "athlete") if coach else 0
+    return jresp({"coach": coach, "unread": unread}, 200)
 
 
 def h_my_coach_post(c):
@@ -160,6 +164,8 @@ def h_coach_athletes(c):
     athletes = list_athletes_of(c.bucket, c.sub)
     if athletes is None:
         raise Forbidden()
+    for athlete in athletes:
+        athlete["unread"] = chat_unread(c.bucket, athlete["sub"], c.sub, "coach")
     return jresp({"athletes": athletes}, 200)
 
 
@@ -190,6 +196,65 @@ def h_coach_run_details(c):
     # Скрытую спортсменом пробежку тренер не видит ни в журнале, ни по id.
     return _run_details_response(c.bucket, _coached_athlete(c), int(c.args[1]),
                                  include_deleted=False)
+
+
+# ── Тренер (#44): чат ─────────────────────────────────────────────────────────
+# Ветку задаёт пара (спортсмен, тренер). Обе стороны ходят в одни и те же
+# функции; отличается только то, как пара получается из запроса.
+
+class NoCoach(Exception):
+    """У спортсмена нет действующего тренера → 409 (см. handle_request)."""
+
+
+def _my_thread(c):
+    """Ветка спортсмена с его нынешним тренером."""
+    coach = active_coach_sub(c.bucket, c.sub)
+    if not coach:
+        raise NoCoach()
+    return c.sub, coach, "athlete"
+
+
+def _athlete_thread(c):
+    """Ветка тренера со спортсменом из пути."""
+    return _coached_athlete(c), c.sub, "coach"
+
+
+def _chat_get(c, thread):
+    athlete, coach, _ = thread
+    args = c.request.args
+    try:
+        page = read_chat(c.bucket, athlete, coach,
+                         after=args.get("after"), before=args.get("before"))
+    except ChatError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp(page, 200)
+
+
+def _chat_post(c, thread):
+    athlete, coach, role = thread
+    try:
+        message = append_chat_message(c.bucket, athlete, coach, c.sub, role,
+                                      c.body().get("text"))
+    except ChatError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp({"message": message}, 201)
+
+
+def _chat_read(c, thread):
+    athlete, coach, role = thread
+    try:
+        mark_chat_read(c.bucket, athlete, coach, role, c.body().get("last_id"))
+    except ChatError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp({"unread": chat_unread(c.bucket, athlete, coach, role)}, 200)
+
+
+def h_my_chat_get(c):       return _chat_get(c, _my_thread(c))
+def h_my_chat_post(c):      return _chat_post(c, _my_thread(c))
+def h_my_chat_read(c):      return _chat_read(c, _my_thread(c))
+def h_coach_chat_get(c):    return _chat_get(c, _athlete_thread(c))
+def h_coach_chat_post(c):   return _chat_post(c, _athlete_thread(c))
+def h_coach_chat_read(c):   return _chat_read(c, _athlete_thread(c))
 
 
 def h_admin_migrate_legacy(c):
@@ -578,6 +643,9 @@ ROUTES = [
     ("GET",    r"^/coaches$",                    h_coaches,              False),
     ("GET",    r"^/my/coach$",                   h_my_coach_get,         False),
     ("POST",   r"^/my/coach$",                   h_my_coach_post,        False),
+    ("GET",    r"^/my/coach/chat$",              h_my_chat_get,          False),
+    ("POST",   r"^/my/coach/chat$",              h_my_chat_post,         False),
+    ("POST",   r"^/my/coach/chat/read$",         h_my_chat_read,         False),
 
     ("GET",    r"^/coach/athletes$",                                    h_coach_athletes,        False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans$",                     h_coach_plans,           False),
@@ -585,6 +653,9 @@ ROUTES = [
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/chat$",                      h_coach_chat_get,        False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/chat$",                      h_coach_chat_post,       False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/chat/read$",                 h_coach_chat_read,       False),
 
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
@@ -690,5 +761,7 @@ def handle_request(request):
         return handler(Ctx(request, bucket, user, match.groups()))
     except Forbidden:
         return jresp({"error": "forbidden"}, 403)
+    except NoCoach:
+        return jresp({"error": "no_coach"}, 409)
     except Exception as e:
         return jresp({"error": str(e)}, 500)

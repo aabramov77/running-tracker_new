@@ -222,7 +222,7 @@ def test_inline_handlers_point_at_existing_functions():
     js = APP_JS.read_text(encoding="utf-8")
     defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
     called = set()
-    for handler in re.findall(r'\bon(?:click|change|input)="([^"]*)"', html):
+    for handler in re.findall(r'\bon(?:click|change|input|keydown)="([^"]*)"', html):
         called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
     missing = called - defined
     assert not missing, f"в app.js нет функций: {sorted(missing)}"

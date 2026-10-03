@@ -470,3 +470,29 @@ table.pb-table td:last-child { text-align: right; }
   max-height: 55vh;
   overflow-y: auto;
 }
+
+/* Chat with the coach (#44) */
+.chat-log {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 360px; overflow-y: auto; padding: 4px 2px 8px;
+}
+.chat-msg {
+  align-self: flex-start; max-width: 78%;
+  padding: 7px 10px; border-radius: 10px;
+  background: var(--bg-metric);
+  font-size: 13px; line-height: 1.4;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.chat-msg.mine { align-self: flex-end; background: var(--c-accent-light); color: var(--c-accent-dark); }
+.chat-time {
+  display: block; margin-top: 2px;
+  font-size: 10px; opacity: .55; font-family: 'DM Mono', monospace;
+}
+.chat-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 8px; }
+.chat-form .form-group { flex: 1; }
+.chat-form textarea { min-height: 44px; max-height: 160px; }
+.nav-badge {
+  display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px;
+  border-radius: 10px; background: var(--c-danger); color: #fff;
+  font-size: 10px; font-weight: 500; line-height: 16px; text-align: center;
+}

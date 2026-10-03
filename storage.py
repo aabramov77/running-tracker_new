@@ -10,7 +10,8 @@ import json
 import re
 import secrets as secrets_mod
 import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import httpx
 from fitparse import FitFile
@@ -50,6 +51,10 @@ def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
 def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
 def p_tmp_fit(sub, token):     return f"tmp/{sub}/{token}/activity.fit"
 def p_tmp_details(sub, token): return f"tmp/{sub}/{token}/details.json"
+# Чат с тренером (#44) — в namespace спортсмена, ветка на каждого тренера
+def p_chat_prefix(athlete, coach):      return f"{upfx(athlete)}coach_chat/{coach}/m/"
+def p_chat_msg(athlete, coach, msg_id): return f"{p_chat_prefix(athlete, coach)}{msg_id}.json"
+def p_chat_read(athlete, coach, role):  return f"{upfx(athlete)}coach_chat/{coach}/read/{role}.json"
 
 # Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
 LEGACY_RUNS = "runs.json"
@@ -1509,6 +1514,133 @@ def list_athletes_of(bucket, coach_sub):
     athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен"}
                 for u in users.values() if _is_coached_by(u, coach_sub)]
     return sorted(athletes, key=lambda a: a["name"].lower())
+
+
+def active_coach_sub(bucket, sub):
+    """sub действующего тренера пользователя или None — по свежему реестру."""
+    users = _fresh_registry(bucket).get("users", {})
+    coach_sub = (users.get(sub) or {}).get("coach_sub")
+    return coach_sub if _is_active_coach(users.get(coach_sub)) else None
+
+
+# ── Чат тренера и спортсмена (#44) ───────────────────────────────────────────
+# Ветка одна на пару и лежит в namespace спортсмена: при смене тренера она
+# остаётся в хранилище, но новому тренеру не видна — у него своя.
+# Сообщение — отдельный неизменяемый объект. Ничего не перезаписывается, и
+# одновременная отправка с двух сторон ничего не теряет: общего файла,
+# который читали бы и писали обратно, просто нет.
+
+CHAT_TEXT_MAX = 2000
+CHAT_PAGE = 50
+CHAT_ROLES = ("athlete", "coach")
+# Идентификатор = время + автор + случайный хвост. Время впереди, поэтому
+# сортировка имён объектов и есть порядок сообщений; автор в имени позволяет
+# считать непрочитанные одним list_blobs, не скачивая сообщения.
+_CHAT_ID_RE = re.compile(r"^\d{8}T\d{12}-(athlete|coach)-[0-9a-f]{8}$")
+
+
+class ChatError(ValueError):
+    """Сообщение или курсор не приняты. Код причины — str(исключения)."""
+
+
+def _check_chat_cursor(cursor):
+    if cursor and not _CHAT_ID_RE.match(str(cursor)):      # пустой курсор = его нет
+        raise ChatError("bad_cursor")
+
+
+def _chat_ids(bucket, athlete, coach):
+    prefix = p_chat_prefix(athlete, coach)
+    ids = (blob.name[len(prefix):-len(".json")]
+           for blob in bucket.list_blobs(prefix=prefix) if blob.name.endswith(".json"))
+    return sorted(i for i in ids if _CHAT_ID_RE.match(i))
+
+
+def append_chat_message(bucket, athlete, coach, from_sub, role, text):
+    """Пишет сообщение новым объектом и возвращает его."""
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        raise ChatError("empty_message")
+    if len(text) > CHAT_TEXT_MAX:
+        raise ChatError("message_too_long")
+    now = datetime.utcnow()
+    # Время в идентификаторе строго растёт внутри ветки: иначе при грубых или
+    # разошедшихся часах инстансов новое сообщение встало бы раньше уже
+    # показанного, и опрос по курсору after его бы пропустил.
+    ids = _chat_ids(bucket, athlete, coach)
+    if ids:
+        last = datetime.strptime(ids[-1][:21], "%Y%m%dT%H%M%S%f")
+        if now <= last:
+            now = last + timedelta(microseconds=1)
+    msg_id = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}"
+    message = {"id": msg_id, "ts": now.isoformat() + "Z",
+               "from_sub": from_sub, "from_role": role, "text": text}
+    bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
+        json.dumps(message, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return message
+
+
+def read_chat(bucket, athlete, coach, after=None, before=None, limit=CHAT_PAGE):
+    """Страница ветки: последние `limit` сообщений из подходящих под курсоры.
+
+    after — только новее этого id (опрос), before — только старше («показать
+    более ранние»). has_more — за пределами страницы остались более ранние.
+    """
+    _check_chat_cursor(after)
+    _check_chat_cursor(before)
+    ids = _chat_ids(bucket, athlete, coach)
+    if after:
+        ids = [i for i in ids if i > after]
+    if before:
+        ids = [i for i in ids if i < before]
+    page = ids[-limit:]
+
+    def load(msg_id):
+        return json.loads(bucket.blob(p_chat_msg(athlete, coach, msg_id)).download_as_text())
+
+    # Объект на сообщение — это запрос на сообщение; читаем параллельно.
+    if len(page) > 1:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            messages = list(pool.map(load, page))
+    else:
+        messages = [load(i) for i in page]
+    return {"messages": messages, "has_more": len(ids) > len(page)}
+
+
+def _chat_last_read(bucket, athlete, coach, role):
+    blob = bucket.blob(p_chat_read(athlete, coach, role))
+    if not blob.exists():
+        return ""
+    return json.loads(blob.download_as_text()).get("last_read_id") or ""
+
+
+def chat_unread(bucket, athlete, coach, reader_role):
+    """Сколько сообщений собеседника читатель ещё не видел."""
+    last = _chat_last_read(bucket, athlete, coach, reader_role)
+    mine = f"-{reader_role}-"
+    return sum(1 for i in _chat_ids(bucket, athlete, coach) if i > last and mine not in i)
+
+
+def mark_chat_read(bucket, athlete, coach, reader_role, last_id=None):
+    """Сдвигает отметку «прочитано до» и возвращает её. Только вперёд и не
+    дальше последнего существующего сообщения — «прочитать» ещё не
+    написанное нельзя. Отметка — lifecycle-метаданные, не бизнес-запись."""
+    _check_chat_cursor(last_id)
+    ids = _chat_ids(bucket, athlete, coach)
+    current = _chat_last_read(bucket, athlete, coach, reader_role)
+    if not ids:
+        return current
+    target = min(last_id, ids[-1]) if last_id else ids[-1]
+    if target <= current:
+        return current
+    bucket.blob(p_chat_read(athlete, coach, reader_role)).upload_from_string(
+        json.dumps({"last_read_id": target,
+                    "updated_at": datetime.utcnow().isoformat() + "Z"},
+                   ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return target
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────

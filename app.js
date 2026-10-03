@@ -53,7 +53,8 @@ function showAccessScreen(id) {
 function applyRole(role) {
   const isAdmin = role === 'admin';
   document.getElementById('nav-users-btn').style.display = isAdmin ? '' : 'none';
-  document.getElementById('nav-coach-btn').style.display = currentIsCoach ? '' : 'none';   // #44
+  // #44: вкладка «Тренер» нужна и тренеру, и спортсмену, у которого тренер есть
+  document.getElementById('nav-coach-btn').style.display = (currentIsCoach || myCoach) ? '' : 'none';
   document.getElementById('llm-settings-card').style.display = isAdmin ? '' : 'none';
   document.getElementById('llm-settings-note').style.display = isAdmin ? 'none' : '';
 }
@@ -73,6 +74,7 @@ async function checkAccessAndInit() {
       hideAccessScreens();
       document.getElementById('signout-btn').style.display = 'inline-flex';
       applyRole(me.role);
+      refreshCoachBadge();
       initApp();
     } else if (me.status === 'pending') {
       showAccessScreen('pending-screen');
@@ -2030,7 +2032,7 @@ function showTab(name,btn){
   if(name==='profile'){loadProfile(); loadLlmSettings(); loadMyCoach();}   // #32; loadLlmSettings сам пропустит не-админа
   if(name==='users')loadUsers();
   // #44: открытого спортсмена перерисовываем (график в скрытой вкладке не имел размера)
-  if(name==='coach'){ COACH.athlete ? renderCoachAthlete() : loadCoachAthletes(); }
+  if(name==='coach')openCoachTab();
 }
 
 // ── Admin: управление пользователями ──
@@ -2159,6 +2161,8 @@ async function saveMyCoach() {
     }
     myCoach = data.coach || null;
     select.value = myCoach ? myCoach.sub : '';
+    applyRole(currentRole);      // вкладка «Тренер» появляется и пропадает вместе с тренером
+    refreshCoachBadge();
     flashCoachMsg(myCoach ? '✓ Тренер выбран' : '✓ Тренер снят', true);
   } catch (e) {
     flashCoachMsg('⚠ ' + e.message, false);
@@ -2182,15 +2186,20 @@ function coachUrl(tail) {
 async function coachGet(tail) {
   const res = await fetch(coachUrl(tail), { headers: authHeaders() });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (res.status === 403) {
-    closeCoachAthlete();
-    alert('Спортсмен закрыл доступ к своим данным.');
-    const err = new Error('forbidden');
-    err.accessLost = true;
-    throw err;
-  }
+  if (res.status === 403) throw coachAccessLost();
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+// Запросы идут пачкой, и 403 приходит на каждый — сообщаем один раз.
+function coachAccessLost() {
+  if (COACH.athlete) {
+    closeCoachAthlete();
+    alert('Спортсмен закрыл доступ к своим данным.');
+  }
+  const err = new Error('forbidden');
+  err.accessLost = true;
+  return err;
 }
 
 async function loadCoachAthletes() {
@@ -2205,7 +2214,7 @@ async function loadCoachAthletes() {
     el.innerHTML = COACH.athletes.length
       // В onclick идёт индекс, а не sub: так в разметку не попадает чужая строка.
       ? COACH.athletes.map((a, i) => `<div class="run-item" onclick="openCoachAthlete(${i})" style="cursor:pointer">
-          <div class="run-info"><div class="run-title">${escapeHtml(a.name)}</div></div>
+          <div class="run-info"><div class="run-title">${escapeHtml(a.name)} ${a.unread ? `<span class="nav-badge" title="Непрочитанные сообщения">${a.unread}</span>` : ''}</div></div>
           <span class="btn-sm" style="flex-shrink:0">Открыть →</span>
         </div>`).join('')
       : '<div class="empty">Пока никто не выбрал вас тренером. Спортсмен делает это в своём Профиле.</div>';
@@ -2214,9 +2223,25 @@ async function loadCoachAthletes() {
   }
 }
 
-function showCoachView(open) {
-  document.getElementById('coach-list-card').style.display = open ? 'none' : '';
-  document.getElementById('coach-athlete-view').style.display = open ? '' : 'none';
+// Что показывать на вкладке: спортсмену — диалог с тренером, тренеру — список
+// или открытого спортсмена. Пользователь может быть и тем и другим сразу.
+function syncCoachTab() {
+  const viewing = !!COACH.athlete;
+  document.getElementById('mychat-card').style.display = (myCoach && !viewing) ? '' : 'none';
+  if (myCoach) document.getElementById('mychat-title').textContent = `Диалог с тренером — ${myCoach.name}`;
+  document.getElementById('coach-list-card').style.display = (currentIsCoach && !viewing) ? '' : 'none';
+  document.getElementById('coach-athlete-view').style.display = viewing ? '' : 'none';
+}
+
+function openCoachTab() {
+  syncCoachTab();
+  if (COACH.athlete) {
+    renderCoachAthlete();     // график в скрытой вкладке не имел размера
+    chatPull('coach');
+    return;
+  }
+  if (currentIsCoach) loadCoachAthletes();
+  if (myCoach) chatOpen('my');
 }
 
 async function openCoachAthlete(index) {
@@ -2224,9 +2249,11 @@ async function openCoachAthlete(index) {
   if (!athlete) return;
   Object.assign(COACH, { athlete, plans: [], planId: null, weeks: [], compliance: null,
                          runs: [], runScope: 'plan', error: 'Загрузка…' });
-  showCoachView(true);
+  chatClose('my');
+  syncCoachTab();
   document.getElementById('coach-athlete-name').textContent = athlete.name;
   renderCoachAthlete();
+  chatOpen('coach');
   try {
     const [index_, runs_] = await Promise.all([coachGet('plans'), coachGet('runs')]);
     if (COACH.athlete !== athlete) return;          // успели открыть другого
@@ -2265,10 +2292,10 @@ async function selectCoachPlan(planId) {
 }
 
 function closeCoachAthlete() {
+  chatClose('coach');
   COACH.athlete = null;
   if (coachChart) { coachChart.destroy(); coachChart = null; }
-  showCoachView(false);
-  loadCoachAthletes();
+  openCoachTab();
 }
 
 function setCoachRunScope(scope) {
@@ -2345,6 +2372,208 @@ function showCoachRunDetail(id) {
   if (!run || !COACH.athlete) return;
   openRunDetail(run, { detailsUrl: coachUrl(`runs/${id}/details`) });
 }
+
+// ── Чат тренера и спортсмена (#44) ──
+// Два экземпляра одного и того же: 'my' — спортсмен со своим тренером,
+// 'coach' — тренер с открытым спортсменом. Различаются адресом и ролью.
+// Push-уведомлений нет: открытый диалог опрашивается, бейдж — тоже.
+const CHAT_POLL_MS = 30000;
+const COACH_BADGE_MS = 120000;
+const CHATS = {
+  my:    { prefix: 'mychat',    role: 'athlete', url: () => API_URL + 'my/coach/chat' },
+  coach: { prefix: 'coachchat', role: 'coach',   url: () => coachUrl('chat') },
+};
+// session растёт при каждом открытии и закрытии: ответ, пришедший в уже
+// другой диалог (сменили спортсмена, ушли со вкладки), отбрасывается.
+Object.values(CHATS).forEach(chat =>
+  Object.assign(chat, { messages: [], hasMore: false, open: false, session: 0 }));
+
+function chatEl(chat, name) { return document.getElementById(`${chat.prefix}-${name}`); }
+
+function chatNote(chat, text) {
+  const el = chatEl(chat, 'msg');
+  el.style.display = text ? 'inline' : 'none';
+  el.style.color = 'var(--c-danger)';
+  el.textContent = text;
+  if (text) setTimeout(() => { if (el.textContent === text) el.style.display = 'none'; }, 6000);
+}
+
+// Запрос к ветке. Ошибки, которые уже показаны пользователю, помечены handled.
+async function chatFetch(key, { suffix = '', query = '', method = 'GET', body = null } = {}) {
+  const chat = CHATS[key];
+  const res = await fetch(chat.url() + suffix + query, {
+    method,
+    headers: authHeaders(body ? { 'Content-Type': 'application/json' } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { handleAuthError(); throw Object.assign(new Error('Unauthorized'), { handled: true }); }
+  if (res.status === 403 && key === 'coach') throw Object.assign(coachAccessLost(), { handled: true });
+  if (res.status === 409 && key === 'my') {
+    // Тренера больше нет: сняли роль или отказались в другой вкладке.
+    myCoach = null;
+    chatClose('my');
+    applyRole(currentRole);
+    syncCoachTab();
+    alert('Тренер больше не назначен — диалог закрыт.');
+    throw Object.assign(new Error('no_coach'), { handled: true });
+  }
+  const data = await res.json();
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.error });
+  return data;
+}
+
+function chatTime(ts) {
+  const d = new Date(ts);
+  return isNaN(d) ? '' : d.toLocaleString('ru-RU',
+    { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function chatRender(chat, scrollToEnd) {
+  const log = chatEl(chat, 'log');
+  chatEl(chat, 'earlier').style.display = chat.hasMore ? '' : 'none';
+  log.innerHTML = chat.messages.length
+    ? chat.messages.map(m =>
+        `<div class="chat-msg${m.from_role === chat.role ? ' mine' : ''}">${escapeHtml(m.text)}<span class="chat-time">${chatTime(m.ts)}</span></div>`).join('')
+    : '<div class="empty">Сообщений пока нет</div>';
+  if (scrollToEnd) log.scrollTop = log.scrollHeight;
+}
+
+async function chatOpen(key) {
+  const chat = CHATS[key];
+  const session = ++chat.session;
+  Object.assign(chat, { open: true, messages: [], hasMore: false });
+  chatEl(chat, 'log').innerHTML = '<div class="empty">Загрузка…</div>';
+  chatEl(chat, 'earlier').style.display = 'none';
+  try {
+    const page = await chatFetch(key);
+    if (chat.session !== session) return;
+    chat.messages = page.messages || [];
+    chat.hasMore = !!page.has_more;
+    chatRender(chat, true);
+    chatMarkRead(key);
+  } catch (e) {
+    if (!e.handled && chat.session === session)
+      chatEl(chat, 'log').innerHTML = '<div class="empty">Не удалось загрузить диалог</div>';
+  }
+}
+
+function chatClose(key) {
+  const chat = CHATS[key];
+  chat.open = false;
+  chat.session++;
+}
+
+// Добирает сообщения новее последнего показанного — и по таймеру, и после
+// отправки своего: между ними могло прийти чужое, порядок задаёт сервер.
+async function chatPull(key) {
+  const chat = CHATS[key];
+  if (!chat.open) return;
+  const session = chat.session;
+  const last = chat.messages.length ? chat.messages[chat.messages.length - 1].id : '';
+  let page;
+  try {
+    page = await chatFetch(key, { query: last ? `?after=${encodeURIComponent(last)}` : '' });
+  } catch (e) { return; }
+  if (chat.session !== session) return;
+  const known = new Set(chat.messages.map(m => m.id));
+  const fresh = (page.messages || []).filter(m => !known.has(m.id));
+  if (!fresh.length) return;
+  const log = chatEl(chat, 'log');
+  const wasAtEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  if (!last) chat.hasMore = !!page.has_more;
+  chat.messages = chat.messages.concat(fresh);
+  // К новому прокручиваем, только если человек и так был внизу или написал сам.
+  chatRender(chat, wasAtEnd || fresh.some(m => m.from_role === chat.role));
+  if (fresh.some(m => m.from_role !== chat.role)) chatMarkRead(key);
+}
+
+async function chatEarlier(key) {
+  const chat = CHATS[key];
+  if (!chat.open || !chat.messages.length) return;
+  const session = chat.session;
+  try {
+    const page = await chatFetch(key, { query: `?before=${encodeURIComponent(chat.messages[0].id)}` });
+    if (chat.session !== session) return;
+    const log = chatEl(chat, 'log');
+    const fromBottom = log.scrollHeight - log.scrollTop;
+    chat.messages = (page.messages || []).concat(chat.messages);
+    chat.hasMore = !!page.has_more;
+    chatRender(chat, false);
+    log.scrollTop = log.scrollHeight - fromBottom;     // остаёмся на том же сообщении
+  } catch (e) {
+    if (!e.handled) chatNote(chat, '⚠ Не удалось загрузить');
+  }
+}
+
+async function chatSend(key) {
+  const chat = CHATS[key];
+  const input = chatEl(chat, 'input');
+  const text = input.value.trim();
+  if (!text || !chat.open) return;
+  const button = chatEl(chat, 'send');
+  const session = chat.session;
+  button.disabled = true;
+  try {
+    await chatFetch(key, { method: 'POST', body: { text } });
+    if (chat.session !== session) return;
+    input.value = '';
+    await chatPull(key);
+  } catch (e) {
+    if (!e.handled) chatNote(chat, e.code === 'message_too_long'
+      ? '⚠ Сообщение длиннее 2000 символов' : '⚠ Не удалось отправить, попробуйте ещё раз');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function chatKey(event, key) {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); chatSend(key); }
+}
+
+async function chatMarkRead(key) {
+  const chat = CHATS[key];
+  const last = chat.messages[chat.messages.length - 1];
+  if (!last) return;
+  try {
+    await chatFetch(key, { suffix: '/read', method: 'POST', body: { last_id: last.id } });
+    refreshCoachBadge();
+  } catch (e) {}
+}
+
+function coachTabVisible() {
+  return !document.hidden && document.getElementById('tab-coach').classList.contains('active');
+}
+
+// Число непрочитанных на кнопке «Тренер»: у спортсмена — от тренера,
+// у тренера — сумма по спортсменам.
+async function refreshCoachBadge() {
+  const badge = document.getElementById('nav-coach-badge');
+  if (!idToken || (!myCoach && !currentIsCoach)) { badge.style.display = 'none'; return; }
+  let total = 0;
+  try {
+    if (myCoach) {
+      const res = await fetch(API_URL + 'my/coach', { headers: authHeaders() });
+      if (res.ok) total += (await res.json()).unread || 0;
+    }
+    if (currentIsCoach) {
+      const res = await fetch(API_URL + 'coach/athletes', { headers: authHeaders() });
+      if (res.ok) total += ((await res.json()).athletes || []).reduce((s, a) => s + (a.unread || 0), 0);
+    }
+  } catch (e) { return; }
+  badge.textContent = total > 99 ? '99+' : total;
+  badge.style.display = total ? '' : 'none';
+}
+
+setInterval(() => {
+  if (!coachTabVisible()) return;
+  Object.keys(CHATS).forEach(key => chatPull(key));
+}, CHAT_POLL_MS);
+setInterval(() => { if (!document.hidden) refreshCoachBadge(); }, COACH_BADGE_MS);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  refreshCoachBadge();
+  if (coachTabVisible()) Object.keys(CHATS).forEach(key => chatPull(key));
+});
 
 async function userAction(action, sub) {
   if (action === 'reject' && !confirm('Отклонить доступ этому пользователю?')) return;

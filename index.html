@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=22">
+<link rel="stylesheet" href="style.css?v=23">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -80,7 +80,7 @@
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
     <button class="nav-btn" onclick="showTab('profile',this)">👤 Профиль</button>
-    <button class="nav-btn" id="nav-coach-btn" onclick="showTab('coach',this)" style="display:none">⏱ Тренер</button>
+    <button class="nav-btn" id="nav-coach-btn" onclick="showTab('coach',this)" style="display:none">⏱ Тренер<span id="nav-coach-badge" class="nav-badge" style="display:none"></span></button>
     <button class="nav-btn" id="nav-users-btn" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
   </nav>
 
@@ -522,7 +522,22 @@
 
   <!-- ТРЕНЕР (#44): спортсмены тренера, только просмотр -->
   <div id="tab-coach" class="tab">
-    <div class="card" id="coach-list-card">
+    <!-- Спортсмену: диалог со своим тренером -->
+    <div class="card" id="mychat-card" style="display:none;margin-bottom:12px">
+      <div class="week-header">
+        <div class="card-title" id="mychat-title" style="margin:0">Диалог с тренером</div>
+        <button class="btn-sm" onclick="chatOpen('my')">↻ Обновить</button>
+      </div>
+      <button class="btn-sm" id="mychat-earlier" onclick="chatEarlier('my')" style="display:none;margin-bottom:8px">Показать более ранние</button>
+      <div class="chat-log" id="mychat-log"></div>
+      <div class="chat-form">
+        <div class="form-group"><textarea id="mychat-input" rows="2" maxlength="2000" placeholder="Сообщение тренеру (Ctrl+Enter — отправить)" onkeydown="chatKey(event,'my')"></textarea></div>
+        <button class="btn-primary" id="mychat-send" onclick="chatSend('my')">Отправить</button>
+      </div>
+      <span id="mychat-msg" class="save-msg"></span>
+    </div>
+
+    <div class="card" id="coach-list-card" style="display:none">
       <div class="week-header">
         <div class="card-title" style="margin:0">Мои спортсмены</div>
         <button class="btn-sm" onclick="loadCoachAthletes()">↻ Обновить</button>
@@ -547,6 +562,21 @@
             <tbody id="coach-plan-body"></tbody>
           </table>
         </div>
+      </div>
+
+      <!-- Тренеру: диалог с открытым спортсменом -->
+      <div class="card" style="margin-bottom:12px">
+        <div class="week-header">
+          <div class="card-title" style="margin:0">Диалог со спортсменом</div>
+          <button class="btn-sm" onclick="chatOpen('coach')">↻ Обновить</button>
+        </div>
+        <button class="btn-sm" id="coachchat-earlier" onclick="chatEarlier('coach')" style="display:none;margin-bottom:8px">Показать более ранние</button>
+        <div class="chat-log" id="coachchat-log"></div>
+        <div class="chat-form">
+          <div class="form-group"><textarea id="coachchat-input" rows="2" maxlength="2000" placeholder="Сообщение спортсмену (Ctrl+Enter — отправить)" onkeydown="chatKey(event,'coach')"></textarea></div>
+          <button class="btn-primary" id="coachchat-send" onclick="chatSend('coach')">Отправить</button>
+        </div>
+        <span id="coachchat-msg" class="save-msg"></span>
       </div>
 
       <div class="card" id="coach-chart-card" style="margin-bottom:12px">
@@ -639,6 +669,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=34"></script>
+<script src="app.js?v=35"></script>
 </body>
 </html>
