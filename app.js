@@ -17,6 +17,8 @@ let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
 let currentRole = null;
 let currentUser = {};
+let currentIsCoach = false; // #44: назначен ли пользователь тренером
+let myCoach = null;         // #44: выбранный тренер {sub, name} или null
 let PLANS = [];             // все планы пользователя (#25)
 let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
 let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
@@ -65,6 +67,8 @@ async function checkAccessAndInit() {
     if (me.status === 'approved') {
       currentRole = me.role;
       currentUser = { name: me.name, email: me.email };
+      currentIsCoach = !!me.is_coach;
+      myCoach = me.coach || null;
       hideAccessScreens();
       document.getElementById('signout-btn').style.display = 'inline-flex';
       applyRole(me.role);
@@ -1991,7 +1995,7 @@ function showTab(name,btn){
   if(name==='stats')renderCharts();
   if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
   if(name==='races')renderRaces();
-  if(name==='profile'){loadProfile(); loadLlmSettings();}   // #32; loadLlmSettings сам пропустит не-админа
+  if(name==='profile'){loadProfile(); loadLlmSettings(); loadMyCoach();}   // #32; loadLlmSettings сам пропустит не-админа
   if(name==='users')loadUsers();
 }
 
@@ -2023,14 +2027,108 @@ function renderUsers(users) {
       ? `<button class="btn-sm" onclick="userAction('approve','${sub}')" style="color:var(--c-accent)">Одобрить</button>` : '';
     const rejectBtn = (u.status !== 'rejected' && u.role !== 'admin')
       ? `<button class="btn-sm" onclick="userAction('reject','${sub}')" style="color:var(--c-danger)">Отклонить</button>` : '';
+    // Тренером (#44) назначаем только одобренных: остальных всё равно нельзя выбрать.
+    const coachBtn = u.status !== 'approved' ? ''
+      : u.is_coach
+        ? `<button class="btn-sm" onclick="coachAction('${sub}',false)">Снять тренера</button>`
+        : `<button class="btn-sm" onclick="coachAction('${sub}',true)">Сделать тренером</button>`;
     return `<div class="run-item">
       <div class="run-info">
-        <div class="run-title">${escapeHtml(u.name || u.email || u.sub)} ${u.role === 'admin' ? '<span class="badge badge-load">админ</span>' : ''}</div>
+        <div class="run-title">${escapeHtml(u.name || u.email || u.sub)} ${u.role === 'admin' ? '<span class="badge badge-load">админ</span>' : ''} ${u.is_coach ? '<span class="badge badge-dev">тренер</span>' : ''}</div>
         <div class="run-meta">${escapeHtml(u.email || '')} · ${statusLabel[u.status] || escapeHtml(u.status)}</div>
       </div>
-      <div style="display:flex;gap:6px;flex-shrink:0">${approveBtn}${rejectBtn}</div>
+      <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end">${coachBtn}${approveBtn}${rejectBtn}</div>
     </div>`;
   }).join('');
+}
+
+async function coachAction(sub, isCoach) {
+  if (!isCoach && !confirm('Снять роль тренера? Его спортсмены останутся без тренера, и доступ к их данным закроется.')) return;
+  try {
+    const res = await fetch(API_URL + 'admin/users/coach', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ sub, is_coach: isCoach }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) { alert('Ошибка: ' + res.status); return; }
+    loadUsers();
+  } catch (e) { alert('Ошибка: ' + e.message); }
+}
+
+// ── Мой тренер (#44): выбор тренера в Профиле ──
+let _coachMsgTimer = null;
+function flashCoachMsg(text, ok, sticky) {
+  const msg = document.getElementById('coach-msg');
+  clearTimeout(_coachMsgTimer);
+  msg.style.display = text ? 'inline' : 'none';
+  msg.style.color = ok ? 'var(--text-muted)' : 'var(--c-danger)';
+  msg.textContent = text;
+  if (sticky || !text) return;   // пустой список сам не наполнится — подпись не прячем
+  _coachMsgTimer = setTimeout(() => { msg.style.display = 'none'; }, ok ? 2500 : 6000);
+}
+
+function renderMyCoach(coaches) {
+  const select = document.getElementById('coach-select');
+  // Действующий тренер остаётся в списке, даже если его там почему-то нет:
+  // иначе «Сохранить» молча сняло бы его.
+  const options = coaches.slice();
+  if (myCoach && !options.some(c => c.sub === myCoach.sub)) options.unshift(myCoach);
+  select.innerHTML = '<option value="">— без тренера —</option>' + options.map(c =>
+    `<option value="${escapeHtml(c.sub)}">${escapeHtml(c.name)}</option>`).join('');
+  select.value = myCoach ? myCoach.sub : '';
+  const empty = !options.length;
+  select.disabled = empty;
+  document.getElementById('coach-save-btn').disabled = empty;
+  flashCoachMsg(empty ? 'Тренеров пока нет — их назначает администратор.' : '', true, true);
+}
+
+async function loadMyCoach() {
+  try {
+    const [coachesRes, mineRes] = await Promise.all([
+      fetch(API_URL + 'coaches', { headers: authHeaders() }),
+      fetch(API_URL + 'my/coach', { headers: authHeaders() }),
+    ]);
+    if (coachesRes.status === 401 || mineRes.status === 401) { handleAuthError(); return; }
+    if (!coachesRes.ok || !mineRes.ok) throw new Error('HTTP ' + (coachesRes.ok ? mineRes.status : coachesRes.status));
+    myCoach = (await mineRes.json()).coach || null;
+    renderMyCoach((await coachesRes.json()).coaches || []);
+  } catch (e) {
+    flashCoachMsg('⚠ Не удалось загрузить список тренеров', false);
+  }
+}
+
+async function saveMyCoach() {
+  const select = document.getElementById('coach-select');
+  const coachSub = select.value || null;
+  const current = myCoach ? myCoach.sub : null;
+  if (coachSub === current) { flashCoachMsg('Без изменений', true); return; }
+  if (current && !confirm(coachSub
+      ? 'Сменить тренера? Прежний потеряет доступ к вашим данным.'
+      : 'Отказаться от тренера? Он потеряет доступ к вашим данным.')) {
+    select.value = current;
+    return;
+  }
+  try {
+    const res = await fetch(API_URL + 'my/coach', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ coach_sub: coachSub }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    const data = await res.json();
+    if (!res.ok) {
+      flashCoachMsg(data.error === 'not_a_coach'
+        ? '⚠ Этот пользователь больше не тренер' : '⚠ Не удалось сохранить', false);
+      loadMyCoach();
+      return;
+    }
+    myCoach = data.coach || null;
+    select.value = myCoach ? myCoach.sub : '';
+    flashCoachMsg(myCoach ? '✓ Тренер выбран' : '✓ Тренер снят', true);
+  } catch (e) {
+    flashCoachMsg('⚠ ' + e.message, false);
+  }
 }
 
 async function userAction(action, sub) {

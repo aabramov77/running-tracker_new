@@ -63,6 +63,10 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/runs/12345/details",    "h_run_details"),
     ("GET",    "/admin/users",           "h_admin_users"),
     ("POST",   "/admin/users/approve",   "h_admin_user_status"),
+    ("POST",   "/admin/users/coach",     "h_admin_user_coach"),
+    ("GET",    "/coaches",               "h_coaches"),
+    ("GET",    "/my/coach",              "h_my_coach_get"),
+    ("POST",   "/my/coach",              "h_my_coach_post"),
     ("DELETE", "/races",                 "h_races_delete"),
     ("POST",   "/config/llm/test",       "h_llm_config_test"),
 ])
@@ -402,3 +406,99 @@ def test_advise_preview_includes_plan_compliance(api, patched_api, fake_bucket):
     text = json.loads(body)["prompt"]
     assert "Выполнение плана по неделям" in text
     assert "факт 17.5 км" in text
+
+
+# ── Тренер (#44, фаза 1): роль и выбор тренера ───────────────────────────────
+
+ADMIN = {"sub": "admin-sub", "email": "aabramov77@gmail.com"}
+
+
+def _register(api, sub):
+    """Первый запрос регистрирует пользователя, фикстура его одобряет."""
+    assert _status(api(FakeRequest("GET", "/me"), sub=sub, email=f"{sub}@example.com")) == 200
+
+
+def _make_coach(api, sub="c1"):
+    _register(api, sub)
+    body, code, _ = api(FakeRequest("POST", "/admin/users/coach",
+                                    {"sub": sub, "is_coach": True}), **ADMIN)
+    assert code == 200, body
+
+
+def test_only_admin_assigns_coaches(api):
+    _register(api, "c1")
+    request = FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": True})
+    assert _status(api(request)) == 403
+    assert json.loads(api(FakeRequest("GET", "/coaches"))[0])["coaches"] == []
+
+
+@pytest.mark.parametrize("payload", [
+    {"is_coach": True},                       # кого?
+    {"sub": "c1"},                            # назначить или снять?
+    {"sub": "c1", "is_coach": "yes"},         # строка — не булево: «no» тоже truthy
+])
+def test_coach_flag_payload_is_validated(api, payload):
+    _register(api, "c1")
+    assert _status(api(FakeRequest("POST", "/admin/users/coach", payload), **ADMIN)) == 400
+
+
+def test_coach_flag_for_unknown_user_is_404(api):
+    request = FakeRequest("POST", "/admin/users/coach", {"sub": "ghost", "is_coach": True})
+    assert _status(api(request, **ADMIN)) == 404
+
+
+def test_athlete_picks_a_coach_and_me_reports_it(api):
+    _make_coach(api)
+
+    coaches = json.loads(api(FakeRequest("GET", "/coaches"))[0])["coaches"]
+    assert coaches == [{"sub": "c1", "name": "Runner"}]
+
+    body, code, _ = api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))
+    assert code == 200 and json.loads(body)["coach"]["sub"] == "c1"
+
+    me = json.loads(api(FakeRequest("GET", "/me"))[0])
+    assert me["coach"] == {"sub": "c1", "name": "Runner"} and me["is_coach"] is False
+
+    coach_me = json.loads(api(FakeRequest("GET", "/me"), sub="c1", email="c1@example.com")[0])
+    assert coach_me["is_coach"] is True and coach_me["coach"] is None
+
+
+def test_coach_is_not_offered_to_themselves(api):
+    _make_coach(api)
+    body, _, _ = api(FakeRequest("GET", "/coaches"), sub="c1", email="c1@example.com")
+    assert json.loads(body)["coaches"] == []
+
+
+@pytest.mark.parametrize("coach_sub,reason", [
+    ("u2", "not_a_coach"),                    # обычный одобренный пользователь
+    ("u1", "cannot_coach_yourself"),
+    ("ghost", "not_a_coach"),
+])
+def test_cannot_pick_someone_who_is_not_a_coach(api, coach_sub, reason):
+    _register(api, "u2")
+    body, code, _ = api(FakeRequest("POST", "/my/coach", {"coach_sub": coach_sub}))
+    assert code == 400 and json.loads(body)["error"] == reason
+    assert json.loads(api(FakeRequest("GET", "/my/coach"))[0])["coach"] is None
+
+
+def test_my_coach_post_requires_explicit_field(api):
+    """Пустое тело не должно молча снимать тренера."""
+    _make_coach(api)
+    api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))
+    assert _status(api(FakeRequest("POST", "/my/coach", {}))) == 400
+    assert json.loads(api(FakeRequest("GET", "/my/coach"))[0])["coach"]["sub"] == "c1"
+
+
+def test_athlete_drops_the_coach(api):
+    _make_coach(api)
+    api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))
+    body, code, _ = api(FakeRequest("POST", "/my/coach", {"coach_sub": None}))
+    assert code == 200 and json.loads(body)["coach"] is None
+
+
+def test_revoked_coach_disappears_for_the_athlete(api):
+    _make_coach(api)
+    api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))
+    api(FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": False}), **ADMIN)
+    assert json.loads(api(FakeRequest("GET", "/my/coach"))[0])["coach"] is None
+    assert json.loads(api(FakeRequest("GET", "/coaches"))[0])["coaches"] == []

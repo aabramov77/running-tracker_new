@@ -448,6 +448,25 @@
       <p class="hint">Считаются автоматически по разделу «Старты».</p>
       <div id="profile-pb"><div class="empty">Загрузка…</div></div>
     </div>
+
+    <!-- Мой тренер (#44) -->
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-title">Мой тренер</div>
+      <p class="hint">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается, и менять ваши данные он не может.</p>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>Тренер</label>
+          <select id="coach-select" disabled>
+            <option value="">— без тренера —</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn-primary" id="coach-save-btn" onclick="saveMyCoach()" disabled>Сохранить</button>
+        <span id="coach-msg" class="save-msg"></span>
+      </div>
+    </div>
+
     <div class="card" id="llm-settings-note" style="display:none">
       <div class="card-title">Настройки ИИ</div>
       <p class="hint">Рекомендации ИИ настроены администратором приложения. Кнопка «Запросить рекомендации» в разделе «Корректировка» работает для всех пользователей.</p>
@@ -572,6 +591,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=32"></script>
+<script src="app.js?v=33"></script>
 </body>
 </html>

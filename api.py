@@ -16,23 +16,24 @@ from config import (ADMIN_DAILY_ADVISE_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_ADVISE_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
-from storage import (LLMRefused, LLMTruncated, RegistrationClosed,
-                     _fmt_duration, _fmt_pace, archive_plan,
-                     attach_fit_details_to_run, build_llm_context,
-                     build_plan_compliance, call_llm,
+from storage import (CoachLinkError, LLMRefused, LLMTruncated,
+                     RegistrationClosed, _fmt_duration, _fmt_pace,
+                     archive_plan, attach_fit_details_to_run,
+                     build_llm_context, build_plan_compliance, call_llm,
                      clean_athlete_profile, clean_effort, cleanup_old_tmp,
-                     compute_athlete_derived, create_plan, find_plan,
-                     get_active_plan, get_storage_client,
-                     increment_advice_usage, mask_key, migrate_legacy_to_user,
-                     parse_fit_file, parse_llm_json, read_advice_usage,
-                     read_athlete_history, read_athlete_profile,
-                     read_latest_advice, read_llm_config_full, read_plan_weeks,
-                     read_plans_index, read_races, read_registry,
-                     read_run_details, read_runs, resolve_user, save_plan_weeks,
-                     set_active_plan, set_user_status, update_plan_meta,
-                     write_advice_version, write_athlete_version,
-                     write_llm_config_version, write_parsed_fit_to_tmp,
-                     write_races, write_runs)
+                     compute_athlete_derived, create_plan, current_coach,
+                     find_plan, get_active_plan, get_storage_client,
+                     increment_advice_usage, list_coaches, mask_key,
+                     migrate_legacy_to_user, parse_fit_file, parse_llm_json,
+                     read_advice_usage, read_athlete_history,
+                     read_athlete_profile, read_latest_advice,
+                     read_llm_config_full, read_plan_weeks, read_plans_index,
+                     read_races, read_registry, read_run_details, read_runs,
+                     resolve_user, save_plan_weeks, set_active_plan,
+                     set_coach_flag, set_user_coach, set_user_status,
+                     update_plan_meta, write_advice_version,
+                     write_athlete_version, write_llm_config_version,
+                     write_parsed_fit_to_tmp, write_races, write_runs)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -98,6 +99,40 @@ def h_admin_user_status(c):
     if not rec:
         return jresp({"error": "user not found"}, 404)
     return jresp({"ok": True, "user": rec}, 200)
+
+
+def h_admin_user_coach(c):
+    body = c.body()
+    target = body.get("sub")
+    if not target or not isinstance(body.get("is_coach"), bool):
+        return jresp({"error": "Missing sub or is_coach"}, 400)
+    rec = set_coach_flag(c.bucket, target, body["is_coach"], c.sub)
+    if not rec:
+        return jresp({"error": "user not found"}, 404)
+    return jresp({"ok": True, "user": rec}, 200)
+
+
+# ── Тренер (#44): выбор тренера спортсменом ───────────────────────────────────
+
+def h_coaches(c):
+    # Себя в списке нет: выбрать себя тренером всё равно нельзя.
+    coaches = [coach for coach in list_coaches(c.bucket) if coach["sub"] != c.sub]
+    return jresp({"coaches": coaches}, 200)
+
+
+def h_my_coach_get(c):
+    return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
+
+
+def h_my_coach_post(c):
+    body = c.body()
+    if "coach_sub" not in body:
+        return jresp({"error": "Missing coach_sub"}, 400)
+    try:
+        set_user_coach(c.bucket, c.sub, body["coach_sub"])
+    except CoachLinkError as e:
+        return jresp({"error": str(e)}, 400)
+    return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
 
 
 def h_admin_migrate_legacy(c):
@@ -476,7 +511,12 @@ def h_runs_delete(c):
 ROUTES = [
     ("GET",    r"^/admin/users$",                h_admin_users,          True),
     ("POST",   r"^/admin/users/(approve|reject)$", h_admin_user_status,  True),
+    ("POST",   r"^/admin/users/coach$",          h_admin_user_coach,     True),
     ("POST",   r"^/admin/migrate-legacy$",       h_admin_migrate_legacy, True),
+
+    ("GET",    r"^/coaches$",                    h_coaches,              False),
+    ("GET",    r"^/my/coach$",                   h_my_coach_get,         False),
+    ("POST",   r"^/my/coach$",                   h_my_coach_post,        False),
 
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
@@ -556,7 +596,9 @@ def handle_request(request):
     # именно из него фронт узнаёт, что заявка ещё на рассмотрении.
     if path == "/me":
         return jresp({"status": user["status"], "role": user["role"],
-                      "email": user.get("email"), "name": user.get("name")}, 200)
+                      "email": user.get("email"), "name": user.get("name"),
+                      "is_coach": bool(user.get("is_coach")),
+                      "coach": current_coach(bucket, user["sub"])}, 200)
 
     # Не одобрен → 403 на всё остальное, ещё до разбора маршрута: иначе по коду
     # ответа можно было бы перебирать существующие пути.

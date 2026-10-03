@@ -1302,14 +1302,17 @@ def write_registry(bucket, registry):
     _registry_cache["ts"] = time.time()
 
 
-def append_user_event(bucket, sub, event, actor):
-    """Append-only аудит переходов (register/approve/reject)."""
+def append_user_event(bucket, sub, event, actor, details=None):
+    """Append-only аудит переходов (register/approve/reject, тренер #44)."""
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+    payload = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "sub": sub, "event": event, "actor": actor,
+    }
+    if details:
+        payload["details"] = details
     bucket.blob(f"users/events/{ts}-{sub}-{event}.json").upload_from_string(
-        json.dumps({
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "sub": sub, "event": event, "actor": actor,
-        }, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
 
@@ -1366,6 +1369,114 @@ def set_user_status(bucket, target_sub, status, actor_sub):
     write_registry(bucket, registry)
     append_user_event(bucket, target_sub, status, actor_sub)
     return rec
+
+
+# ── Тренер (#44): роль и связь «спортсмен → тренер» ──────────────────────────
+# Обе отметки живут в реестре, а не в профиле: реестр и так читается на каждый
+# запрос, а список спортсменов тренера получается фильтром, без обхода чужих
+# профилей. Это авторизационные метаданные; история — в users/events/.
+
+class CoachLinkError(ValueError):
+    """Этого тренера выбрать нельзя. Код причины — str(исключения)."""
+
+
+def _fresh_registry(bucket):
+    """Реестр мимо кэша. Кэш живёт REGISTRY_TTL_SEC на каждом инстансе, и
+    запись поверх устаревшей копии затёрла бы чужое изменение."""
+    data = _load_registry(bucket)
+    _registry_cache["data"] = data
+    _registry_cache["ts"] = time.time()
+    return data
+
+
+def _is_active_coach(rec):
+    return bool(rec and rec.get("is_coach") and rec.get("status") == "approved")
+
+
+def set_coach_flag(bucket, target_sub, is_coach, actor_sub):
+    """Админ назначает или снимает тренера. Возвращает запись или None.
+
+    Снятие заодно отвязывает его спортсменов: иначе у них в профиле остался бы
+    тренер, которого уже нет, а при повторном назначении доступ вернулся бы
+    без их ведома.
+    """
+    registry = _fresh_registry(bucket)
+    users = registry.get("users", {})
+    rec = users.get(target_sub)
+    if rec is None:
+        return None
+
+    now = datetime.utcnow().isoformat() + "Z"
+    rec["is_coach"] = bool(is_coach)
+    rec["updated_at"] = now
+    released = []
+    if not is_coach:
+        for user in users.values():
+            if user.get("coach_sub") == target_sub:
+                user["coach_sub"] = None
+                user["updated_at"] = now
+                released.append(user["sub"])
+
+    write_registry(bucket, registry)
+    append_user_event(bucket, target_sub,
+                      "coach_grant" if is_coach else "coach_revoke", actor_sub)
+    for sub in released:
+        append_user_event(bucket, sub, "coach_clear", actor_sub,
+                          {"previous": target_sub, "reason": "coach_revoked"})
+    return rec
+
+
+def set_user_coach(bucket, sub, coach_sub):
+    """Спортсмен выбирает тренера или отказывается от него (coach_sub=None).
+
+    Доступ к данным даёт именно эта запись, поэтому ставит её только сам
+    владелец данных. Поднимает CoachLinkError, если выбрать нельзя.
+    """
+    coach_sub = coach_sub or None
+    registry = _fresh_registry(bucket)
+    users = registry.get("users", {})
+    rec = users.get(sub)
+    if rec is None:
+        raise CoachLinkError("user_not_found")
+    if coach_sub:
+        if coach_sub == sub:
+            raise CoachLinkError("cannot_coach_yourself")
+        if not _is_active_coach(users.get(coach_sub)):
+            raise CoachLinkError("not_a_coach")
+
+    previous = rec.get("coach_sub")
+    if previous == coach_sub:
+        return rec
+
+    rec["coach_sub"] = coach_sub
+    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    write_registry(bucket, registry)
+    append_user_event(bucket, sub, "coach_select" if coach_sub else "coach_clear", sub,
+                      {"coach_sub": coach_sub, "previous": previous})
+    return rec
+
+
+def _coach_card(rec):
+    """Что о тренере видят остальные: имя, но не почта."""
+    return {"sub": rec["sub"], "name": rec.get("name") or "Тренер"}
+
+
+def list_coaches(bucket):
+    """Кого сейчас можно выбрать тренером."""
+    users = read_registry(bucket).get("users", {})
+    cards = [_coach_card(u) for u in users.values() if _is_active_coach(u)]
+    return sorted(cards, key=lambda card: card["name"].lower())
+
+
+def current_coach(bucket, sub):
+    """Действующий тренер пользователя или None.
+
+    Связь на тренера, которого с тех пор отклонили, считается недействующей —
+    запись в реестре остаётся, но доступа она не даёт.
+    """
+    users = read_registry(bucket).get("users", {})
+    coach = users.get((users.get(sub) or {}).get("coach_sub"))
+    return _coach_card(coach) if _is_active_coach(coach) else None
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────
