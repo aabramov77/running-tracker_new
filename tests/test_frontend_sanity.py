@@ -211,3 +211,36 @@ def test_frontend_reads_the_statuses_backend_emits():
     js = APP_JS.read_text(encoding="utf-8")
     for status in (compliance.DONE, compliance.MISSED, compliance.EXTRA):
         assert f"'{status}'" in js, f"фронт не знает статуса {status!r}"
+
+
+# ── Тренер (#44) ──────────────────────────────────────────────────────────────
+
+def test_inline_handlers_point_at_existing_functions():
+    """onclick/onchange в index.html зовут функции по имени. Опечатка или
+    переименование в app.js ломает кнопку молча — до первого клика."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    called = set()
+    for handler in re.findall(r'\bon(?:click|change|input)="([^"]*)"', html):
+        called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
+    missing = called - defined
+    assert not missing, f"в app.js нет функций: {sorted(missing)}"
+
+
+def test_coach_tab_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="tab-coach"' in html
+    assert "showTab('coach',this)" in html
+
+
+def test_coach_screen_keeps_out_of_own_data():
+    """Экран тренера держит чужие данные в COACH. Запись в свои runs/PLAN или
+    в localStorage отправила бы чужие пробежки в кэш и офлайн-синхронизацию."""
+    js = APP_JS.read_text(encoding="utf-8")
+    start = js.index("const COACH = {")
+    section = js[start:js.index("function renderAll()", start)]
+    assert "showCoachRunDetail" in section, "секция тренера найдена не целиком"
+    assert "localStorage" not in section
+    for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races"):
+        assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"

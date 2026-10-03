@@ -1302,6 +1302,15 @@ def write_registry(bucket, registry):
     _registry_cache["ts"] = time.time()
 
 
+def _fresh_registry(bucket):
+    """Реестр мимо кэша. Кэш живёт REGISTRY_TTL_SEC на каждом инстансе, и
+    запись поверх устаревшей копии затёрла бы чужое изменение."""
+    data = _load_registry(bucket)
+    _registry_cache["data"] = data
+    _registry_cache["ts"] = time.time()
+    return data
+
+
 def append_user_event(bucket, sub, event, actor, details=None):
     """Append-only аудит переходов (register/approve/reject, тренер #44)."""
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
@@ -1335,6 +1344,12 @@ def resolve_user(bucket, token_info):
     if sub in users:
         return users[sub]
 
+    # Записи в кэше нет — перед записью берём свежий реестр (см. _fresh_registry).
+    registry = _fresh_registry(bucket)
+    users = registry.setdefault("users", {})
+    if sub in users:
+        return users[sub]
+
     now = datetime.utcnow().isoformat() + "Z"
     is_admin = email in ADMIN_EMAILS
     if not is_admin:
@@ -1357,7 +1372,7 @@ def resolve_user(bucket, token_info):
 
 def set_user_status(bucket, target_sub, status, actor_sub):
     """Меняет статус пользователя (lifecycle-метаданные). Возвращает запись или None."""
-    registry = read_registry(bucket)
+    registry = _fresh_registry(bucket)
     users = registry.get("users", {})
     if target_sub not in users:
         return None
@@ -1378,15 +1393,6 @@ def set_user_status(bucket, target_sub, status, actor_sub):
 
 class CoachLinkError(ValueError):
     """Этого тренера выбрать нельзя. Код причины — str(исключения)."""
-
-
-def _fresh_registry(bucket):
-    """Реестр мимо кэша. Кэш живёт REGISTRY_TTL_SEC на каждом инстансе, и
-    запись поверх устаревшей копии затёрла бы чужое изменение."""
-    data = _load_registry(bucket)
-    _registry_cache["data"] = data
-    _registry_cache["ts"] = time.time()
-    return data
 
 
 def _is_active_coach(rec):
@@ -1477,6 +1483,32 @@ def current_coach(bucket, sub):
     users = read_registry(bucket).get("users", {})
     coach = users.get((users.get(sub) or {}).get("coach_sub"))
     return _coach_card(coach) if _is_active_coach(coach) else None
+
+
+def _is_coached_by(athlete, coach_sub):
+    return bool(athlete and athlete.get("status") == "approved"
+                and athlete.get("coach_sub") == coach_sub)
+
+
+def coach_can_access(bucket, coach_sub, athlete_sub):
+    """Единственная проверка права тренера на данные спортсмена.
+
+    Реестр читается мимо кэша: спортсмен, снявший тренера, закрывает доступ
+    сразу, а не через REGISTRY_TTL_SEC на соседнем инстансе.
+    """
+    users = _fresh_registry(bucket).get("users", {})
+    return (_is_active_coach(users.get(coach_sub))
+            and _is_coached_by(users.get(athlete_sub), coach_sub))
+
+
+def list_athletes_of(bucket, coach_sub):
+    """Спортсмены тренера: [{sub, name}]. None — пользователь не тренер."""
+    users = _fresh_registry(bucket).get("users", {})
+    if not _is_active_coach(users.get(coach_sub)):
+        return None
+    athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен"}
+                for u in users.values() if _is_coached_by(u, coach_sub)]
+    return sorted(athletes, key=lambda a: a["name"].lower())
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────

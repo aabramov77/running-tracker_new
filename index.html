@@ -80,6 +80,7 @@
     <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
     <button class="nav-btn" onclick="showTab('profile',this)">👤 Профиль</button>
+    <button class="nav-btn" id="nav-coach-btn" onclick="showTab('coach',this)" style="display:none">⏱ Тренер</button>
     <button class="nav-btn" id="nav-users-btn" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
   </nav>
 
@@ -519,6 +520,53 @@
     </div>
   </div>
 
+  <!-- ТРЕНЕР (#44): спортсмены тренера, только просмотр -->
+  <div id="tab-coach" class="tab">
+    <div class="card" id="coach-list-card">
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Мои спортсмены</div>
+        <button class="btn-sm" onclick="loadCoachAthletes()">↻ Обновить</button>
+      </div>
+      <p class="hint">Здесь те, кто выбрал вас тренером в своём Профиле. Их планы и журнал доступны только для просмотра.</p>
+      <div id="coach-athletes-list"><div class="empty">Загрузка…</div></div>
+    </div>
+
+    <div id="coach-athlete-view" style="display:none">
+      <div class="card" style="margin-bottom:12px">
+        <div class="week-header" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <button class="btn-sm" onclick="closeCoachAthlete()">← Спортсмены</button>
+            <div class="card-title" id="coach-athlete-name" style="margin:0"></div>
+          </div>
+          <select id="coach-plan-select" onchange="selectCoachPlan(this.value)" style="max-width:240px;display:none"></select>
+        </div>
+        <div id="coach-summary" class="hint" style="margin:0 0 8px"></div>
+        <div style="overflow-x:auto">
+          <table class="plan">
+            <thead id="coach-plan-head"></thead>
+            <tbody id="coach-plan-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card" id="coach-chart-card" style="margin-bottom:12px">
+        <div class="card-title">Недельный объём: план и факт (км)</div>
+        <div class="chart-wrap"><canvas id="coachWeekChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <div class="week-header">
+          <div class="card-title" style="margin:0">Журнал</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="btn-sm scope-btn active" id="coach-scope-plan" onclick="setCoachRunScope('plan')">Этот план</button>
+            <button class="btn-sm scope-btn" id="coach-scope-all" onclick="setCoachRunScope('all')">Все</button>
+          </div>
+        </div>
+        <div id="coach-run-log"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- СТАРТЫ -->
   <div id="tab-races" class="tab">
     <div class="card" style="margin-bottom:12px">
@@ -591,6 +639,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=33"></script>
+<script src="app.js?v=34"></script>
 </body>
 </html>

@@ -502,3 +502,179 @@ def test_revoked_coach_disappears_for_the_athlete(api):
     api(FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": False}), **ADMIN)
     assert json.loads(api(FakeRequest("GET", "/my/coach"))[0])["coach"] is None
     assert json.loads(api(FakeRequest("GET", "/coaches"))[0])["coaches"] == []
+
+
+# ── Тренер (#44, фаза 2): доступ к данным спортсмена ─────────────────────────
+# Первое место в приложении, где один пользователь читает данные другого.
+# Проверяется не столько «тренер видит», сколько «все остальные — нет».
+
+COACH = {"sub": "c1", "email": "c1@example.com"}
+FORBIDDEN = json.dumps({"error": "forbidden"})
+
+
+def _coached(api, patched_api, fake_bucket):
+    """Спортсмен u1 с планом и пробежками, его тренер c1. Возвращает plan_id."""
+    plan_id = _seed_plan_with_runs(api, patched_api, fake_bucket)
+    _make_coach(api)
+    assert _status(api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))) == 200
+    return plan_id
+
+
+def _athlete_paths(plan_id, sub="u1"):
+    base = f"/coach/athletes/{sub}"
+    return [f"{base}/plans", f"{base}/plans/{plan_id}/weeks",
+            f"{base}/plans/{plan_id}/compliance", f"{base}/runs",
+            f"{base}/runs/1/details"]
+
+
+def _assert_all_forbidden(api, plan_id, who, athlete="u1"):
+    for path in ["/coach/athletes"] if athlete is None else _athlete_paths(plan_id, athlete):
+        body, code, _ = api(FakeRequest("GET", path), **who)
+        assert (code, body) == (403, FORBIDDEN), path
+
+
+def _seed_run_details(fake_bucket, sub="u1", run_id=1):
+    path = f"users/{sub}/runs/{run_id}/v1/details.json"
+    fake_bucket.blob(path).upload_from_string(json.dumps({"laps": [{"lap": 1, "pace": "5:00"}]}))
+    fake_bucket.blob(f"users/{sub}/runs/{run_id}/manifest.json").upload_from_string(
+        json.dumps({"current_version": 1, "gcs_object_path": path}))
+
+
+@pytest.mark.parametrize("method,path,handler_name", [
+    ("GET", "/coach/athletes",                            "h_coach_athletes"),
+    ("GET", "/coach/athletes/u-1/plans",                  "h_coach_plans"),
+    ("GET", "/coach/athletes/u-1/plans/abc-1/weeks",      "h_coach_plan_weeks"),
+    ("GET", "/coach/athletes/u-1/plans/abc-1/compliance", "h_coach_plan_compliance"),
+    ("GET", "/coach/athletes/u-1/runs",                   "h_coach_runs"),
+    ("GET", "/coach/athletes/u-1/runs/42/details",        "h_coach_run_details"),
+])
+def test_coach_paths_resolve(api_module, method, path, handler_name):
+    route, _, allow = api_module.match_route(path, method)
+    assert allow is None and route[2].__name__ == handler_name
+
+
+def test_coach_sees_what_the_athlete_sees(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _seed_run_details(fake_bucket)
+    pairs = [("/plans", "plans"),
+             (f"/plans/{plan_id}/weeks", f"plans/{plan_id}/weeks"),
+             (f"/plans/{plan_id}/compliance", f"plans/{plan_id}/compliance"),
+             ("/", "runs"),
+             ("/runs/1/details", "runs/1/details")]
+    for own_path, coach_tail in pairs:
+        own_body, own_code, _ = api(FakeRequest("GET", own_path))
+        body, code, _ = api(FakeRequest("GET", f"/coach/athletes/u1/{coach_tail}"), **COACH)
+        assert (code, body) == (own_code, own_body) and code == 200, coach_tail
+
+
+def test_coach_lists_only_own_athletes_without_emails(api, patched_api, fake_bucket):
+    _coached(api, patched_api, fake_bucket)
+    _register(api, "u2")                                  # без тренера
+    body, code, _ = api(FakeRequest("GET", "/coach/athletes"), **COACH)
+    assert code == 200
+    assert json.loads(body) == {"athletes": [{"sub": "u1", "name": "Runner"}]}
+
+
+def test_regular_user_is_not_a_coach(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _register(api, "u2")
+    who = {"sub": "u2", "email": "u2@example.com"}
+    _assert_all_forbidden(api, plan_id, who, athlete=None)
+    _assert_all_forbidden(api, plan_id, who)
+
+
+def test_coach_cannot_read_another_coachs_athlete(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _make_coach(api, "c2")
+    _assert_all_forbidden(api, plan_id, {"sub": "c2", "email": "c2@example.com"})
+
+
+def test_coach_cannot_read_users_who_did_not_choose_them(api, patched_api, fake_bucket):
+    """Чужой спортсмен, человек без тренера и несуществующий sub отвечают
+    одинаково — перебором идентификаторов ничего не узнать."""
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _register(api, "u2")
+    for sub in ("u2", "ghost", "admin-sub", "c1"):
+        for path in _athlete_paths(plan_id, sub):
+            body, code, _ = api(FakeRequest("GET", path), **COACH)
+            assert (code, body) == (403, FORBIDDEN), path
+
+
+def test_admin_has_no_backdoor_into_athlete_data(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _assert_all_forbidden(api, plan_id, ADMIN)
+
+
+def test_access_ends_when_athlete_drops_the_coach(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", "/my/coach", {"coach_sub": None}))
+    _assert_all_forbidden(api, plan_id, COACH)
+    assert json.loads(api(FakeRequest("GET", "/coach/athletes"), **COACH)[0]) == {"athletes": []}
+
+
+def test_access_ends_when_admin_revokes_the_coach(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": False}), **ADMIN)
+    _assert_all_forbidden(api, plan_id, COACH)
+    _assert_all_forbidden(api, plan_id, COACH, athlete=None)
+
+
+def test_rejected_athlete_is_no_longer_visible(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    patched_api.set_user_status(fake_bucket, "u1", "rejected", "admin-sub")
+    _assert_all_forbidden(api, plan_id, COACH)
+
+
+def test_revocation_on_another_instance_is_immediate(api, patched_api, fake_bucket):
+    """Кэш реестра этого инстанса ещё помнит связь, но доступ уже снят."""
+    plan_id = _coached(api, patched_api, fake_bucket)
+    assert _status(api(FakeRequest("GET", "/coach/athletes/u1/runs"), **COACH)) == 200
+
+    blob = fake_bucket.blob("users/registry.json")
+    remote = json.loads(blob.download_as_text())
+    remote["users"]["u1"]["coach_sub"] = None
+    blob.upload_from_string(json.dumps(remote))           # «соседний инстанс»
+
+    _assert_all_forbidden(api, plan_id, COACH)
+
+
+def test_athlete_data_is_read_only_for_the_coach(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    before = dict(fake_bucket._store)
+    for path in _athlete_paths(plan_id):
+        for method in ("POST", "DELETE"):
+            assert _status(api(FakeRequest(method, path, {"weeks": []}), **COACH)) == 405, path
+    assert {k: v for k, v in fake_bucket._store.items() if k.startswith("users/u1/")} == \
+           {k: v for k, v in before.items() if k.startswith("users/u1/")}
+
+
+def test_coach_routes_can_only_read_except_chat(api_module):
+    for method, pattern, _, _ in routes(api_module):
+        if pattern.startswith("^/coach/athletes") and "/chat" not in pattern:
+            assert method == "GET", f"{method} {pattern}"
+
+
+@pytest.mark.parametrize("tail", ["profile", "profile/history", "races", "advise"])
+def test_profile_and_the_rest_stay_private(api, patched_api, fake_bucket, tail):
+    """Тренеру открыты планы и журнал. Вес, пульс, травмы, старты и советы ИИ
+    не отдаёт ни один маршрут."""
+    _coached(api, patched_api, fake_bucket)
+    assert _status(api(FakeRequest("GET", f"/coach/athletes/u1/{tail}"), **COACH)) == 404
+
+
+def test_run_hidden_by_athlete_is_hidden_from_the_coach(api, patched_api, fake_bucket):
+    _coached(api, patched_api, fake_bucket)
+    _seed_run_details(fake_bucket)
+    assert _status(api(FakeRequest("GET", "/coach/athletes/u1/runs/1/details"), **COACH)) == 200
+
+    assert _status(api(FakeRequest("DELETE", "/", args={"id": "1"}))) == 200
+    runs = json.loads(api(FakeRequest("GET", "/coach/athletes/u1/runs"), **COACH)[0])
+    assert [r["id"] for r in runs] == [2]
+    assert _status(api(FakeRequest("GET", "/coach/athletes/u1/runs/1/details"), **COACH)) == 404
+
+
+def test_coach_gets_404_for_unknown_plan_of_own_athlete(api, patched_api, fake_bucket):
+    _coached(api, patched_api, fake_bucket)
+    for tail in ("weeks", "compliance"):
+        path = f"/coach/athletes/u1/plans/no-such-plan/{tail}"
+        assert _status(api(FakeRequest("GET", path), **COACH)) == 404

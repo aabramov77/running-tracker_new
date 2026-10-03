@@ -21,9 +21,10 @@ from storage import (CoachLinkError, LLMRefused, LLMTruncated,
                      archive_plan, attach_fit_details_to_run,
                      build_llm_context, build_plan_compliance, call_llm,
                      clean_athlete_profile, clean_effort, cleanup_old_tmp,
-                     compute_athlete_derived, create_plan, current_coach,
-                     find_plan, get_active_plan, get_storage_client,
-                     increment_advice_usage, list_coaches, mask_key,
+                     coach_can_access, compute_athlete_derived, create_plan,
+                     current_coach, find_plan, get_active_plan,
+                     get_storage_client, increment_advice_usage,
+                     list_athletes_of, list_coaches, mask_key,
                      migrate_legacy_to_user, parse_fit_file, parse_llm_json,
                      read_advice_usage, read_athlete_history,
                      read_athlete_profile, read_latest_advice,
@@ -135,6 +136,62 @@ def h_my_coach_post(c):
     return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
 
 
+# ── Тренер (#44): просмотр данных спортсмена ──────────────────────────────────
+# Только чтение. Профиль спортсмена сюда не входит намеренно: тренеру открыты
+# планы, выполнение и журнал — но не вес, пульс и травмы.
+
+class Forbidden(Exception):
+    """Нет права на чужие данные → 403 (см. handle_request)."""
+
+
+def _coached_athlete(c):
+    """sub спортсмена из пути — если текущий пользователь его тренер.
+
+    Ответ одинаков для чужого спортсмена и для несуществующего sub, поэтому
+    перебором идентификаторов ничего не узнать.
+    """
+    athlete = c.args[0]
+    if not coach_can_access(c.bucket, c.sub, athlete):
+        raise Forbidden()
+    return athlete
+
+
+def h_coach_athletes(c):
+    athletes = list_athletes_of(c.bucket, c.sub)
+    if athletes is None:
+        raise Forbidden()
+    return jresp({"athletes": athletes}, 200)
+
+
+def h_coach_plans(c):
+    return jresp(read_plans_index(c.bucket, _coached_athlete(c)), 200)
+
+
+def h_coach_plan_weeks(c):
+    athlete, plan_id = _coached_athlete(c), c.args[1]
+    if not find_plan(read_plans_index(c.bucket, athlete), plan_id):
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(read_plan_weeks(c.bucket, athlete, plan_id), 200)
+
+
+def h_coach_plan_compliance(c):
+    result = build_plan_compliance(c.bucket, _coached_athlete(c), c.args[1])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(result, 200)
+
+
+def h_coach_runs(c):
+    runs = read_runs(c.bucket, _coached_athlete(c))
+    return jresp([r for r in runs if not r.get("deleted", False)], 200)
+
+
+def h_coach_run_details(c):
+    # Скрытую спортсменом пробежку тренер не видит ни в журнале, ни по id.
+    return _run_details_response(c.bucket, _coached_athlete(c), int(c.args[1]),
+                                 include_deleted=False)
+
+
 def h_admin_migrate_legacy(c):
     return jresp(migrate_legacy_to_user(c.bucket, c.sub), 200)
 
@@ -173,17 +230,21 @@ def h_parse_fit(c):
     }, 200)
 
 
-def h_run_details(c):
-    run_id = int(c.args[0])
+def _run_details_response(bucket, sub, run_id, include_deleted=True):
     # Ownership: run_id должен быть в runs.json пользователя (иначе ленивый
     # fallback мог бы утащить чужие/legacy данные в чужой namespace).
-    own_ids = {r.get("id") for r in read_runs(c.bucket, c.sub)}
+    own_ids = {r.get("id") for r in read_runs(bucket, sub)
+               if include_deleted or not r.get("deleted", False)}
     if run_id not in own_ids:
         return jresp({"error": "Run details not found"}, 404)
-    details = read_run_details(c.bucket, c.sub, run_id)
+    details = read_run_details(bucket, sub, run_id)
     if not details:
         return jresp({"error": "Run details not found"}, 404)
     return jresp(details, 200)
+
+
+def h_run_details(c):
+    return _run_details_response(c.bucket, c.sub, int(c.args[0]))
 
 
 def h_llm_config_get(c):
@@ -518,6 +579,13 @@ ROUTES = [
     ("GET",    r"^/my/coach$",                   h_my_coach_get,         False),
     ("POST",   r"^/my/coach$",                   h_my_coach_post,        False),
 
+    ("GET",    r"^/coach/athletes$",                                    h_coach_athletes,        False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans$",                     h_coach_plans,           False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",      h_coach_plan_weeks,      False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
+
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
 
@@ -620,5 +688,7 @@ def handle_request(request):
 
     try:
         return handler(Ctx(request, bucket, user, match.groups()))
+    except Forbidden:
+        return jresp({"error": "forbidden"}, 403)
     except Exception as e:
         return jresp({"error": str(e)}, 500)

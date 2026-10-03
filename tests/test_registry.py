@@ -324,3 +324,59 @@ def test_coach_writes_do_not_clobber_another_instances_change(storage_module, fa
     stored = json.loads(blob.download_as_text())["users"]
     assert "u9" in stored
     assert stored["u1"]["coach_sub"] == "c1"
+
+
+# ── Тренер (#44): право на данные спортсмена ─────────────────────────────────
+
+def test_coach_can_access_only_the_athlete_who_chose_them(storage_module, fake_bucket):
+    storage_module.resolve_user(fake_bucket, ADMIN_TOKEN)
+    _coach_and_athlete(storage_module, fake_bucket)
+    can = storage_module.coach_can_access
+
+    assert not can(fake_bucket, "c1", "u1")               # ещё не выбрал
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert can(fake_bucket, "c1", "u1")
+
+    assert not can(fake_bucket, "u1", "c1")               # связь не симметрична
+    assert not can(fake_bucket, "admin-sub", "u1")        # админ — не тренер
+    assert not can(fake_bucket, "c1", "admin-sub")
+    assert not can(fake_bucket, "c1", "ghost")
+    assert not can(fake_bucket, "ghost", "u1")
+    assert not can(fake_bucket, "c1", "c1")
+
+
+@pytest.mark.parametrize("who", ["c1", "u1"])
+def test_rejecting_either_side_closes_access(storage_module, fake_bucket, who):
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_user_status(fake_bucket, who, "rejected", "admin-sub")
+    assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
+
+
+def test_stale_instance_does_not_bring_a_dropped_coach_back(storage_module, fake_bucket):
+    """Спортсмен снял тренера на одном инстансе, а на другом — с ещё прогретым
+    кэшем — админ одобрил новичка. Запись реестра из кэша вернула бы связь."""
+    import json
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")           # кэш помнит связь
+
+    blob = fake_bucket.blob("users/registry.json")
+    remote = json.loads(blob.download_as_text())
+    remote["users"]["u1"]["coach_sub"] = None
+    blob.upload_from_string(json.dumps(remote))                      # «соседний инстанс»
+    storage_module._registry_cache["ts"] = __import__("time").time() # кэш всё ещё «свежий»
+
+    storage_module.resolve_user(fake_bucket, {"sub": "u7", "email": "n@example.com", "name": "N"})
+    storage_module.set_user_status(fake_bucket, "u7", "approved", "admin-sub")
+
+    assert json.loads(blob.download_as_text())["users"]["u1"]["coach_sub"] is None
+    assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
+
+
+def test_list_athletes_of(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    assert storage_module.list_athletes_of(fake_bucket, "u1") is None      # не тренер
+    assert storage_module.list_athletes_of(fake_bucket, "c1") == []
+
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert storage_module.list_athletes_of(fake_bucket, "c1") == [{"sub": "u1", "name": "Runner"}]
