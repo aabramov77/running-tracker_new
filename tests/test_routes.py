@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from conftest import FakeRequest
+
 
 def routes(api_module):
     return api_module.ROUTES
@@ -45,9 +47,14 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/",                      "h_runs_get"),
     ("POST",   "/",                      "h_runs_post"),
     ("DELETE", "/",                      "h_runs_delete"),
-    ("GET",    "/advise",                "h_advise_get"),
-    ("POST",   "/advise",                "h_advise_post"),
     ("GET",    "/advise/preview",        "h_advise_preview"),
+    ("GET",    "/ai-coach/threads",      "h_ai_threads_get"),
+    ("POST",   "/ai-coach/threads",      "h_ai_threads_post"),
+    ("GET",    "/ai-coach/threads/20260101T000000000000-deadbeef", "h_ai_thread_get"),
+    ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/messages", "h_ai_message_post"),
+    ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/archive",  "h_ai_thread_archive"),
+    ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/messages/"
+               "20260101T000000000001-ai-deadbeef/apply",                   "h_ai_proposal_apply"),
     ("GET",    "/profile",               "h_profile_get"),
     ("POST",   "/profile",               "h_profile_post"),
     ("GET",    "/profile/history",       "h_profile_history"),
@@ -121,33 +128,6 @@ def test_unknown_path_is_404(api_module, path):
 
 
 # ── Сквозная проверка диспетчера ──────────────────────────────────────────────
-
-class FakeRequest:
-    def __init__(self, method="GET", path="/", json_body=None, args=None):
-        self.method = method
-        self.path = path
-        self._json = json_body
-        self.args = args or {}
-        self.files = None
-        self.headers = {"Authorization": "Bearer test-token"}
-
-    def get_json(self, silent=False):
-        return self._json
-
-
-@pytest.fixture
-def api(patched_api, fake_bucket, monkeypatch):
-    """runs_api с подменённой проверкой токена: тут проверяется маршрутизация,
-    а не подпись Google. Пользователь по умолчанию одобрен."""
-    def call(request, sub="u1", email="runner@example.com", approved=True):
-        token = {"sub": sub, "email": email, "name": "Runner"}
-        monkeypatch.setattr(patched_api, "verify_token", lambda r: token)
-        patched_api.resolve_user(fake_bucket, token)
-        if approved:
-            patched_api.set_user_status(fake_bucket, sub, "approved", "admin-sub")
-        return patched_api.handle_request(request)
-    return call
-
 
 def _status(response):
     return response[1]
@@ -277,35 +257,6 @@ def test_llm_config_without_effort_gets_default(api):
     assert cfg["effort"] == cfg["default_effort"] == "medium"
 
 
-def _seed_advice_prerequisites(api, patched_api, fake_bucket):
-    """Для /advise нужны конфиг LLM и хотя бы одна пробежка."""
-    patched_api.write_llm_config_version(fake_bucket, "openai", "gpt-5.6-luna", "sk-test")
-    api(FakeRequest("POST", "/", json_body={"date": "2026-08-16", "dist": 10.0}))
-
-
-def test_advise_surfaces_refusal_as_422(api, patched_api, fake_bucket, monkeypatch):
-    _seed_advice_prerequisites(api, patched_api, fake_bucket)
-
-    def refuse(*a, **kw):
-        raise patched_api.LLMRefused("нет медицинских рекомендаций")
-
-    monkeypatch.setattr(patched_api, "call_llm", refuse)
-    body, code, _ = api(FakeRequest("POST", "/advise"))
-    assert code == 422
-    assert "отклонила" in body and "медицинских" in body
-
-
-def test_advise_surfaces_truncation_with_a_fix_hint(api, patched_api, fake_bucket, monkeypatch):
-    _seed_advice_prerequisites(api, patched_api, fake_bucket)
-
-    def truncate(*a, **kw):
-        raise patched_api.LLMTruncated("оборвано")
-
-    monkeypatch.setattr(patched_api, "call_llm", truncate)
-    body, code, _ = api(FakeRequest("POST", "/advise"))
-    assert code == 502 and "глубину рассуждения" in body
-
-
 # ── План против факта (#41) ───────────────────────────────────────────────────
 
 def _seed_plan_with_runs(api, patched_api, fake_bucket, sub="u1"):
@@ -396,6 +347,26 @@ def test_compliance_does_not_write_anything(api, patched_api, fake_bucket):
         FakeRequest("GET", f"/plans/{plan_id}/compliance"))
     assert code == 200
     assert fake_bucket._store == before
+
+
+def test_retired_advise_endpoints_are_gone(api):
+    """Разовые рекомендации заменены диалогом (#46). Остался только
+    предпросмотр контекста — на него смотрит кнопка в Профиле."""
+    assert _status(api(FakeRequest("GET", "/advise"))) == 404
+    assert _status(api(FakeRequest("POST", "/advise"))) == 404
+    assert _status(api(FakeRequest("GET", "/advise/preview"))) == 200
+
+
+def test_preview_shows_what_the_ai_coach_is_given(api, patched_api, fake_bucket):
+    """Предпросмотр — это данные хода диалога, а не отдельный текст:
+    разойтись с тем, что видит модель, он не может."""
+    api(FakeRequest("POST", "/", json_body={"id": 9, "date": "2026-08-16", "dist": 12.5}))
+    preview = json.loads(api(FakeRequest("GET", "/advise/preview"))[0])
+    turn = patched_api.build_ai_turn(fake_bucket, "u1", {"run_id": None}, [])
+    assert preview == {"prompt": turn["data"], "system_prompt": turn["instructions"]}
+    assert "12.5км" in preview["prompt"]
+    assert "беговой тренер" in preview["system_prompt"]
+    assert "беговой тренер" not in preview["prompt"]
 
 
 def test_advise_preview_includes_plan_compliance(api, patched_api, fake_bucket):
@@ -654,7 +625,8 @@ def test_coach_routes_can_only_read_except_chat(api_module):
             assert method == "GET", f"{method} {pattern}"
 
 
-@pytest.mark.parametrize("tail", ["profile", "profile/history", "races", "advise"])
+@pytest.mark.parametrize("tail", ["profile", "profile/history", "races", "advise",
+                                  "ai-coach/threads"])
 def test_profile_and_the_rest_stay_private(api, patched_api, fake_bucket, tail):
     """Тренеру открыты планы и журнал. Вес, пульс, травмы, старты и советы ИИ
     не отдаёт ни один маршрут."""

@@ -20,9 +20,13 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
-from compliance import current_week_idx, plan_compliance
-from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
-from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
+from compliance import (DAY_FIELDS, DEFAULT as UNDATED, anchor_source,
+                        current_week_idx, day_date, plan_compliance,
+                        planned_for_date, to_date, week_window)
+from domain import HR_ZONE_BOUNDS, PLAN_DAYS, TYPE_LABELS, personal_bests
+from llm_prompt import (coach_chat_data, coach_chat_instructions,
+                        format_context_for_llm, format_plan_window,
+                        format_run_focus)
 
 def get_storage_client():
     return gcs.Client()
@@ -55,6 +59,14 @@ def p_tmp_details(sub, token): return f"tmp/{sub}/{token}/details.json"
 def p_chat_prefix(athlete, coach):      return f"{upfx(athlete)}coach_chat/{coach}/m/"
 def p_chat_msg(athlete, coach, msg_id): return f"{p_chat_prefix(athlete, coach)}{msg_id}.json"
 def p_chat_read(athlete, coach, role):  return f"{upfx(athlete)}coach_chat/{coach}/read/{role}.json"
+# Разборы с ИИ-тренером (#46): ветка и её сообщения — в namespace спортсмена.
+def p_ai_root(sub):                return f"{upfx(sub)}ai_coach/t/"
+def p_ai_thread(sub, tid):         return f"{p_ai_root(sub)}{tid}/thread.json"
+def p_ai_archived(sub, tid):       return f"{p_ai_root(sub)}{tid}/archived.json"
+def p_ai_msg_prefix(sub, tid):     return f"{p_ai_root(sub)}{tid}/m/"
+def p_ai_msg(sub, tid, msg_id):    return f"{p_ai_msg_prefix(sub, tid)}{msg_id}.json"
+def p_ai_applied_prefix(sub, tid): return f"{p_ai_root(sub)}{tid}/applied/"
+def p_ai_applied(sub, tid, msg_id): return f"{p_ai_applied_prefix(sub, tid)}{msg_id}.json"
 
 # Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
 LEGACY_RUNS = "runs.json"
@@ -887,7 +899,13 @@ def write_llm_config_version(bucket, provider, model, api_key, effort=None, crea
 
 # ── LLM clients (Anthropic / OpenAI / Deepseek) ──────────────────────────────
 
-def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500):
+def _turns(history, user_prompt):
+    """Реплики диалога для провайдера: прошлые ходы (#46) и новый вопрос."""
+    return [*(history or []), {"role": "user", "content": user_prompt}]
+
+
+def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500,
+                    history=None):
     res = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -899,7 +917,7 @@ def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500)
             "model": model,
             "max_tokens": max_tokens,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
+            "messages": _turns(history, user_prompt),
         },
         timeout=60.0,
     )
@@ -948,14 +966,14 @@ def _post_chat(base_url, api_key, payload):
 
 
 def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt,
-                            max_tokens=None, effort=None):
+                            max_tokens=None, effort=None, history=None):
     """Универсальный клиент для OpenAI и Deepseek (одинаковый протокол)."""
     budget = max_tokens or LLM_MAX_TOKENS
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            *_turns(history, user_prompt),
         ],
         "response_format": {"type": "json_object"},
         "reasoning_effort": clean_effort(effort),
@@ -995,18 +1013,23 @@ def clean_effort(effort):
     return effort if effort in LLM_EFFORT_LEVELS else LLM_DEFAULT_EFFORT
 
 
-def call_llm(provider, model, api_key, system_prompt, user_prompt, effort=None):
+def call_llm(provider, model, api_key, system_prompt, user_prompt, effort=None,
+             history=None):
+    """history — прошлые реплики диалога [{role: user|assistant, content}] (#46)."""
     if provider == "anthropic":
         # Провайдер вне интерфейса (#38): ключа нет. Уровень рассуждения у
         # Anthropic задаётся не reasoning_effort, а output_config.effort —
         # прокинуть его сюда придётся вместе с возвратом провайдера.
-        return _call_anthropic(model, api_key, system_prompt, user_prompt)
+        return _call_anthropic(model, api_key, system_prompt, user_prompt,
+                               history=history)
     if provider == "openai":
         return _call_openai_compatible("https://api.openai.com/v1", model, api_key,
-                                       system_prompt, user_prompt, effort=effort)
+                                       system_prompt, user_prompt, effort=effort,
+                                       history=history)
     if provider == "deepseek":
         return _call_openai_compatible("https://api.deepseek.com/v1", model, api_key,
-                                       system_prompt, user_prompt, effort=effort)
+                                       system_prompt, user_prompt, effort=effort,
+                                       history=history)
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -1091,6 +1114,57 @@ def lap_paces_str(details, limit=15):
     if len(paces) > limit:
         return ", ".join(paces[:limit]) + f" … (+{len(paces) - limit})"
     return ", ".join(paces)
+
+
+def half_paces(details):
+    """(темп первой половины, темп второй) в сек/км по кругам.
+
+    None, если кругов меньше четырёх: на двух-трёх кругах «половина» — это
+    разминка против заминки, а не раскладка сил.
+    """
+    laps = [l for l in (details.get("laps") or [])
+            if l.get("dist_km") and l.get("duration_sec")]
+    if len(laps) < 4:
+        return None
+    mid = len(laps) // 2
+
+    def pace(part):
+        return int(sum(l["duration_sec"] for l in part) / sum(l["dist_km"] for l in part))
+
+    return pace(laps[:mid]), pace(laps[mid:])
+
+
+# Сэмпл «держит» время до следующего. Разрыв длиннее — часы стояли на паузе,
+# и записывать его в зону последнего пульса нельзя.
+ZONE_GAP_CAP_SEC = 30
+
+
+def hr_zone_minutes(details, zones):
+    """Время в пульсовых зонах по сэмплам: [{name, min, pct}]. [] — считать не из чего.
+
+    zones — как в compute_athlete_derived: [{name, from, to}] по возрастанию.
+    Пульс ниже первой зоны идёт отдельной строкой, а не теряется: иначе
+    проценты остальных зон завышены.
+    """
+    samples = details.get("samples") or {}
+    times, hrs = samples.get("t_offset_sec") or [], samples.get("hr") or []
+    if not zones or len(times) < 2 or len(times) != len(hrs):
+        return []
+
+    seconds = [0.0] * (len(zones) + 1)          # [0] — ниже первой зоны
+    for i in range(len(times) - 1):
+        span = min(times[i + 1] - times[i], ZONE_GAP_CAP_SEC)
+        if not hrs[i] or span <= 0:
+            continue
+        slot = sum(1 for zone in zones if hrs[i] >= zone["from"])
+        seconds[slot] += span
+
+    total = sum(seconds)
+    if total <= 0:
+        return []
+    names = ["ниже " + zones[0]["name"].split()[0]] + [zone["name"] for zone in zones]
+    return [{"name": name, "min": round(sec / 60, 1), "pct": round(sec / total * 100)}
+            for name, sec in zip(names, seconds) if sec > 0]
 
 
 def build_llm_context(bucket, sub):
@@ -1186,6 +1260,8 @@ def build_llm_context(bucket, sub):
         "weeks_total": len(plan) if plan else 0,
         "plan_id": plan_id,
         "plan_version": plan_version,
+        "plan_weeks": plan or [],
+        "plan_start": (active_plan or {}).get("plan_start"),
         "race": {f: (active_plan or {}).get(f, "") for f in PLAN_META_FIELDS},
         "heuristics": {
             "avg_pace_min_per_km": avg_pace,
@@ -1195,25 +1271,13 @@ def build_llm_context(bucket, sub):
     }
 
 
-def read_advice_manifest(bucket, sub):
-    blob = bucket.blob(p_advice_manifest(sub))
-    if not blob.exists():
-        return None
-    return json.loads(blob.download_as_text())
-
-
-def read_latest_advice(bucket, sub):
-    manifest = read_advice_manifest(bucket, sub)
-    if not manifest:
-        return None
-    blob = bucket.blob(manifest["gcs_object_path"])
-    if not blob.exists():
-        return None
-    return json.loads(blob.download_as_text())
-
-
 def read_advice_usage(bucket, sub):
-    """Дневной счётчик вызовов /advise. Сбрасывается при смене даты."""
+    """Дневной счётчик обращений пользователя к LLM. Сбрасывается при смене даты.
+
+    Имя и путь остались от разовых рекомендаций (/advise), на смену
+    которым пришёл диалог с ИИ-тренером (#46): счётчик тот же, и
+    переносить его незачем.
+    """
     today = datetime.utcnow().date().isoformat()
     blob = bucket.blob(p_advice_usage(sub))
     if not blob.exists():
@@ -1231,46 +1295,6 @@ def increment_advice_usage(bucket, sub):
         json.dumps(usage, ensure_ascii=False), content_type="application/json"
     )
     return usage
-
-
-def write_advice_version(bucket, sub, recommendation, ctx, provider, model, input_tokens, output_tokens, llm_config_version, created_by="api"):
-    manifest = read_advice_manifest(bucket, sub)
-    next_version = (manifest["current_version"] + 1) if manifest else 1
-    object_path = p_advice_ver(sub, next_version)
-    now = datetime.utcnow().isoformat() + "Z"
-
-    payload = {
-        "version": next_version,
-        "is_current": True,
-        "created_at": now,
-        "created_by": created_by,
-        "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
-        "based_on_plan_id": ctx.get("plan_id"),
-        "based_on_plan_version": ctx["plan_version"],
-        "based_on_profile_version": ctx.get("profile_version", 0),
-        "based_on_llm_config_version": llm_config_version,
-        "provider": provider,
-        "model": model,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "recommendation": recommendation,
-        "supersedes_version": next_version - 1 if next_version > 1 else None,
-    }
-    bucket.blob(object_path).upload_from_string(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-
-    new_manifest = {
-        "current_version": next_version,
-        "gcs_object_path": object_path,
-        "updated_at": now,
-    }
-    bucket.blob(p_advice_manifest(sub)).upload_from_string(
-        json.dumps(new_manifest, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return payload
 
 
 # ── User registry (мульти-пользователь) ──────────────────────────────────────
@@ -1548,11 +1572,44 @@ def _check_chat_cursor(cursor):
         raise ChatError("bad_cursor")
 
 
-def _chat_ids(bucket, athlete, coach):
-    prefix = p_chat_prefix(athlete, coach)
+# Нижний слой общий для чата с тренером и разборов с ИИ (#46): и там, и там
+# ветка — это префикс, под которым лежат сообщения-объекты.
+
+def _message_ids(bucket, prefix, id_re):
+    """Идентификаторы сообщений под префиксом, от старых к новым."""
     ids = (blob.name[len(prefix):-len(".json")]
            for blob in bucket.list_blobs(prefix=prefix) if blob.name.endswith(".json"))
-    return sorted(i for i in ids if _CHAT_ID_RE.match(i))
+    return sorted(i for i in ids if id_re.match(i))
+
+
+def _next_message_id(ids, role):
+    """(id, время) для нового сообщения ветки, в которой уже лежат ids.
+
+    Время в идентификаторе строго растёт внутри ветки: иначе при грубых или
+    разошедшихся часах инстансов новое сообщение встало бы раньше уже
+    показанного, и опрос по курсору after его бы пропустил.
+    """
+    now = datetime.utcnow()
+    if ids:
+        last = datetime.strptime(ids[-1][:21], "%Y%m%dT%H%M%S%f")
+        if now <= last:
+            now = last + timedelta(microseconds=1)
+    return f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}", now
+
+
+def _load_json_objects(bucket, paths):
+    """Объект на сообщение — это запрос на сообщение; читаем параллельно."""
+    def load(path):
+        return json.loads(bucket.blob(path).download_as_text())
+
+    if len(paths) > 1:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(load, paths))
+    return [load(path) for path in paths]
+
+
+def _chat_ids(bucket, athlete, coach):
+    return _message_ids(bucket, p_chat_prefix(athlete, coach), _CHAT_ID_RE)
 
 
 def append_chat_message(bucket, athlete, coach, from_sub, role, text):
@@ -1562,16 +1619,7 @@ def append_chat_message(bucket, athlete, coach, from_sub, role, text):
         raise ChatError("empty_message")
     if len(text) > CHAT_TEXT_MAX:
         raise ChatError("message_too_long")
-    now = datetime.utcnow()
-    # Время в идентификаторе строго растёт внутри ветки: иначе при грубых или
-    # разошедшихся часах инстансов новое сообщение встало бы раньше уже
-    # показанного, и опрос по курсору after его бы пропустил.
-    ids = _chat_ids(bucket, athlete, coach)
-    if ids:
-        last = datetime.strptime(ids[-1][:21], "%Y%m%dT%H%M%S%f")
-        if now <= last:
-            now = last + timedelta(microseconds=1)
-    msg_id = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}"
+    msg_id, now = _next_message_id(_chat_ids(bucket, athlete, coach), role)
     message = {"id": msg_id, "ts": now.isoformat() + "Z",
                "from_sub": from_sub, "from_role": role, "text": text}
     bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
@@ -1595,16 +1643,7 @@ def read_chat(bucket, athlete, coach, after=None, before=None, limit=CHAT_PAGE):
     if before:
         ids = [i for i in ids if i < before]
     page = ids[-limit:]
-
-    def load(msg_id):
-        return json.loads(bucket.blob(p_chat_msg(athlete, coach, msg_id)).download_as_text())
-
-    # Объект на сообщение — это запрос на сообщение; читаем параллельно.
-    if len(page) > 1:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            messages = list(pool.map(load, page))
-    else:
-        messages = [load(i) for i in page]
+    messages = _load_json_objects(bucket, [p_chat_msg(athlete, coach, i) for i in page])
     return {"messages": messages, "has_more": len(ids) > len(page)}
 
 
@@ -1641,6 +1680,460 @@ def mark_chat_read(bucket, athlete, coach, reader_role, last_id=None):
         content_type="application/json"
     )
     return target
+
+
+# ── Разборы с ИИ-тренером (#46) ───────────────────────────────────────────────
+# Разбор — ветка диалога спортсмена с LLM. Хранится как чат с тренером:
+# карточка ветки и каждое сообщение — отдельные неизменяемые объекты. Скрытие
+# разбора — объект-событие рядом; сама ветка остаётся в хранилище.
+
+AI_TITLE_MAX = 80
+AI_HISTORY_WINDOW = 12        # столько последних реплик ветки уходит модели
+_AI_ID_TIME = "%Y%m%dT%H%M%S%f"
+_AI_THREAD_ID_RE = re.compile(r"^\d{8}T\d{12}-[0-9a-f]{8}$")
+_AI_MSG_ID_RE = re.compile(r"^\d{8}T\d{12}-(athlete|ai)-[0-9a-f]{8}$")
+
+
+class AICoachError(ValueError):
+    """Запрос к разбору не принят. Код причины — str(исключения)."""
+
+
+def clean_ai_text(text):
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        raise AICoachError("empty_message")
+    if len(text) > CHAT_TEXT_MAX:
+        raise AICoachError("message_too_long")
+    return text
+
+
+def find_own_run(bucket, sub, run_id):
+    """Своя не скрытая пробежка по id; None — такой нет.
+
+    Читается только журнал самого пользователя, поэтому чужой id здесь
+    просто не находится — отдельной проверки владения не нужно.
+    """
+    try:
+        run_id = int(run_id)
+    except (TypeError, ValueError):
+        return None
+    return next((r for r in read_runs(bucket, sub)
+                 if r.get("id") == run_id and not r.get("deleted", False)), None)
+
+
+def run_title(run):
+    """«Длительный 14.2 км · 2026-10-03» — подпись пробежки в разборе."""
+    label = TYPE_LABELS.get(run.get("type"), "тренировка").capitalize()
+    try:
+        dist = f"{float(run.get('dist')):g} км"
+    except (TypeError, ValueError):
+        dist = ""
+    return " · ".join(part for part in (f"{label} {dist}".strip(), run.get("date")) if part)
+
+
+def create_ai_thread(bucket, sub, title, run=None, created_by="api"):
+    """Заводит разбор и возвращает его карточку. LLM здесь не вызывается.
+
+    run — пробежка, которой разбор посвящён: она остаётся в фокусе на всём
+    его протяжении и даёт заголовок, если своего не задали.
+    """
+    now = datetime.utcnow()
+    title = " ".join(str(title or "").split())[:AI_TITLE_MAX]
+    thread = {
+        "id": f"{now.strftime(_AI_ID_TIME)}-{secrets_mod.token_hex(4)}",
+        "kind": "run" if run else "general",
+        "run_id": run["id"] if run else None,
+        "title": title or (run_title(run) if run else "Разбор"),
+        "status": "active",
+        "created_at": now.isoformat() + "Z",
+        "created_by": created_by,
+    }
+    bucket.blob(p_ai_thread(sub, thread["id"])).upload_from_string(
+        json.dumps(thread, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return thread
+
+
+def read_ai_thread(bucket, sub, thread_id):
+    """Карточка разбора; None — такого нет или он скрыт."""
+    if not _AI_THREAD_ID_RE.match(str(thread_id)):
+        return None
+    blob = bucket.blob(p_ai_thread(sub, thread_id))
+    if not blob.exists() or bucket.blob(p_ai_archived(sub, thread_id)).exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+def list_ai_threads(bucket, sub):
+    """Разборы пользователя, сначала с самой свежей репликой.
+
+    Число сообщений и время последнего берутся из имён объектов, одним
+    list_blobs; скачиваются только карточки. Разбор без единого сообщения в
+    список не попадает: он остаётся, когда первый ход не дошёл до модели.
+    """
+    root = p_ai_root(sub)
+    found = {}
+    for blob in bucket.list_blobs(prefix=root):
+        thread_id, _, rest = blob.name[len(root):].partition("/")
+        if not _AI_THREAD_ID_RE.match(thread_id):
+            continue
+        entry = found.setdefault(thread_id, {"ids": [], "card": False, "archived": False})
+        if rest == "thread.json":
+            entry["card"] = True
+        elif rest == "archived.json":
+            entry["archived"] = True
+        elif rest.startswith("m/") and _AI_MSG_ID_RE.match(rest[2:-len(".json")]):
+            entry["ids"].append(rest[2:-len(".json")])
+
+    visible = sorted((tid for tid, e in found.items()
+                      if e["card"] and e["ids"] and not e["archived"]),
+                     key=lambda tid: max(found[tid]["ids"]), reverse=True)
+    threads = _load_json_objects(bucket, [p_ai_thread(sub, tid) for tid in visible])
+    for thread in threads:
+        ids = found[thread["id"]]["ids"]
+        last = datetime.strptime(max(ids)[:21], _AI_ID_TIME)
+        thread["messages"] = len(ids)
+        thread["last_ts"] = last.isoformat() + "Z"
+    return threads
+
+
+def archive_ai_thread(bucket, sub, thread_id, archived_by="api"):
+    """Скрывает разбор из списка. False — скрывать нечего."""
+    if not read_ai_thread(bucket, sub, thread_id):
+        return False
+    bucket.blob(p_ai_archived(sub, thread_id)).upload_from_string(
+        json.dumps({"archived_at": datetime.utcnow().isoformat() + "Z",
+                    "archived_by": archived_by}, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return True
+
+
+def append_ai_message(bucket, sub, thread_id, role, text, extra=None):
+    """Пишет реплику разбора новым объектом и возвращает её."""
+    prefix = p_ai_msg_prefix(sub, thread_id)
+    msg_id, now = _next_message_id(_message_ids(bucket, prefix, _AI_MSG_ID_RE), role)
+    message = {"id": msg_id, "ts": now.isoformat() + "Z", "role": role,
+               "text": text, **(extra or {})}
+    bucket.blob(p_ai_msg(sub, thread_id, msg_id)).upload_from_string(
+        json.dumps(message, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return message
+
+
+def read_ai_messages(bucket, sub, thread_id):
+    ids = _message_ids(bucket, p_ai_msg_prefix(sub, thread_id), _AI_MSG_ID_RE)
+    return _load_json_objects(bucket, [p_ai_msg(sub, thread_id, i) for i in ids])
+
+
+def ai_history(messages, window=AI_HISTORY_WINDOW):
+    """Последние реплики ветки в виде, который принимает call_llm.
+
+    Ответы ИИ отдаются тем же JSON-конвертом, в каком модель их писала:
+    увидев свои прошлые ответы простым текстом, она начинает отвечать так же
+    и ломает JSON-режим.
+    """
+    recent = messages[-window:]
+    while recent and recent[0]["role"] != "athlete":    # диалог открывает вопрос
+        recent = recent[1:]
+
+    def envelope(message):
+        data = {"reply": message["text"]}
+        proposal = message.get("proposal")
+        if proposal:        # модель должна помнить, что именно она предлагала
+            data["proposal"] = {
+                "summary": proposal["summary"],
+                "changes": [{k: c[k] for k in ("week", "day", "text", "reason")}
+                            for c in proposal["changes"]]}
+        return json.dumps(data, ensure_ascii=False)
+
+    return [{"role": "user", "content": m["text"]} if m["role"] == "athlete" else
+            {"role": "assistant", "content": envelope(m)}
+            for m in recent]
+
+
+def parse_coach_reply(text):
+    """(ответ, весь конверт) из ответа модели на ход диалога.
+
+    Модель, ответившая вне JSON, не повод терять ход: тогда весь её текст и
+    есть ответ. Пустой ответ — ошибка, показывать спортсмену нечего.
+    """
+    try:
+        envelope = parse_llm_json(text)
+    except ValueError:
+        envelope = None
+    if isinstance(envelope, dict):
+        reply = envelope.get("reply")
+    else:
+        envelope, reply = {}, text
+    reply = reply.strip() if isinstance(reply, str) else ""
+    if not reply:
+        raise ValueError("модель вернула пустой ответ")
+    return reply, envelope
+
+
+AI_FOCUS_RUNS_MAX = 3         # подробных блоков по пробежкам на один ход
+
+
+def ai_focus_run_ids(thread, messages, run_id=None, window=AI_HISTORY_WINDOW):
+    """Какие пробежки разбираются на этом ходу, от давно упомянутой к свежей.
+
+    Пробежка разбора, прикреплённые к репликам окна и прикреплённая сейчас.
+    Повторное упоминание поднимает пробежку в конец; лишние отбрасываются с
+    начала — подробный блок стоит токенов, а разговор уже ушёл дальше.
+    """
+    mentioned = ([thread.get("run_id")]
+                 + [m.get("run_id") for m in messages[-window:]] + [run_id])
+    ids = []
+    for rid in mentioned:
+        if rid is None:
+            continue
+        if rid in ids:
+            ids.remove(rid)
+        ids.append(rid)
+    return ids[-AI_FOCUS_RUNS_MAX:]
+
+
+def build_run_focus(bucket, sub, run, ctx):
+    """Подробные данные одной пробежки для разбора (форматирует llm_prompt)."""
+    focus = {"run": run, "laps": [], "hr_drift_pct": None, "half_paces": None,
+             "zones": [], "hr_max": None, "hr_max_estimated": False, "planned": None}
+
+    details = None
+    if run.get("details_available"):
+        try:
+            details = read_run_details(bucket, sub, run["id"])
+        except Exception:
+            details = None          # без деталей разбор идёт по сводке
+    if details:
+        derived = ctx.get("profile_derived") or {}
+        focus["laps"] = details.get("laps") or []
+        focus["hr_drift_pct"] = compute_hr_drift(details)
+        focus["half_paces"] = half_paces(details)
+        focus["zones"] = hr_zone_minutes(details, derived.get("hr_zones"))
+        focus["hr_max"] = derived.get("hr_max_effective")
+        focus["hr_max_estimated"] = bool(derived.get("hr_max_estimated"))
+
+    # Что стояло в плане на этот день. У пробежки без привязки (до #25)
+    # смотрим активный план: дата всё равно должна попасть в его недели.
+    plan_id = run.get("plan_id") or ctx.get("plan_id")
+    if plan_id and plan_id == ctx.get("plan_id"):
+        weeks, plan_start = ctx.get("plan_weeks") or [], ctx.get("plan_start")
+    elif plan_id:
+        plan = find_plan(read_plans_index(bucket, sub), plan_id)
+        weeks = read_plan_weeks(bucket, sub, plan_id) if plan else []
+        plan_start = (plan or {}).get("plan_start")
+    else:
+        weeks, plan_start = [], None
+    hit = planned_for_date(weeks, run.get("date"), plan_start)
+    if hit:
+        idx, field, text = hit
+        focus["planned"] = {"week": idx + 1, "day": field, "text": text,
+                            "phase": weeks[idx].get("type"),
+                            "accent": weeks[idx].get("accent", "")}
+    return focus
+
+
+def build_ai_turn(bucket, sub, thread, messages, run=None):
+    """Всё, что уходит модели на очередной ход, кроме самого вопроса.
+
+    Контекст пересобирается на каждый ход: между репликами спортсмен мог
+    добавить пробежку или поправить план. run — пробежка, прикреплённая к
+    новому вопросу.
+    """
+    ctx = build_llm_context(bucket, sub)
+    own = {r.get("id"): r for r in read_runs(bucket, sub) if not r.get("deleted", False)}
+    focus_ids = [rid for rid in ai_focus_run_ids(thread, messages, run and run["id"])
+                 if rid in own]       # скрытая после разбора пробежка выпадает молча
+    blocks = [format_run_focus(build_run_focus(bucket, sub, own[rid], ctx))
+              for rid in focus_ids]
+    window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
+    instructions = coach_chat_instructions(with_proposals=bool(window))
+    data = coach_chat_data(format_context_for_llm(ctx), blocks,
+                           format_plan_window(window) if window else "")
+    return {
+        "ctx": ctx,
+        "focus_run_ids": focus_ids,
+        "plan_window": window,
+        "instructions": instructions,
+        "data": data,
+        "system": instructions + "\n\n" + data,
+        "history": ai_history(messages),
+    }
+
+
+# ── Правки плана от ИИ-тренера (#46) ──────────────────────────────────────────
+# Модель план не меняет: она возвращает предложение, сервер сверяет его с
+# планом и хранит в реплике, а применяет спортсмен — отдельным запросом,
+# который пишет обычную новую версию плана.
+
+AI_PLAN_WINDOW_WEEKS = 4      # текущая неделя и три следующие открыты для правок
+AI_PROPOSAL_MAX_CHANGES = 14
+AI_PROPOSAL_TEXT_MAX = 200
+
+
+def ai_plan_window(weeks, plan_start, week_idx, today=None, count=AI_PLAN_WINDOW_WEEKS):
+    """Недели плана, которые ИИ может править, с датой и текстом каждого дня.
+
+    [] — плана нет или он ничем не датирован: править ячейку, не зная её
+    даты, значит гадать. Недели, закончившиеся до сегодня, в окно не входят,
+    прошедшие дни текущей помечены и правке не подлежат.
+    """
+    today = to_date(today) or datetime.utcnow().date()
+    if not weeks or anchor_source(plan_start, weeks) == UNDATED:
+        return []
+    window = []
+    for idx in range(max(week_idx, 0), min(len(weeks), week_idx + count)):
+        start, end = week_window(weeks, idx, plan_start)
+        if end < today:
+            continue
+        days = sorted((day_date(start, field), field) for field in DAY_FIELDS)
+        window.append({
+            "week": idx + 1,
+            "current": start <= today <= end,
+            "start": start.isoformat(), "end": end.isoformat(),
+            "phase": weeks[idx].get("type"),
+            "days": [{"field": field, "date": day.isoformat(),
+                      "text": str(weeks[idx].get(field) or "").strip(),
+                      "past": day < today}
+                     for day, field in days],
+        })
+    return window
+
+
+def _one_line(value, limit=AI_PROPOSAL_TEXT_MAX):
+    return " ".join(value.split())[:limit] if isinstance(value, str) else ""
+
+
+def clean_proposal(raw, window):
+    """Предложение модели, сверенное с окном плана; None — применять нечего.
+
+    Модель может ошибиться номером недели, выдумать день, тронуть прошедший
+    или вернуть то, что и так стоит в плане. Такая правка отбрасывается
+    молча — текстовый ответ тренера от этого не страдает. У каждой принятой
+    правки сохраняется, что было в ячейке: карточку «было → стало» можно
+    показать и после того, как план ушёл вперёд.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("changes"), list):
+        return None
+    cells = {(week["week"], day["field"]): day for week in window for day in week["days"]}
+    changes = {}
+    for item in raw["changes"]:
+        if not isinstance(item, dict):
+            continue
+        week, field, text = item.get("week"), item.get("day"), item.get("text")
+        if isinstance(week, bool) or not isinstance(week, int) \
+                or not isinstance(field, str) or not isinstance(text, str):
+            continue
+        cell = cells.get((week, field))
+        text = _one_line(text)
+        if cell is None or cell["past"] or text == cell["text"]:
+            continue
+        changes.pop((week, field), None)        # ячейка повторилась — в силе последняя правка
+        changes[(week, field)] = {"week": week, "day": field, "date": cell["date"],
+                                  "old": cell["text"], "text": text,
+                                  "reason": _one_line(item.get("reason"))}
+    if not changes:
+        return None
+    ordered = sorted(changes.values(), key=lambda change: change["date"])
+    return {"summary": _one_line(raw.get("summary")) or "Корректировка плана",
+            "changes": ordered[:AI_PROPOSAL_MAX_CHANGES]}
+
+
+def read_ai_message(bucket, sub, thread_id, msg_id):
+    if not _AI_MSG_ID_RE.match(str(msg_id)):
+        return None
+    blob = bucket.blob(p_ai_msg(sub, thread_id, msg_id))
+    return json.loads(blob.download_as_text()) if blob.exists() else None
+
+
+def _active_plan_version(bucket, sub):
+    """(id активного плана, номер его текущей версии, манифест) или тройка None."""
+    active = get_active_plan(bucket, sub)
+    manifest = read_plan_manifest(bucket, sub, active["id"]) if active else None
+    if not manifest:
+        return None, None, None
+    return active["id"], manifest["current_version"], manifest
+
+
+def _proposal_is_current(proposal, plan_id, version, today):
+    """Предложение ещё применимо: план тот же, той же версии, и ни один из
+    затронутых дней не успел пройти."""
+    return (plan_id is not None
+            and proposal.get("plan_id") == plan_id
+            and proposal.get("plan_version") == version
+            and all((to_date(c.get("date")) or today) >= today
+                    for c in proposal.get("changes", [])))
+
+
+def mark_proposal_states(bucket, sub, thread_id, messages, today=None):
+    """Проставляет репликам с предложением proposal_state: applied / stale / open.
+
+    Состояние считается на чтении и нигде не хранится: «устарело» — это
+    свойство текущего плана, а не реплики.
+    """
+    proposed = [m for m in messages if m.get("proposal")]
+    if not proposed:
+        return messages
+    today = to_date(today) or datetime.utcnow().date()
+    prefix = p_ai_applied_prefix(sub, thread_id)
+    applied = {blob.name[len(prefix):-len(".json")]
+               for blob in bucket.list_blobs(prefix=prefix)}
+    plan_id, version, _ = _active_plan_version(bucket, sub)
+    for message in proposed:
+        if message["id"] in applied:
+            message["proposal_state"] = "applied"
+        elif _proposal_is_current(message["proposal"], plan_id, version, today):
+            message["proposal_state"] = "open"
+        else:
+            message["proposal_state"] = "stale"
+    return messages
+
+
+def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=None):
+    """Применяет предложение из реплики: новая версия плана и событие применения.
+
+    None — реплики нет. AICoachError: no_proposal, already_applied,
+    proposal_stale. Прежняя версия плана остаётся в хранилище, вернуться к
+    ней можно обычной правкой.
+
+    Проверка «не применено ли уже» и запись идут не атомарно: два
+    одновременных запроса создадут две одинаковые версии плана подряд.
+    Данные при этом не теряются; полное решение — предусловия записи (#35).
+    """
+    message = read_ai_message(bucket, sub, thread_id, msg_id)
+    if not message:
+        return None
+    proposal = message.get("proposal")
+    if not proposal:
+        raise AICoachError("no_proposal")
+    marker_blob = bucket.blob(p_ai_applied(sub, thread_id, msg_id))
+    if marker_blob.exists():
+        raise AICoachError("already_applied")
+
+    today = to_date(today) or datetime.utcnow().date()
+    plan_id, version, manifest = _active_plan_version(bucket, sub)
+    if not _proposal_is_current(proposal, plan_id, version, today):
+        raise AICoachError("proposal_stale")
+    current = read_plan_version(bucket, manifest["gcs_object_path"]) or {}
+    weeks = [dict(week) for week in current.get("weeks", [])]
+    if any(not 1 <= change["week"] <= len(weeks) for change in proposal["changes"]):
+        raise AICoachError("proposal_stale")
+    for change in proposal["changes"]:
+        weeks[change["week"] - 1][change["day"]] = change["text"]
+
+    saved = save_plan_weeks(bucket, sub, plan_id, weeks,
+                            f"ИИ-тренер: {proposal['summary']}", applied_by)
+    marker = {
+        "thread_id": thread_id, "message_id": msg_id,
+        "applied_at": datetime.utcnow().isoformat() + "Z", "applied_by": applied_by,
+        "plan_id": plan_id, "from_version": version, "to_version": saved["version"],
+    }
+    marker_blob.upload_from_string(json.dumps(marker, ensure_ascii=False, indent=2),
+                                   content_type="application/json")
+    return marker
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────

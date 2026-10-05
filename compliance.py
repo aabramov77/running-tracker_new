@@ -141,6 +141,23 @@ def anchor_source(plan_start=None, weeks=None):
     return PLAN_START if to_date(plan_start) else DEFAULT
 
 
+def planned_for_date(weeks, day, plan_start=None):
+    """Что стояло в плане на дату: (индекс недели, поле дня, текст) или None.
+
+    None — дата вне плана либо план ничем не датирован: подставить тренировку
+    с угаданного дня хуже, чем не подставить никакой (#46).
+    """
+    day = to_date(day)
+    if day is None or not weeks or anchor_source(plan_start, weeks) == DEFAULT:
+        return None
+    for idx in range(len(weeks)):
+        start, end = week_window(weeks, idx, plan_start)
+        if start <= day <= end:
+            field = DAY_FIELDS[day.weekday()]
+            return idx, field, str((weeks[idx] or {}).get(field) or "").strip()
+    return None
+
+
 def plan_week_range(plan_start, idx, weeks=None):
     """(первый день, последний день) недели idx, 0-based."""
     return week_window(weeks, idx, plan_start)

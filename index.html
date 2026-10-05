@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=23">
+<link rel="stylesheet" href="style.css?v=24">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -77,7 +77,7 @@
     <button class="nav-btn" onclick="showTab('add',this)">+ Пробежка</button>
     <button class="nav-btn" onclick="showTab('log',this)">Журнал</button>
     <button class="nav-btn" onclick="showTab('stats',this)">Аналитика</button>
-    <button class="nav-btn" onclick="showTab('adjust',this)">Корректировка</button>
+    <button class="nav-btn" id="nav-aicoach-btn" onclick="showTab('aicoach',this)">🤖 ИИ-тренер</button>
     <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
     <button class="nav-btn" onclick="showTab('profile',this)">👤 Профиль</button>
     <button class="nav-btn" id="nav-coach-btn" onclick="showTab('coach',this)" style="display:none">⏱ Тренер<span id="nav-coach-badge" class="nav-badge" style="display:none"></span></button>
@@ -308,20 +308,35 @@
     <div class="card" style="margin-top:12px"><div class="card-title">Динамика темпа (мин/км)</div><div class="chart-wrap"><canvas id="paceChart"></canvas></div></div>
   </div>
 
-  <!-- КОРРЕКТИРОВКА -->
-  <div id="tab-adjust" class="tab">
+  <!-- ИИ-ТРЕНЕР (#46) -->
+  <div id="tab-aicoach" class="tab">
     <div class="card">
-      <div class="card-title">Эвристики</div>
-      <p class="hint">Быстрый анализ по простым правилам</p>
-      <div id="adjust-content"><div class="empty">Добавьте несколько пробежек для получения рекомендаций</div></div>
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Разборы</div>
+        <button class="btn-sm" onclick="aiNewThread()">+ Новый разбор</button>
+      </div>
+      <div id="ai-threads"><div class="empty">Загрузка…</div></div>
     </div>
     <div class="card" style="margin-top:12px">
-      <div class="week-header">
-        <div class="card-title" style="margin:0">Рекомендации ИИ</div>
-        <button class="btn-sm" id="llm-advice-btn" onclick="requestLlmAdvice()">🤖 Запросить рекомендации</button>
+      <div class="week-header" style="gap:8px">
+        <div class="card-title" id="ai-title" style="margin:0">Новый разбор</div>
+        <span class="hint" id="ai-usage" style="margin:0;white-space:nowrap"></span>
       </div>
-      <div id="llm-advice-meta" class="hint" style="display:none"></div>
-      <div id="llm-advice-output"><div class="empty">Нажмите кнопку, чтобы получить рекомендации от LLM</div></div>
+      <div id="ai-focus"></div>
+      <div class="chat-log ai-log" id="ai-log" style="display:none"></div>
+      <div id="ai-starters">
+        <p class="hint">Спросите ИИ-тренера о тренировках и плане. Он видит ваш профиль, план, его выполнение и последние пробежки.</p>
+        <div class="ai-starter-list" id="ai-starter-list"></div>
+      </div>
+      <div class="form-group ai-attach">
+        <label for="ai-run">📎 Прикрепить тренировку к вопросу</label>
+        <select id="ai-run"></select>
+      </div>
+      <div class="chat-form">
+        <div class="form-group"><textarea id="ai-input" rows="2" maxlength="2000" placeholder="Вопрос ИИ-тренеру (Ctrl+Enter — отправить)" onkeydown="aiKey(event)"></textarea></div>
+        <button class="btn-primary" id="ai-send" onclick="aiSend()">Отправить</button>
+      </div>
+      <div id="ai-msg" class="save-msg"></div>
     </div>
   </div>
 
@@ -470,11 +485,11 @@
 
     <div class="card" id="llm-settings-note" style="display:none">
       <div class="card-title">Настройки ИИ</div>
-      <p class="hint">Рекомендации ИИ настроены администратором приложения. Кнопка «Запросить рекомендации» в разделе «Корректировка» работает для всех пользователей.</p>
+      <p class="hint">ИИ-тренер настроен администратором приложения и доступен всем пользователям во вкладке «ИИ-тренер».</p>
     </div>
     <div class="card" id="llm-settings-card">
       <div class="card-title">Настройки LLM</div>
-      <p class="hint">Подключите внешнюю LLM (Anthropic / OpenAI / Deepseek) для рекомендаций по корректировке плана. Ключ хранится в приватном GCS-объекте и не передаётся обратно фронту.</p>
+      <p class="hint">Подключите внешнюю LLM (Anthropic / OpenAI / Deepseek) для ИИ-тренера. Ключ хранится в приватном GCS-объекте и не передаётся обратно фронту.</p>
       <div class="form-grid">
         <div class="form-group">
           <label>Провайдер</label>
@@ -662,6 +677,7 @@
       <div id="rd-charts"></div>
       <div style="margin-top:20px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn-primary" onclick="closeRunDetail()">Закрыть</button>
+        <button class="btn-sm" id="rd-ai-btn">🤖 Разобрать с ИИ</button>
         <button class="btn-sm" id="rd-delete-btn" style="color:var(--c-danger)">Скрыть пробежку</button>
       </div>
     </div>
@@ -669,6 +685,6 @@
 
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=35"></script>
+<script src="app.js?v=36"></script>
 </body>
 </html>

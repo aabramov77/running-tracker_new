@@ -347,19 +347,7 @@ def test_llm_context_uses_only_active_plan(storage_module, fake_bucket):
     assert "A" in text and "A-неделя" in text
 
 
-# ── advice round-trip + daily usage ───────────────────────────────────────────
-
-def test_advice_roundtrip(storage_module, fake_bucket):
-    assert storage_module.read_latest_advice(fake_bucket, SUB) is None
-    ctx = {"last_runs": [{"id": 11}, {"id": 12}], "plan_version": 3}
-    rec = {"assessment": "ok", "adjustments": [], "warnings": []}
-    storage_module.write_advice_version(fake_bucket, SUB, rec, ctx, "deepseek", "deepseek-chat",
-                                     100, 50, llm_config_version=1)
-    latest = storage_module.read_latest_advice(fake_bucket, SUB)
-    assert latest["recommendation"] == rec
-    assert latest["based_on_runs"] == [11, 12]
-    assert storage_module.read_latest_advice(fake_bucket, SUB2) is None
-
+# ── daily usage of the LLM ───────────────────────────────────────────────────
 
 def test_advice_usage_counter(storage_module, fake_bucket):
     assert storage_module.read_advice_usage(fake_bucket, SUB)["count"] == 0

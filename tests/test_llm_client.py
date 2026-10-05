@@ -174,6 +174,48 @@ def test_effort_survives_the_legacy_budget_retry(storage_module, captured):
     assert captured["calls"][1]["body"]["reasoning_effort"] == "high"
 
 
+# ── история диалога (#46) ─────────────────────────────────────────────────────
+
+HISTORY = [{"role": "user", "content": "первый вопрос"},
+           {"role": "assistant", "content": '{"reply": "первый ответ"}'}]
+
+
+def test_history_goes_between_system_and_the_new_question(storage_module, captured):
+    _call(storage_module, history=HISTORY)
+    messages = captured["calls"][0]["body"]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[1:3] == HISTORY
+    assert messages[0]["content"] == "system" and messages[3]["content"] == "user"
+
+
+@pytest.mark.parametrize("history", [None, []])
+def test_no_history_leaves_the_request_as_it_was(storage_module, captured, history):
+    _call(storage_module, history=history)
+    assert [m["role"] for m in captured["calls"][0]["body"]["messages"]] == ["system", "user"]
+
+
+def test_call_llm_passes_history_through(storage_module, captured):
+    storage_module.call_llm("deepseek", "test-model", "sk-test", "s", "u", history=HISTORY)
+    assert captured["calls"][0]["body"]["messages"][1:3] == HISTORY
+
+
+def test_history_survives_the_legacy_budget_retry(storage_module, captured):
+    captured["replies"].append(FakeResponse({}, status_code=400,
+                                            text="Unsupported parameter: 'max_completion_tokens'"))
+    captured["replies"].append(FakeResponse(OK_BODY))
+    _call(storage_module, history=HISTORY)
+    assert captured["calls"][1]["body"]["messages"][1:3] == HISTORY
+
+
+def test_anthropic_gets_history_as_turns_and_system_separately(storage_module, captured):
+    captured["replies"].append(FakeResponse(
+        {"content": [{"text": "{}"}], "usage": {"input_tokens": 1, "output_tokens": 1}}))
+    storage_module.call_llm("anthropic", "test-model", "sk-test", "s", "u", history=HISTORY)
+    body = captured["calls"][0]["body"]
+    assert body["system"] == "s"
+    assert body["messages"] == [*HISTORY, {"role": "user", "content": "u"}]
+
+
 # ── конфиг LLM хранит уровень ─────────────────────────────────────────────────
 
 def test_config_version_stores_effort(storage_module, fake_bucket):

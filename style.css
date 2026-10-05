@@ -228,18 +228,6 @@ table.plan tr:hover td { background: var(--bg-metric); }
 
 .empty { text-align: center; padding: 2rem; color: var(--text-muted); font-size: 13px; }
 
-.suggestion {
-  border-left: 3px solid var(--c-blue);
-  padding: 8px 12px;
-  background: var(--c-blue-light);
-  border-radius: 0 8px 8px 0;
-  font-size: 13px;
-  margin-bottom: 8px;
-  color: var(--c-blue);
-}
-.suggestion.warn { border-color: var(--c-warn); background: var(--c-warn-light); color: var(--c-warn); }
-.suggestion.good { border-color: var(--c-accent); background: var(--c-accent-light); color: var(--c-accent-dark); }
-
 @media (max-width: 600px) {
   /* Layout */
   .app { padding: 0.875rem 0.75rem 4rem; }
@@ -489,8 +477,48 @@ table.pb-table td:last-child { text-align: right; }
   font-size: 10px; opacity: .55; font-family: 'DM Mono', monospace;
 }
 .chat-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 8px; }
-.chat-form .form-group { flex: 1; }
+.chat-form .form-group { flex: 1; min-width: 0; }   /* иначе на узком экране кнопка выезжает за карточку */
 .chat-form textarea { min-height: 44px; max-height: 160px; }
+/* ИИ-тренер (#46): лента та же, что у чата с тренером, но ответы длиннее */
+.ai-log { max-height: 60vh; }
+.ai-log .chat-msg { max-width: 88%; }
+.ai-thinking { color: var(--text-muted); font-style: italic; }
+.ai-starter-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+#ai-threads { max-height: 230px; overflow-y: auto; }
+.ai-thread { cursor: pointer; }
+.ai-thread.active .run-title { color: var(--c-accent); }
+#ai-msg { margin-top: 6px; }
+.ai-attach { margin-top: 10px; max-width: 420px; }
+.ai-chip {
+  display: block; width: fit-content; margin-top: 4px; padding: 1px 8px;
+  border-radius: 10px; border: 0.5px solid var(--border);
+  font-size: 11px; cursor: pointer; white-space: normal;
+}
+#ai-focus .ai-chip { margin: 0 0 8px; }
+/* Карточка правок плана; white-space сброшен — лента хранит переносы ответа */
+.ai-proposal {
+  white-space: normal; margin-top: 8px; padding: 8px 10px;
+  background: var(--bg-card); color: var(--text);
+  border: 0.5px solid var(--border); border-left: 3px solid var(--c-blue);
+  border-radius: 0 8px 8px 0;
+}
+.ai-prop-title { font-weight: 500; margin-bottom: 6px; }
+.ai-proposal table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+.ai-proposal td { padding: 5px 0; border-top: 0.5px solid var(--border); vertical-align: top; }
+.ai-proposal td.ai-prop-when {
+  white-space: nowrap; padding-right: 12px;
+  font-family: 'DM Mono', monospace; font-size: 12px; color: var(--text-muted);
+}
+.ai-prop-old { color: var(--text-muted); text-decoration: line-through; }
+.ai-prop-why { font-size: 12px; color: var(--text-muted); }
+.ai-prop-state { font-size: 12px; color: var(--text-muted); }
+.ai-prop-state.done { color: var(--c-accent); font-weight: 500; }
+@media (max-width: 600px) {
+  .ai-log .chat-msg { max-width: 96%; }
+  /* На узком экране дата правки встаёт над ней, а не сбоку */
+  .ai-proposal tr { display: block; padding: 5px 0; border-top: 0.5px solid var(--border); }
+  .ai-proposal td, .ai-proposal td.ai-prop-when { display: block; padding: 1px 0; border-top: none; }
+}
 .nav-badge {
   display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px;
   border-radius: 10px; background: var(--c-danger); color: #fff;

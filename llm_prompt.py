@@ -211,18 +211,169 @@ def format_context_for_llm(ctx):
 
     return "\n".join(lines)
 
-SYSTEM_PROMPT = """Ты опытный беговой тренер. Анализируешь данные тренировок бегуна, готовящегося к целевому старту (дистанция и цель указаны в данных).
+# ── Диалог с ИИ-тренером (#46) ────────────────────────────────────────────────
 
-Если в данных есть профиль спортсмена — учитывай возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
+COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер. Ведёшь диалог со спортсменом: разбираешь его тренировки, отвечаешь на вопросы и помогаешь корректировать план подготовки к целевому старту.
 
-Дай рекомендации СТРОГО в JSON-формате без лишнего текста до или после:
-{
-  "assessment": "1-2 предложения общей оценки прогресса",
-  "adjustments": [
-    {"day": "среда", "change": "конкретное предложение по корректировке"}
-  ],
-  "warnings": ["предупреждение если есть риски"]
-}
+Правила:
+- Опирайся на данные спортсмена ниже. Если для вывода данных не хватает — скажи об этом прямо и спроси недостающее, не додумывай цифры.
+- Учитывай профиль: возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
+- Ты не врач и диагнозов не ставишь. При жалобах на боль или тревожных симптомах советуй снизить нагрузку и обратиться к специалисту.
+- Отвечай на заданный вопрос и конкретно: темпы, пульс, километры, дни недели. Не пересказывай данные, которые спортсмен и так видит.
+- Разбирая тренировку, сравни её с тем, что стояло в плане на этот день, оцени раскладку темпа по кругам, дрейф пульса и время в зонах, и скажи, что из этого следует для ближайших тренировок. Если детальных данных по тренировке нет — разбирай по сводке и скажи, чего не хватает для точного вывода.
+- Пиши по-русски и коротко: обычно 3–8 предложений или короткий список. Для выделения годятся **жирный** и списки с «- »."""
 
-Если корректировок не нужно — пустой массив adjustments. Если предупреждений нет — пустой массив warnings.
-Отвечай на русском языке."""
+COACH_CHAT_REPLY_FORMAT = """Формат ответа — СТРОГО JSON без текста до или после:
+{"reply": "текст ответа спортсмену"}"""
+
+# Формат с правками плана. Используется, только когда модели показана таблица
+# «План: что можно менять» — без неё адресовать правку нечем.
+COACH_CHAT_PROPOSAL_FORMAT = """Формат ответа — СТРОГО JSON без текста до или после:
+{"reply": "текст ответа спортсмену", "proposal": null}
+
+Когда нужно изменить план, вместо null передай правки:
+{"reply": "...", "proposal": {"summary": "что меняется и зачем, одной фразой", "changes": [{"week": 6, "day": "wed", "text": "новый текст ячейки", "reason": "почему"}]}}
+
+Правила для proposal:
+- Заполняй его, только когда спортсмен просит изменить план либо изменение явно необходимо (травма, перегруз, пропущена ключевая тренировка). На обычный вопрос или разбор тренировки — null.
+- week — номер недели, day — код дня (mon, tue, wed, thu, fri, sat, sun) из таблицы «План: что можно менять». Менять можно только дни этой таблицы, не помеченные как прошедшие.
+- text — новое содержимое ячейки целиком, в том же стиле, что остальной план. Пустая строка — день отдыха.
+- Не больше 14 правок. В reply объясни их словами: спортсмен увидит карточку «было → стало» и сам решит, применять ли. Не пиши, что план уже изменён."""
+
+
+def format_plan_window(window):
+    """Таблица недель, которые модель может править (#46).
+
+    На вход — список из storage.ai_plan_window. Дни идут по датам, а не
+    пн→вс: у строки вс→сб воскресенье — первый день, и модель не должна
+    считать его концом недели.
+    """
+    day_ru = dict(PLAN_DAYS)
+    lines = ["=== План: что можно менять ==="]
+    for week in window:
+        phase = PLAN_PHASE_LABELS.get(week.get("phase"), week.get("phase") or "")
+        head = f"Неделя {week['week']}" + (" (текущая)" if week.get("current") else "")
+        head += f", {week['start']} – {week['end']}" + (f", {phase}" if phase else "")
+        lines.append(head)
+        for day in week["days"]:
+            past = " (прошёл, менять нельзя)" if day["past"] else ""
+            lines.append(f"  {day['field']} ({day_ru[day['field']]} {day['date']}): "
+                         f"{day['text'] or '—'}{past}")
+    return "\n".join(lines)
+
+FOCUS_LAPS_MAX = 45           # марафон на километровом автокруге помещается целиком
+
+
+def _mmss(seconds):
+    seconds = int(round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _lap_line(lap):
+    parts = [f"{lap.get('dist_km', 0):g} км"]
+    if lap.get("duration_sec"):
+        parts.append(f"за {_mmss(lap['duration_sec'])}")
+    if lap.get("pace"):
+        parts.append(f"темп {lap['pace']}/км")
+    if lap.get("avg_hr"):
+        hr = f"пульс {lap['avg_hr']}"
+        if lap.get("max_hr"):
+            hr += f"/{lap['max_hr']}"
+        parts.append(hr)
+    if lap.get("cadence"):
+        parts.append(f"каденс {lap['cadence']}")
+    if lap.get("ascent_m"):
+        parts.append(f"набор {lap['ascent_m']} м")
+    return f"  {lap.get('lap', '?')}: " + ", ".join(parts)
+
+
+def format_run_focus(focus):
+    """Подробный блок одной пробежки для разбора (#46).
+
+    На вход — словарь из storage.build_run_focus. Сырые посекундные ряды сюда
+    не попадают: из них заранее посчитаны дрейф, половины и зоны.
+    """
+    run = focus["run"]
+    kind = TYPE_LABELS.get(run.get("type"), run.get("type") or "тренировка")
+    lines = [f"--- Тренировка {run.get('date', '?')}, {kind} ---"]
+
+    summary = [f"{run.get('dist', '?')} км"]
+    if run.get("time"):
+        summary.append(f"за {run['time']}")
+    if run.get("pace"):
+        summary.append(f"темп {run['pace']}/км")
+    if run.get("hr"):
+        summary.append(f"пульс ср. {run['hr']}" + (f", макс {run['max_hr']}" if run.get("max_hr") else ""))
+    if run.get("avg_cadence"):
+        summary.append(f"каденс {run['avg_cadence']}")
+    if run.get("total_ascent_m"):
+        summary.append(f"набор {run['total_ascent_m']} м")
+    lines.append("Сводка: " + ", ".join(summary))
+    if FEEL_LABELS.get(run.get("feel")):
+        lines.append(f"Ощущения спортсмена: {FEEL_LABELS[run['feel']]}")
+    if run.get("notes"):
+        lines.append(f"Заметки спортсмена: {run['notes']}")
+
+    planned = focus.get("planned")
+    if planned:
+        phase = PLAN_PHASE_LABELS.get(planned.get("phase"), planned.get("phase") or "")
+        where = f"неделя {planned['week']}" + (f", {phase}" if phase else "")
+        lines.append(f"По плану в этот день ({where}): «{planned['text']}»" if planned["text"]
+                     else f"По плану в этот день ({where}) тренировки не было")
+    else:
+        lines.append("Что стояло в плане на этот день — неизвестно (дата вне плана "
+                     "или план без дат)")
+
+    laps = focus.get("laps") or []
+    if laps:
+        lines.append("Круги (№: дистанция, время, темп, пульс ср./макс, каденс):")
+        lines.extend(_lap_line(lap) for lap in laps[:FOCUS_LAPS_MAX])
+        if len(laps) > FOCUS_LAPS_MAX:
+            lines.append(f"  … и ещё {len(laps) - FOCUS_LAPS_MAX}")
+    if focus.get("half_paces"):
+        first, second = focus["half_paces"]
+        lines.append(f"Темп по половинам (по кругам): {_mmss(first)} → {_mmss(second)}/км")
+    if focus.get("hr_drift_pct") is not None:
+        drift = focus["hr_drift_pct"]
+        lines.append(f"HR-drift: {'+' if drift >= 0 else ''}{drift}% "
+                     "(средний пульс второй половины к первой)")
+    if focus.get("zones"):
+        basis = f"макс. пульс {focus.get('hr_max')}" + (
+            " — оценка по возрасту, не измерялся" if focus.get("hr_max_estimated") else "")
+        lines.append(f"Время в пульсовых зонах ({basis}): " + "; ".join(
+            f"{z['name']} — {z['min']:g} мин ({z['pct']}%)" for z in focus["zones"]))
+    if not laps and not focus.get("zones"):
+        lines.append("Детальных данных (кругов, пульса по времени) нет — только сводка.")
+    return "\n".join(lines)
+
+
+def coach_chat_instructions(with_proposals):
+    """Неизменная часть системного промпта: роль, правила и формат ответа.
+
+    Формат с правками плана даётся, только когда модели показана таблица
+    недель, открытых для правок: без неё адресовать правку нечем.
+    """
+    return "\n\n".join([
+        COACH_CHAT_SYSTEM_PROMPT,
+        COACH_CHAT_PROPOSAL_FORMAT if with_proposals else COACH_CHAT_REPLY_FORMAT])
+
+
+def coach_chat_data(context_text, focus_blocks=(), plan_window_text=""):
+    """Данные спортсмена для системного промпта хода.
+
+    Они идут в системную часть, а не репликой: так история диалога остаётся
+    чистым чередованием вопросов и ответов, а контекст каждый ход
+    подставляется актуальный, не тот, что был на момент первого вопроса.
+
+    focus_blocks — подробные блоки пробежек, которые спортсмен выбрал для
+    разбора; последняя в списке прикреплена позже всех.
+    """
+    parts = ["=== Данные спортсмена на момент сообщения ===\n" + context_text]
+    if plan_window_text:
+        parts.append(plan_window_text)
+    if focus_blocks:
+        parts.append(
+            "=== Тренировки, выбранные спортсменом для разбора ===\n"
+            "Разговор идёт о них; остальные данные — фон. Если выбрано несколько, "
+            "последняя в списке прикреплена позже всех.\n\n" + "\n\n".join(focus_blocks))
+    return "\n\n".join(parts)
