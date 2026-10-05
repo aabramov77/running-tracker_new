@@ -24,7 +24,7 @@ from compliance import (DAY_FIELDS, DEFAULT as UNDATED, anchor_source,
                         current_week_idx, day_date, plan_compliance,
                         planned_for_date, to_date, week_window)
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, TYPE_LABELS, personal_bests
-from llm_prompt import (SYSTEM_PROMPT, coach_chat_system_prompt,
+from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_plan_window,
                         format_run_focus)
 
@@ -1271,25 +1271,13 @@ def build_llm_context(bucket, sub):
     }
 
 
-def read_advice_manifest(bucket, sub):
-    blob = bucket.blob(p_advice_manifest(sub))
-    if not blob.exists():
-        return None
-    return json.loads(blob.download_as_text())
-
-
-def read_latest_advice(bucket, sub):
-    manifest = read_advice_manifest(bucket, sub)
-    if not manifest:
-        return None
-    blob = bucket.blob(manifest["gcs_object_path"])
-    if not blob.exists():
-        return None
-    return json.loads(blob.download_as_text())
-
-
 def read_advice_usage(bucket, sub):
-    """Дневной счётчик вызовов /advise. Сбрасывается при смене даты."""
+    """Дневной счётчик обращений пользователя к LLM. Сбрасывается при смене даты.
+
+    Имя и путь остались от разовых рекомендаций (/advise), на смену
+    которым пришёл диалог с ИИ-тренером (#46): счётчик тот же, и
+    переносить его незачем.
+    """
     today = datetime.utcnow().date().isoformat()
     blob = bucket.blob(p_advice_usage(sub))
     if not blob.exists():
@@ -1307,46 +1295,6 @@ def increment_advice_usage(bucket, sub):
         json.dumps(usage, ensure_ascii=False), content_type="application/json"
     )
     return usage
-
-
-def write_advice_version(bucket, sub, recommendation, ctx, provider, model, input_tokens, output_tokens, llm_config_version, created_by="api"):
-    manifest = read_advice_manifest(bucket, sub)
-    next_version = (manifest["current_version"] + 1) if manifest else 1
-    object_path = p_advice_ver(sub, next_version)
-    now = datetime.utcnow().isoformat() + "Z"
-
-    payload = {
-        "version": next_version,
-        "is_current": True,
-        "created_at": now,
-        "created_by": created_by,
-        "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
-        "based_on_plan_id": ctx.get("plan_id"),
-        "based_on_plan_version": ctx["plan_version"],
-        "based_on_profile_version": ctx.get("profile_version", 0),
-        "based_on_llm_config_version": llm_config_version,
-        "provider": provider,
-        "model": model,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "recommendation": recommendation,
-        "supersedes_version": next_version - 1 if next_version > 1 else None,
-    }
-    bucket.blob(object_path).upload_from_string(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-
-    new_manifest = {
-        "current_version": next_version,
-        "gcs_object_path": object_path,
-        "updated_at": now,
-    }
-    bucket.blob(p_advice_manifest(sub)).upload_from_string(
-        json.dumps(new_manifest, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return payload
 
 
 # ── User registry (мульти-пользователь) ──────────────────────────────────────
@@ -2002,13 +1950,16 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
     blocks = [format_run_focus(build_run_focus(bucket, sub, own[rid], ctx))
               for rid in focus_ids]
     window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
+    instructions = coach_chat_instructions(with_proposals=bool(window))
+    data = coach_chat_data(format_context_for_llm(ctx), blocks,
+                           format_plan_window(window) if window else "")
     return {
         "ctx": ctx,
         "focus_run_ids": focus_ids,
         "plan_window": window,
-        "system": coach_chat_system_prompt(
-            format_context_for_llm(ctx), blocks,
-            format_plan_window(window) if window else ""),
+        "instructions": instructions,
+        "data": data,
+        "system": instructions + "\n\n" + data,
         "history": ai_history(messages),
     }
 

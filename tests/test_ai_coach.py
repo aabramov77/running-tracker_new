@@ -776,10 +776,19 @@ def test_plan_window_text_names_every_editable_cell(storage_module):
 
 def test_reply_format_offers_proposals_only_with_a_plan_window(storage_module):
     import llm_prompt
-    with_plan = llm_prompt.coach_chat_system_prompt("ctx", (), "=== План: что можно менять ===")
-    without = llm_prompt.coach_chat_system_prompt("ctx")
-    assert '"proposal"' in with_plan and "План: что можно менять" in with_plan
+    with_plan = llm_prompt.coach_chat_instructions(with_proposals=True)
+    without = llm_prompt.coach_chat_instructions(with_proposals=False)
+    assert '"proposal"' in with_plan and "JSON" in with_plan
     assert "proposal" not in without and "JSON" in without
+
+
+def test_data_block_orders_context_plan_window_and_chosen_runs(storage_module):
+    import llm_prompt
+    data = llm_prompt.coach_chat_data("КОНТЕКСТ", ["БЛОК-1", "БЛОК-2"], "ОКНО ПЛАНА")
+    assert data.index("КОНТЕКСТ") < data.index("ОКНО ПЛАНА") < data.index(FOCUS_MARKER) \
+        < data.index("БЛОК-1") < data.index("БЛОК-2")
+    bare = llm_prompt.coach_chat_data("КОНТЕКСТ")
+    assert FOCUS_MARKER not in bare and bare.endswith("КОНТЕКСТ")
 
 
 # ── проверка предложения модели ───────────────────────────────────────────────

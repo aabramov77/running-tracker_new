@@ -47,8 +47,6 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/",                      "h_runs_get"),
     ("POST",   "/",                      "h_runs_post"),
     ("DELETE", "/",                      "h_runs_delete"),
-    ("GET",    "/advise",                "h_advise_get"),
-    ("POST",   "/advise",                "h_advise_post"),
     ("GET",    "/advise/preview",        "h_advise_preview"),
     ("GET",    "/ai-coach/threads",      "h_ai_threads_get"),
     ("POST",   "/ai-coach/threads",      "h_ai_threads_post"),
@@ -259,35 +257,6 @@ def test_llm_config_without_effort_gets_default(api):
     assert cfg["effort"] == cfg["default_effort"] == "medium"
 
 
-def _seed_advice_prerequisites(api, patched_api, fake_bucket):
-    """Для /advise нужны конфиг LLM и хотя бы одна пробежка."""
-    patched_api.write_llm_config_version(fake_bucket, "openai", "gpt-5.6-luna", "sk-test")
-    api(FakeRequest("POST", "/", json_body={"date": "2026-08-16", "dist": 10.0}))
-
-
-def test_advise_surfaces_refusal_as_422(api, patched_api, fake_bucket, monkeypatch):
-    _seed_advice_prerequisites(api, patched_api, fake_bucket)
-
-    def refuse(*a, **kw):
-        raise patched_api.LLMRefused("нет медицинских рекомендаций")
-
-    monkeypatch.setattr(patched_api, "call_llm", refuse)
-    body, code, _ = api(FakeRequest("POST", "/advise"))
-    assert code == 422
-    assert "отклонила" in body and "медицинских" in body
-
-
-def test_advise_surfaces_truncation_with_a_fix_hint(api, patched_api, fake_bucket, monkeypatch):
-    _seed_advice_prerequisites(api, patched_api, fake_bucket)
-
-    def truncate(*a, **kw):
-        raise patched_api.LLMTruncated("оборвано")
-
-    monkeypatch.setattr(patched_api, "call_llm", truncate)
-    body, code, _ = api(FakeRequest("POST", "/advise"))
-    assert code == 502 and "глубину рассуждения" in body
-
-
 # ── План против факта (#41) ───────────────────────────────────────────────────
 
 def _seed_plan_with_runs(api, patched_api, fake_bucket, sub="u1"):
@@ -378,6 +347,26 @@ def test_compliance_does_not_write_anything(api, patched_api, fake_bucket):
         FakeRequest("GET", f"/plans/{plan_id}/compliance"))
     assert code == 200
     assert fake_bucket._store == before
+
+
+def test_retired_advise_endpoints_are_gone(api):
+    """Разовые рекомендации заменены диалогом (#46). Остался только
+    предпросмотр контекста — на него смотрит кнопка в Профиле."""
+    assert _status(api(FakeRequest("GET", "/advise"))) == 404
+    assert _status(api(FakeRequest("POST", "/advise"))) == 404
+    assert _status(api(FakeRequest("GET", "/advise/preview"))) == 200
+
+
+def test_preview_shows_what_the_ai_coach_is_given(api, patched_api, fake_bucket):
+    """Предпросмотр — это данные хода диалога, а не отдельный текст:
+    разойтись с тем, что видит модель, он не может."""
+    api(FakeRequest("POST", "/", json_body={"id": 9, "date": "2026-08-16", "dist": 12.5}))
+    preview = json.loads(api(FakeRequest("GET", "/advise/preview"))[0])
+    turn = patched_api.build_ai_turn(fake_bucket, "u1", {"run_id": None}, [])
+    assert preview == {"prompt": turn["data"], "system_prompt": turn["instructions"]}
+    assert "12.5км" in preview["prompt"]
+    assert "беговой тренер" in preview["system_prompt"]
+    assert "беговой тренер" not in preview["prompt"]
 
 
 def test_advise_preview_includes_plan_compliance(api, patched_api, fake_bucket):

@@ -12,18 +12,16 @@ import httpx
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
-from config import (ADMIN_DAILY_ADVISE_LIMIT, ADMIN_DAILY_AI_COACH_LIMIT,
-                    BUCKET_NAME, CLIENT_ID, DAILY_ADVISE_LIMIT,
+from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
-from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      LLMTruncated, RegistrationClosed, _fmt_duration, _fmt_pace,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
                      attach_fit_details_to_run, build_ai_turn,
-                     build_llm_context, build_plan_compliance, call_llm,
+                     build_plan_compliance, call_llm,
                      chat_unread, mark_chat_read, read_chat,
                      clean_ai_text, clean_athlete_profile, clean_effort,
                      clean_proposal,
@@ -34,14 +32,14 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      list_ai_threads, list_athletes_of, list_coaches,
                      mark_proposal_states, mask_key,
                      migrate_legacy_to_user, parse_coach_reply, parse_fit_file,
-                     parse_llm_json, read_advice_usage, read_ai_messages,
+                     read_advice_usage, read_ai_messages,
                      read_ai_thread, read_athlete_history,
-                     read_athlete_profile, read_latest_advice,
+                     read_athlete_profile,
                      read_llm_config_full, read_plan_weeks, read_plans_index,
                      read_races, read_registry, read_run_details, read_runs,
                      resolve_user, run_title, save_plan_weeks, set_active_plan,
                      set_coach_flag, set_user_coach, set_user_status,
-                     update_plan_meta, write_advice_version,
+                     update_plan_meta,
                      write_athlete_version, write_llm_config_version,
                      write_parsed_fit_to_tmp, write_races, write_runs)
 
@@ -406,46 +404,12 @@ def _ask_llm(cfg, system_prompt, user_prompt, history=None):
 
 
 def h_advise_preview(c):
-    ctx = build_llm_context(c.bucket, c.sub)
-    return jresp({"prompt": format_context_for_llm(ctx),
-                  "system_prompt": SYSTEM_PROMPT}, 200)
-
-
-def h_advise_get(c):
-    latest = read_latest_advice(c.bucket, c.sub)
-    if not latest:
-        return jresp({"available": False}, 200)
-    return jresp({"available": True, **latest}, 200)
-
-
-def h_advise_post(c):
-    cfg = read_llm_config_full(c.bucket)
-    if not cfg or not cfg.get("api_key"):
-        return jresp({"error": "LLM config not set. Обратитесь к администратору."}, 400)
-    limit = ADMIN_DAILY_ADVISE_LIMIT if c.is_admin else DAILY_ADVISE_LIMIT
-    usage = read_advice_usage(c.bucket, c.sub)
-    if usage.get("count", 0) >= limit:
-        return jresp({"error": "daily_limit_reached", "limit": limit}, 429)
-    ctx = build_llm_context(c.bucket, c.sub)
-    if not ctx["last_runs"]:
-        return jresp({"error": "Нужна хотя бы одна пробежка для рекомендаций"}, 400)
-    user_prompt = format_context_for_llm(ctx)
-    llm_res, failure = _ask_llm(cfg, SYSTEM_PROMPT, user_prompt)
-    if failure:
-        return failure
-    try:
-        recommendation = parse_llm_json(llm_res["text"])
-    except Exception as e:
-        return jresp({"error": f"Cannot parse LLM response as JSON: {str(e)[:200]}",
-                      "raw_text": llm_res["text"][:500]}, 502)
-
-    payload = write_advice_version(
-        c.bucket, c.sub, recommendation, ctx,
-        cfg["provider"], cfg["model"],
-        llm_res["input_tokens"], llm_res["output_tokens"],
-        cfg["version"], created_by=c.email)
-    increment_advice_usage(c.bucket, c.sub)
-    return jresp({"available": True, **payload}, 201)
+    """Данные, которые ИИ-тренер получает на каждый ход, — без самого
+    вопроса и без тренировок, выбранных для разбора. Путь остался от
+    разовых рекомендаций: на него смотрит кнопка в Профиле."""
+    turn = build_ai_turn(c.bucket, c.sub, {"run_id": None}, [])
+    return jresp({"prompt": turn["data"],
+                  "system_prompt": turn["instructions"]}, 200)
 
 
 # ── ИИ-тренер (#46): разборы ──────────────────────────────────────────────────
@@ -810,8 +774,6 @@ ROUTES = [
     ("POST",   r"^/config/llm$",                 h_llm_config_post,      True),
     ("POST",   r"^/config/llm/test$",            h_llm_config_test,      True),
 
-    ("GET",    r"^/advise$",                     h_advise_get,           False),
-    ("POST",   r"^/advise$",                     h_advise_post,          False),
     ("GET",    r"^/advise/preview$",             h_advise_preview,       False),
 
     ("GET",    r"^/ai-coach/threads$",                     h_ai_threads_get,    False),
