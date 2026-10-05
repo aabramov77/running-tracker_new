@@ -22,7 +22,8 @@ from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
 from compliance import current_week_idx, plan_compliance
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
-from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
+from llm_prompt import (SYSTEM_PROMPT, coach_chat_system_prompt,
+                        format_context_for_llm)
 
 def get_storage_client():
     return gcs.Client()
@@ -55,6 +56,12 @@ def p_tmp_details(sub, token): return f"tmp/{sub}/{token}/details.json"
 def p_chat_prefix(athlete, coach):      return f"{upfx(athlete)}coach_chat/{coach}/m/"
 def p_chat_msg(athlete, coach, msg_id): return f"{p_chat_prefix(athlete, coach)}{msg_id}.json"
 def p_chat_read(athlete, coach, role):  return f"{upfx(athlete)}coach_chat/{coach}/read/{role}.json"
+# Разборы с ИИ-тренером (#46): ветка и её сообщения — в namespace спортсмена.
+def p_ai_root(sub):                return f"{upfx(sub)}ai_coach/t/"
+def p_ai_thread(sub, tid):         return f"{p_ai_root(sub)}{tid}/thread.json"
+def p_ai_archived(sub, tid):       return f"{p_ai_root(sub)}{tid}/archived.json"
+def p_ai_msg_prefix(sub, tid):     return f"{p_ai_root(sub)}{tid}/m/"
+def p_ai_msg(sub, tid, msg_id):    return f"{p_ai_msg_prefix(sub, tid)}{msg_id}.json"
 
 # Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
 LEGACY_RUNS = "runs.json"
@@ -887,7 +894,13 @@ def write_llm_config_version(bucket, provider, model, api_key, effort=None, crea
 
 # ── LLM clients (Anthropic / OpenAI / Deepseek) ──────────────────────────────
 
-def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500):
+def _turns(history, user_prompt):
+    """Реплики диалога для провайдера: прошлые ходы (#46) и новый вопрос."""
+    return [*(history or []), {"role": "user", "content": user_prompt}]
+
+
+def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500,
+                    history=None):
     res = httpx.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -899,7 +912,7 @@ def _call_anthropic(model, api_key, system_prompt, user_prompt, max_tokens=1500)
             "model": model,
             "max_tokens": max_tokens,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
+            "messages": _turns(history, user_prompt),
         },
         timeout=60.0,
     )
@@ -948,14 +961,14 @@ def _post_chat(base_url, api_key, payload):
 
 
 def _call_openai_compatible(base_url, model, api_key, system_prompt, user_prompt,
-                            max_tokens=None, effort=None):
+                            max_tokens=None, effort=None, history=None):
     """Универсальный клиент для OpenAI и Deepseek (одинаковый протокол)."""
     budget = max_tokens or LLM_MAX_TOKENS
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            *_turns(history, user_prompt),
         ],
         "response_format": {"type": "json_object"},
         "reasoning_effort": clean_effort(effort),
@@ -995,18 +1008,23 @@ def clean_effort(effort):
     return effort if effort in LLM_EFFORT_LEVELS else LLM_DEFAULT_EFFORT
 
 
-def call_llm(provider, model, api_key, system_prompt, user_prompt, effort=None):
+def call_llm(provider, model, api_key, system_prompt, user_prompt, effort=None,
+             history=None):
+    """history — прошлые реплики диалога [{role: user|assistant, content}] (#46)."""
     if provider == "anthropic":
         # Провайдер вне интерфейса (#38): ключа нет. Уровень рассуждения у
         # Anthropic задаётся не reasoning_effort, а output_config.effort —
         # прокинуть его сюда придётся вместе с возвратом провайдера.
-        return _call_anthropic(model, api_key, system_prompt, user_prompt)
+        return _call_anthropic(model, api_key, system_prompt, user_prompt,
+                               history=history)
     if provider == "openai":
         return _call_openai_compatible("https://api.openai.com/v1", model, api_key,
-                                       system_prompt, user_prompt, effort=effort)
+                                       system_prompt, user_prompt, effort=effort,
+                                       history=history)
     if provider == "deepseek":
         return _call_openai_compatible("https://api.deepseek.com/v1", model, api_key,
-                                       system_prompt, user_prompt, effort=effort)
+                                       system_prompt, user_prompt, effort=effort,
+                                       history=history)
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -1548,11 +1566,44 @@ def _check_chat_cursor(cursor):
         raise ChatError("bad_cursor")
 
 
-def _chat_ids(bucket, athlete, coach):
-    prefix = p_chat_prefix(athlete, coach)
+# Нижний слой общий для чата с тренером и разборов с ИИ (#46): и там, и там
+# ветка — это префикс, под которым лежат сообщения-объекты.
+
+def _message_ids(bucket, prefix, id_re):
+    """Идентификаторы сообщений под префиксом, от старых к новым."""
     ids = (blob.name[len(prefix):-len(".json")]
            for blob in bucket.list_blobs(prefix=prefix) if blob.name.endswith(".json"))
-    return sorted(i for i in ids if _CHAT_ID_RE.match(i))
+    return sorted(i for i in ids if id_re.match(i))
+
+
+def _next_message_id(ids, role):
+    """(id, время) для нового сообщения ветки, в которой уже лежат ids.
+
+    Время в идентификаторе строго растёт внутри ветки: иначе при грубых или
+    разошедшихся часах инстансов новое сообщение встало бы раньше уже
+    показанного, и опрос по курсору after его бы пропустил.
+    """
+    now = datetime.utcnow()
+    if ids:
+        last = datetime.strptime(ids[-1][:21], "%Y%m%dT%H%M%S%f")
+        if now <= last:
+            now = last + timedelta(microseconds=1)
+    return f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}", now
+
+
+def _load_json_objects(bucket, paths):
+    """Объект на сообщение — это запрос на сообщение; читаем параллельно."""
+    def load(path):
+        return json.loads(bucket.blob(path).download_as_text())
+
+    if len(paths) > 1:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(load, paths))
+    return [load(path) for path in paths]
+
+
+def _chat_ids(bucket, athlete, coach):
+    return _message_ids(bucket, p_chat_prefix(athlete, coach), _CHAT_ID_RE)
 
 
 def append_chat_message(bucket, athlete, coach, from_sub, role, text):
@@ -1562,16 +1613,7 @@ def append_chat_message(bucket, athlete, coach, from_sub, role, text):
         raise ChatError("empty_message")
     if len(text) > CHAT_TEXT_MAX:
         raise ChatError("message_too_long")
-    now = datetime.utcnow()
-    # Время в идентификаторе строго растёт внутри ветки: иначе при грубых или
-    # разошедшихся часах инстансов новое сообщение встало бы раньше уже
-    # показанного, и опрос по курсору after его бы пропустил.
-    ids = _chat_ids(bucket, athlete, coach)
-    if ids:
-        last = datetime.strptime(ids[-1][:21], "%Y%m%dT%H%M%S%f")
-        if now <= last:
-            now = last + timedelta(microseconds=1)
-    msg_id = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}"
+    msg_id, now = _next_message_id(_chat_ids(bucket, athlete, coach), role)
     message = {"id": msg_id, "ts": now.isoformat() + "Z",
                "from_sub": from_sub, "from_role": role, "text": text}
     bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
@@ -1595,16 +1637,7 @@ def read_chat(bucket, athlete, coach, after=None, before=None, limit=CHAT_PAGE):
     if before:
         ids = [i for i in ids if i < before]
     page = ids[-limit:]
-
-    def load(msg_id):
-        return json.loads(bucket.blob(p_chat_msg(athlete, coach, msg_id)).download_as_text())
-
-    # Объект на сообщение — это запрос на сообщение; читаем параллельно.
-    if len(page) > 1:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            messages = list(pool.map(load, page))
-    else:
-        messages = [load(i) for i in page]
+    messages = _load_json_objects(bucket, [p_chat_msg(athlete, coach, i) for i in page])
     return {"messages": messages, "has_more": len(ids) > len(page)}
 
 
@@ -1641,6 +1674,173 @@ def mark_chat_read(bucket, athlete, coach, reader_role, last_id=None):
         content_type="application/json"
     )
     return target
+
+
+# ── Разборы с ИИ-тренером (#46) ───────────────────────────────────────────────
+# Разбор — ветка диалога спортсмена с LLM. Хранится как чат с тренером:
+# карточка ветки и каждое сообщение — отдельные неизменяемые объекты. Скрытие
+# разбора — объект-событие рядом; сама ветка остаётся в хранилище.
+
+AI_TITLE_MAX = 80
+AI_HISTORY_WINDOW = 12        # столько последних реплик ветки уходит модели
+_AI_ID_TIME = "%Y%m%dT%H%M%S%f"
+_AI_THREAD_ID_RE = re.compile(r"^\d{8}T\d{12}-[0-9a-f]{8}$")
+_AI_MSG_ID_RE = re.compile(r"^\d{8}T\d{12}-(athlete|ai)-[0-9a-f]{8}$")
+
+
+class AICoachError(ValueError):
+    """Запрос к разбору не принят. Код причины — str(исключения)."""
+
+
+def clean_ai_text(text):
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        raise AICoachError("empty_message")
+    if len(text) > CHAT_TEXT_MAX:
+        raise AICoachError("message_too_long")
+    return text
+
+
+def create_ai_thread(bucket, sub, title, created_by="api"):
+    """Заводит разбор и возвращает его карточку. LLM здесь не вызывается."""
+    now = datetime.utcnow()
+    thread = {
+        "id": f"{now.strftime(_AI_ID_TIME)}-{secrets_mod.token_hex(4)}",
+        "kind": "general",
+        "run_id": None,
+        "title": " ".join(str(title or "").split())[:AI_TITLE_MAX] or "Разбор",
+        "status": "active",
+        "created_at": now.isoformat() + "Z",
+        "created_by": created_by,
+    }
+    bucket.blob(p_ai_thread(sub, thread["id"])).upload_from_string(
+        json.dumps(thread, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return thread
+
+
+def read_ai_thread(bucket, sub, thread_id):
+    """Карточка разбора; None — такого нет или он скрыт."""
+    if not _AI_THREAD_ID_RE.match(str(thread_id)):
+        return None
+    blob = bucket.blob(p_ai_thread(sub, thread_id))
+    if not blob.exists() or bucket.blob(p_ai_archived(sub, thread_id)).exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+def list_ai_threads(bucket, sub):
+    """Разборы пользователя, сначала с самой свежей репликой.
+
+    Число сообщений и время последнего берутся из имён объектов, одним
+    list_blobs; скачиваются только карточки. Разбор без единого сообщения в
+    список не попадает: он остаётся, когда первый ход не дошёл до модели.
+    """
+    root = p_ai_root(sub)
+    found = {}
+    for blob in bucket.list_blobs(prefix=root):
+        thread_id, _, rest = blob.name[len(root):].partition("/")
+        if not _AI_THREAD_ID_RE.match(thread_id):
+            continue
+        entry = found.setdefault(thread_id, {"ids": [], "card": False, "archived": False})
+        if rest == "thread.json":
+            entry["card"] = True
+        elif rest == "archived.json":
+            entry["archived"] = True
+        elif rest.startswith("m/") and _AI_MSG_ID_RE.match(rest[2:-len(".json")]):
+            entry["ids"].append(rest[2:-len(".json")])
+
+    visible = sorted((tid for tid, e in found.items()
+                      if e["card"] and e["ids"] and not e["archived"]),
+                     key=lambda tid: max(found[tid]["ids"]), reverse=True)
+    threads = _load_json_objects(bucket, [p_ai_thread(sub, tid) for tid in visible])
+    for thread in threads:
+        ids = found[thread["id"]]["ids"]
+        last = datetime.strptime(max(ids)[:21], _AI_ID_TIME)
+        thread["messages"] = len(ids)
+        thread["last_ts"] = last.isoformat() + "Z"
+    return threads
+
+
+def archive_ai_thread(bucket, sub, thread_id, archived_by="api"):
+    """Скрывает разбор из списка. False — скрывать нечего."""
+    if not read_ai_thread(bucket, sub, thread_id):
+        return False
+    bucket.blob(p_ai_archived(sub, thread_id)).upload_from_string(
+        json.dumps({"archived_at": datetime.utcnow().isoformat() + "Z",
+                    "archived_by": archived_by}, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return True
+
+
+def append_ai_message(bucket, sub, thread_id, role, text, extra=None):
+    """Пишет реплику разбора новым объектом и возвращает её."""
+    prefix = p_ai_msg_prefix(sub, thread_id)
+    msg_id, now = _next_message_id(_message_ids(bucket, prefix, _AI_MSG_ID_RE), role)
+    message = {"id": msg_id, "ts": now.isoformat() + "Z", "role": role,
+               "text": text, **(extra or {})}
+    bucket.blob(p_ai_msg(sub, thread_id, msg_id)).upload_from_string(
+        json.dumps(message, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+    return message
+
+
+def read_ai_messages(bucket, sub, thread_id):
+    ids = _message_ids(bucket, p_ai_msg_prefix(sub, thread_id), _AI_MSG_ID_RE)
+    return _load_json_objects(bucket, [p_ai_msg(sub, thread_id, i) for i in ids])
+
+
+def ai_history(messages, window=AI_HISTORY_WINDOW):
+    """Последние реплики ветки в виде, который принимает call_llm.
+
+    Ответы ИИ отдаются тем же JSON-конвертом, в каком модель их писала:
+    увидев свои прошлые ответы простым текстом, она начинает отвечать так же
+    и ломает JSON-режим.
+    """
+    recent = messages[-window:]
+    while recent and recent[0]["role"] != "athlete":    # диалог открывает вопрос
+        recent = recent[1:]
+    return [{"role": "user", "content": m["text"]} if m["role"] == "athlete" else
+            {"role": "assistant", "content": json.dumps({"reply": m["text"]},
+                                                        ensure_ascii=False)}
+            for m in recent]
+
+
+def parse_coach_reply(text):
+    """(ответ, весь конверт) из ответа модели на ход диалога.
+
+    Модель, ответившая вне JSON, не повод терять ход: тогда весь её текст и
+    есть ответ. Пустой ответ — ошибка, показывать спортсмену нечего.
+    """
+    try:
+        envelope = parse_llm_json(text)
+    except ValueError:
+        envelope = None
+    if isinstance(envelope, dict):
+        reply = envelope.get("reply")
+    else:
+        envelope, reply = {}, text
+    reply = reply.strip() if isinstance(reply, str) else ""
+    if not reply:
+        raise ValueError("модель вернула пустой ответ")
+    return reply, envelope
+
+
+def build_ai_turn(bucket, sub, messages):
+    """Всё, что уходит модели на очередной ход, кроме самого вопроса.
+
+    Контекст пересобирается на каждый ход: между репликами спортсмен мог
+    добавить пробежку или поправить план.
+    """
+    ctx = build_llm_context(bucket, sub)
+    return {
+        "ctx": ctx,
+        "system": coach_chat_system_prompt(format_context_for_llm(ctx)),
+        "history": ai_history(messages),
+    }
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────

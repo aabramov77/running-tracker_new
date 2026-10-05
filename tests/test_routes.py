@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from conftest import FakeRequest
+
 
 def routes(api_module):
     return api_module.ROUTES
@@ -48,6 +50,11 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/advise",                "h_advise_get"),
     ("POST",   "/advise",                "h_advise_post"),
     ("GET",    "/advise/preview",        "h_advise_preview"),
+    ("GET",    "/ai-coach/threads",      "h_ai_threads_get"),
+    ("POST",   "/ai-coach/threads",      "h_ai_threads_post"),
+    ("GET",    "/ai-coach/threads/20260101T000000000000-deadbeef", "h_ai_thread_get"),
+    ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/messages", "h_ai_message_post"),
+    ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/archive",  "h_ai_thread_archive"),
     ("GET",    "/profile",               "h_profile_get"),
     ("POST",   "/profile",               "h_profile_post"),
     ("GET",    "/profile/history",       "h_profile_history"),
@@ -121,33 +128,6 @@ def test_unknown_path_is_404(api_module, path):
 
 
 # ── Сквозная проверка диспетчера ──────────────────────────────────────────────
-
-class FakeRequest:
-    def __init__(self, method="GET", path="/", json_body=None, args=None):
-        self.method = method
-        self.path = path
-        self._json = json_body
-        self.args = args or {}
-        self.files = None
-        self.headers = {"Authorization": "Bearer test-token"}
-
-    def get_json(self, silent=False):
-        return self._json
-
-
-@pytest.fixture
-def api(patched_api, fake_bucket, monkeypatch):
-    """runs_api с подменённой проверкой токена: тут проверяется маршрутизация,
-    а не подпись Google. Пользователь по умолчанию одобрен."""
-    def call(request, sub="u1", email="runner@example.com", approved=True):
-        token = {"sub": sub, "email": email, "name": "Runner"}
-        monkeypatch.setattr(patched_api, "verify_token", lambda r: token)
-        patched_api.resolve_user(fake_bucket, token)
-        if approved:
-            patched_api.set_user_status(fake_bucket, sub, "approved", "admin-sub")
-        return patched_api.handle_request(request)
-    return call
-
 
 def _status(response):
     return response[1]
@@ -654,7 +634,8 @@ def test_coach_routes_can_only_read_except_chat(api_module):
             assert method == "GET", f"{method} {pattern}"
 
 
-@pytest.mark.parametrize("tail", ["profile", "profile/history", "races", "advise"])
+@pytest.mark.parametrize("tail", ["profile", "profile/history", "races", "advise",
+                                  "ai-coach/threads"])
 def test_profile_and_the_rest_stay_private(api, patched_api, fake_bucket, tail):
     """Тренеру открыты планы и журнал. Вес, пульс, травмы, старты и советы ИИ
     не отдаёт ни один маршрут."""

@@ -95,6 +95,7 @@ function handleCredentialResponse(response) {
 
 function signOut() {
   idToken = null; userSub = null; currentRole = null;
+  aiReset();                  // #46: разборы прежнего пользователя — не следующему
   localStorage.removeItem('g_id_token');
   hideAccessScreens();
   document.getElementById('login-screen').classList.add('active');
@@ -338,7 +339,6 @@ function setRunScope(scope, btn) {
   document.querySelectorAll('.scope-btn[data-scope="' + scope + '"]').forEach(b => b.classList.add('active'));
   renderAll();
   if (document.getElementById('tab-stats').classList.contains('active')) renderCharts();
-  if (document.getElementById('tab-adjust').classList.contains('active')) renderAdjust();
 }
 
 /** Активные пробежки с учётом выбранной области (план / все). */
@@ -1607,25 +1607,6 @@ function renderCharts() {
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>r.date.slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
 }
 
-function renderAdjust() {
-  const el=document.getElementById('adjust-content');
-  const activeRuns = scopedRuns();
-  if(activeRuns.length<2){el.innerHTML='<div class="empty">Добавьте несколько пробежек для рекомендаций</div>';return;}
-  const paces=activeRuns.map(r=>parsePace(r.pace)).filter(Boolean);
-  const avgPace=paces.length?paces.reduce((a,b)=>a+b,0)/paces.length:null;
-  const hardRuns=activeRuns.filter(r=>r.feel==='hard'||r.feel==='bad');
-  const totalKm=activeRuns.reduce((s,r)=>s+r.dist,0);
-  const target=4.74;
-  let html='';
-  if(avgPace&&avgPace<target-0.2)html+=`<div class="suggestion good">Ваш средний темп (${formatPace(avgPace)}/км) лучше целевого. Можно увеличить объём интервалов.</div>`;
-  else if(avgPace&&avgPace>target+0.2)html+=`<div class="suggestion">Средний темп (${formatPace(avgPace)}/км) медленнее цели 4:44/км. Больше темповых тренировок в субботу.</div>`;
-  else if(avgPace)html+=`<div class="suggestion good">Средний темп (${formatPace(avgPace)}/км) в норме. Продолжайте!</div>`;
-  if(hardRuns.length>=2)html+=`<div class="suggestion warn">${hardRuns.length} тяжёлых тренировок подряд. Добавьте день восстановления.</div>`;
-  if(totalKm>30)html+=`<div class="suggestion good">Накоплено ${totalKm.toFixed(0)} км — отличный прогресс!</div>`;
-  if(!html)html='<div class="empty">Данных пока недостаточно</div>';
-  el.innerHTML=html;
-}
-
 // ── LLM Settings ──────────────────────────────────────────────────────────────
 
 // По одному варианту на провайдера. Anthropic убран из выбора: своего ключа
@@ -1949,76 +1930,212 @@ async function testLlmKey() {
   }
 }
 
-// ── LLM Advice ────────────────────────────────────────────────────────────────
+/// ── ИИ-тренер (#46) ───────────────────────────────────────────────────────────
+// Разбор — отдельная ветка диалога с моделью. Состояние живёт только в
+// памяти: источник истины — сервер. Опроса нет: ответ приходит на отправку.
+const AI_STARTERS = [
+  { label: '📊 Итоги недели', title: 'Итоги недели',
+    text: 'Подведи итоги этой недели: что получилось, что нет и на что обратить внимание.' },
+  { label: '🗓 Что поменять на следующей неделе', title: 'Корректировка следующей недели',
+    text: 'Что стоит поменять в плане на следующую неделю, исходя из последних тренировок?' },
+  { label: '🎯 Иду ли я к цели', title: 'Движение к цели',
+    text: 'Иду ли я по графику к целевому результату? Что сейчас сдерживает больше всего?' },
+];
+// session растёт при смене разбора: ответ, пришедший уже в другой разбор,
+// отбрасывается. pending — вопрос, на который модель ещё не ответила.
+const AICOACH = { threads: [], thread: null, messages: [], usage: null,
+                  pending: null, loading: false, session: 0 };
 
-function renderLlmAdvice(rec, meta) {
-  const out = document.getElementById('llm-advice-output');
-  const metaEl = document.getElementById('llm-advice-meta');
-  let html = '';
-  if (rec.assessment) {
-    html += `<div class="suggestion good"><b>Оценка:</b> ${escapeHtml(rec.assessment)}</div>`;
-  }
-  if (Array.isArray(rec.adjustments) && rec.adjustments.length) {
-    html += '<div class="card-title" style="margin-top:14px">Корректировки</div>';
-    rec.adjustments.forEach(a => {
-      html += `<div class="suggestion"><b>${escapeHtml(a.day || '')}:</b> ${escapeHtml(a.change || '')}</div>`;
-    });
-  }
-  if (Array.isArray(rec.warnings) && rec.warnings.length) {
-    html += '<div class="card-title" style="margin-top:14px">⚠ Предупреждения</div>';
-    rec.warnings.forEach(w => {
-      html += `<div class="suggestion warn">${escapeHtml(w)}</div>`;
-    });
-  }
-  if (!html) html = '<div class="empty">Пустой ответ от LLM</div>';
-  out.innerHTML = html;
-
-  if (meta) {
-    const dt = meta.created_at ? new Date(meta.created_at).toLocaleString('ru-RU') : '';
-    metaEl.textContent = `${meta.provider}/${meta.model} · ${meta.input_tokens || 0}+${meta.output_tokens || 0} токенов · ${dt}`;
-    metaEl.style.display = 'block';
-  }
+function aiReset() {
+  AICOACH.session++;
+  Object.assign(AICOACH, { threads: [], thread: null, messages: [], usage: null,
+                           pending: null, loading: false });
 }
 
-async function loadLatestAdvice() {
-  try {
-    const res = await fetch(API_URL + 'advise', { headers: authHeaders() });
-    if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data.available && data.recommendation) {
-      renderLlmAdvice(data.recommendation, data);
-    }
-  } catch (e) {}
+async function aiFetch(path, { method = 'GET', body = null } = {}) {
+  const res = await fetch(API_URL + 'ai-coach/' + path, {
+    method,
+    headers: authHeaders(body ? { 'Content-Type': 'application/json' } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) { handleAuthError(); throw Object.assign(new Error('Unauthorized'), { handled: true }); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`),
+                                   { code: data.error, status: res.status, limit: data.limit });
+  return data;
 }
 
-async function requestLlmAdvice() {
-  const btn = document.getElementById('llm-advice-btn');
-  const out = document.getElementById('llm-advice-output');
-  const metaEl = document.getElementById('llm-advice-meta');
-  btn.disabled = true;
-  const oldText = btn.textContent;
-  btn.textContent = '⏳ Думаю…';
-  out.innerHTML = '<div class="empty">⏳ Анализирую тренировки через LLM, обычно 5-15 секунд…</div>';
-  metaEl.style.display = 'none';
+function aiErrorText(e) {
+  if (e.status === 429) return `Дневной лимит сообщений исчерпан (${e.limit}). Счётчик сбрасывается раз в сутки.`;
+  if (e.code === 'message_too_long') return 'Сообщение длиннее 2000 символов';
+  if (e.status === 404) return 'Разбор не найден — возможно, он скрыт в другой вкладке';
+  return e.message || 'Не удалось получить ответ';
+}
+
+function aiNote(text) {
+  const el = document.getElementById('ai-msg');
+  el.style.display = text ? 'block' : 'none';
+  el.style.color = 'var(--c-danger)';
+  el.textContent = text ? '⚠ ' + text : '';
+}
+
+// Ответ модели — текст с лёгкой разметкой. Сначала экранируем, потом
+// размечаем: HTML из ответа не исполняется ни при каких условиях.
+function mdLite(text) {
+  return escapeHtml(text)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+    .replace(/^#{1,4}\s+(.+)$/gm, '<b>$1</b>')
+    .replace(/^[ \t]*[-*•]\s+/gm, '• ');
+}
+
+function aiMessageHtml(m) {
+  const mine = m.role === 'athlete';
+  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+}
+
+function aiRenderThreads() {
+  const el = document.getElementById('ai-threads');
+  if (!AICOACH.threads.length) {
+    el.innerHTML = '<div class="empty">Разборов пока нет. Задайте вопрос ниже или выберите подсказку.</div>';
+    return;
+  }
+  const current = AICOACH.thread && AICOACH.thread.id;
+  el.innerHTML = AICOACH.threads.map(t =>
+    `<div class="run-item ai-thread${t.id === current ? ' active' : ''}" onclick="aiOpenThread('${escapeHtml(t.id)}')">
+      <div class="run-date">${chatTime(t.last_ts)}</div>
+      <div class="run-info">
+        <div class="run-title">${escapeHtml(t.title)}</div>
+        <div class="run-meta">сообщений: ${t.messages}</div>
+      </div>
+      <button class="btn-sm" title="Скрыть разбор" onclick="event.stopPropagation();aiArchiveThread('${escapeHtml(t.id)}')" style="flex-shrink:0;color:var(--c-danger)">✕</button>
+    </div>`).join('');
+}
+
+function aiRender(scrollToEnd = true) {
+  const { thread, messages, pending, loading, usage } = AICOACH;
+  document.getElementById('ai-title').textContent = thread && thread.title ? thread.title : 'Новый разбор';
+  document.getElementById('ai-usage').textContent =
+    usage ? `сегодня ${usage.count} из ${usage.limit}` : '';
+
+  let html = loading ? '<div class="empty">Загрузка…</div>' : messages.map(aiMessageHtml).join('');
+  if (pending) html += `<div class="chat-msg mine">${escapeHtml(pending)}</div>`
+                     + '<div class="chat-msg ai-thinking">Тренер думает…</div>';
+  const log = document.getElementById('ai-log');
+  log.innerHTML = html;
+  log.style.display = html ? '' : 'none';
+  if (scrollToEnd) log.scrollTop = log.scrollHeight;
+
+  document.getElementById('ai-starters').style.display = html ? 'none' : '';
+  document.getElementById('ai-starter-list').innerHTML = AI_STARTERS.map((s, i) =>
+    `<button class="btn-sm" onclick="aiStarter(${i})">${escapeHtml(s.label)}</button>`).join('');
+  document.getElementById('ai-send').disabled = !!pending || loading;
+}
+
+function openAiCoachTab() {
+  aiRender(false);
+  aiLoadThreads();
+}
+
+async function aiLoadThreads() {
+  const who = userSub;
   try {
-    const res = await fetch(API_URL + 'advise', {
-      method: 'POST',
-      headers: authHeaders({'Content-Type':'application/json'}),
-    });
-    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({error: 'HTTP ' + res.status}));
-      throw new Error(err.error || `HTTP ${res.status}`);
-    }
-    const data = await res.json();
-    renderLlmAdvice(data.recommendation, data);
+    const data = await aiFetch('threads');
+    if (userSub !== who) return;          // за время запроса вошёл другой человек
+    AICOACH.threads = data.threads || [];
+    AICOACH.usage = data.usage || AICOACH.usage;
+    aiRenderThreads();
+    aiRender(false);
   } catch (e) {
-    out.innerHTML = `<div class="suggestion warn">⚠ ${escapeHtml(e.message)}</div>`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
+    if (!e.handled) document.getElementById('ai-threads').innerHTML =
+      '<div class="empty">Не удалось загрузить разборы</div>';
   }
+}
+
+async function aiOpenThread(id) {
+  const session = ++AICOACH.session;
+  const listed = AICOACH.threads.find(t => t.id === id);
+  Object.assign(AICOACH, { thread: listed || { id, title: '' }, messages: [],
+                           pending: null, loading: true });
+  aiNote('');
+  aiRenderThreads();
+  aiRender();
+  try {
+    const data = await aiFetch('threads/' + encodeURIComponent(id));
+    if (AICOACH.session !== session) return;
+    Object.assign(AICOACH, { thread: data.thread, messages: data.messages || [],
+                             usage: data.usage || AICOACH.usage, loading: false });
+    aiRender();
+  } catch (e) {
+    if (AICOACH.session !== session) return;
+    Object.assign(AICOACH, { thread: null, loading: false });
+    aiRender();
+    if (!e.handled) aiNote(aiErrorText(e));
+    aiLoadThreads();
+  }
+}
+
+function aiNewThread() {
+  AICOACH.session++;
+  Object.assign(AICOACH, { thread: null, messages: [], pending: null, loading: false });
+  aiNote('');
+  aiRenderThreads();
+  aiRender();
+  document.getElementById('ai-input').focus();
+}
+
+// Отправка вопроса. Разбор заводится на первом вопросе, а не кнопкой
+// «Новый разбор»: пустых веток в хранилище не остаётся.
+async function aiSend(preset = null, title = null) {
+  const input = document.getElementById('ai-input');
+  const text = (preset || input.value).trim();
+  if (!text || AICOACH.pending || AICOACH.loading) return;
+  const session = AICOACH.session;
+  AICOACH.pending = text;
+  if (!preset) input.value = '';
+  aiNote('');
+  aiRender();
+  try {
+    if (!AICOACH.thread) {
+      const created = await aiFetch('threads', { method: 'POST', body: { title: title || text } });
+      if (AICOACH.session !== session) return;
+      AICOACH.thread = created.thread;
+    }
+    const data = await aiFetch(`threads/${encodeURIComponent(AICOACH.thread.id)}/messages`,
+                               { method: 'POST', body: { text } });
+    if (AICOACH.session !== session) { aiLoadThreads(); return; }
+    AICOACH.messages = AICOACH.messages.concat(data.messages || []);
+    AICOACH.usage = data.usage || AICOACH.usage;
+    AICOACH.pending = null;
+    aiRender();
+    aiLoadThreads();
+  } catch (e) {
+    if (AICOACH.session !== session) return;
+    AICOACH.pending = null;
+    if (!input.value) input.value = text;       // вопрос не теряется — можно отправить снова
+    aiRender();
+    if (!e.handled) aiNote(aiErrorText(e));
+  }
+}
+
+function aiStarter(index) {
+  const starter = AI_STARTERS[index];
+  if (starter) aiSend(starter.text, starter.title);
+}
+
+function aiKey(event) {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); aiSend(); }
+}
+
+async function aiArchiveThread(id) {
+  if (!confirm('Скрыть этот разбор? Переписка останется в хранилище.')) return;
+  try {
+    await aiFetch(`threads/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+  } catch (e) {
+    if (e.handled) return;
+    if (e.status !== 404) { aiNote(aiErrorText(e)); return; }   // 404 — уже скрыт
+  }
+  if (AICOACH.thread && AICOACH.thread.id === id) aiNewThread();
+  aiLoadThreads();
 }
 
 function showTab(name,btn){
@@ -2027,7 +2144,7 @@ function showTab(name,btn){
   document.getElementById('tab-'+name).classList.add('active');
   btn.classList.add('active');
   if(name==='stats')renderCharts();
-  if(name==='adjust'){renderAdjust(); loadLatestAdvice();}
+  if(name==='aicoach')openAiCoachTab();   // #46
   if(name==='races')renderRaces();
   if(name==='profile'){loadProfile(); loadLlmSettings(); loadMyCoach();}   // #32; loadLlmSettings сам пропустит не-админа
   if(name==='users')loadUsers();

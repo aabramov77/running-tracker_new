@@ -128,3 +128,32 @@ def patched_api(api_module, fake_bucket, monkeypatch):
     Патчим имя в api: оно связано импортом и на storage уже не смотрит."""
     monkeypatch.setattr(api_module, "get_storage_client", lambda: FakeClient(fake_bucket))
     return api_module
+
+
+# ── HTTP-запрос и вызов диспетчера (общие для тестов маршрутов) ───────────────
+
+class FakeRequest:
+    def __init__(self, method="GET", path="/", json_body=None, args=None):
+        self.method = method
+        self.path = path
+        self._json = json_body
+        self.args = args or {}
+        self.files = None
+        self.headers = {"Authorization": "Bearer test-token"}
+
+    def get_json(self, silent=False):
+        return self._json
+
+
+@pytest.fixture
+def api(patched_api, fake_bucket, monkeypatch):
+    """runs_api с подменённой проверкой токена: тут проверяется маршрутизация,
+    а не подпись Google. Пользователь по умолчанию одобрен."""
+    def call(request, sub="u1", email="runner@example.com", approved=True):
+        token = {"sub": sub, "email": email, "name": "Runner"}
+        monkeypatch.setattr(patched_api, "verify_token", lambda r: token)
+        patched_api.resolve_user(fake_bucket, token)
+        if approved:
+            patched_api.set_user_status(fake_bucket, sub, "approved", "admin-sub")
+        return patched_api.handle_request(request)
+    return call

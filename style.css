@@ -491,6 +491,15 @@ table.pb-table td:last-child { text-align: right; }
 .chat-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 8px; }
 .chat-form .form-group { flex: 1; }
 .chat-form textarea { min-height: 44px; max-height: 160px; }
+/* ИИ-тренер (#46): лента та же, что у чата с тренером, но ответы длиннее */
+.ai-log { max-height: 60vh; }
+.ai-log .chat-msg { max-width: 88%; }
+.ai-thinking { color: var(--text-muted); font-style: italic; }
+.ai-starter-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+#ai-threads { max-height: 230px; overflow-y: auto; }
+.ai-thread { cursor: pointer; }
+.ai-thread.active .run-title { color: var(--c-accent); }
+#ai-msg { margin-top: 6px; }
 .nav-badge {
   display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px;
   border-radius: 10px; background: var(--c-danger); color: #fff;

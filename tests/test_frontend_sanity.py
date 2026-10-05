@@ -234,6 +234,52 @@ def test_coach_tab_is_wired():
     assert "showTab('coach',this)" in html
 
 
+def _js_section(js, start_marker, end_marker):
+    start = js.index(start_marker)
+    return js[start:js.index(end_marker, start)]
+
+
+# ── ИИ-тренер (#46) ───────────────────────────────────────────────────────────
+
+def test_ai_coach_tab_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="tab-aicoach"' in html
+    assert "showTab('aicoach',this)" in html
+    assert "if(name==='aicoach')openAiCoachTab()" in APP_JS.read_text(encoding="utf-8")
+
+
+def test_old_adjust_tab_is_gone_everywhere():
+    """Вкладку заменили целиком: забытая ссылка на её элементы падает в
+    рантайме на getElementById(...).classList."""
+    for path in (APP_JS, INDEX):
+        text = path.read_text(encoding="utf-8")
+        for leftover in ("tab-adjust", "renderAdjust", "llm-advice", "requestLlmAdvice"):
+            assert leftover not in text, f"{leftover} остался в {path.name}"
+
+
+def test_ai_coach_generated_handlers_exist():
+    """Кнопки разборов и подсказок рисует app.js — проверка inline-обработчиков
+    из index.html их не видит."""
+    js = APP_JS.read_text(encoding="utf-8")
+    section = _js_section(js, "// ── ИИ-тренер (#46)", "function showTab(")
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    called = set()
+    for handler in re.findall(r'onclick="([^"]*)"', section):
+        called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
+    called -= {"escapeHtml"}            # подстановка в шаблоне, не обработчик
+    assert called and not (called - defined), sorted(called - defined)
+
+
+def test_ai_coach_answers_are_escaped_before_markup():
+    """Ответ модели — недоверенный текст: разметка накладывается только
+    поверх экранированной строки."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "function mdLite(", "\n}\n")
+    assert body.index("escapeHtml(text)") < body.index(".replace(")
+    section = _js_section(js, "// ── ИИ-тренер (#46)", "function showTab(")
+    assert "localStorage" not in section
+
+
 def test_coach_screen_keeps_out_of_own_data():
     """Экран тренера держит чужие данные в COACH. Запись в свои runs/PLAN или
     в localStorage отправила бы чужие пробежки в кэш и офлайн-синхронизацию."""

@@ -12,23 +12,27 @@ import httpx
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
-from config import (ADMIN_DAILY_ADVISE_LIMIT, BUCKET_NAME, CLIENT_ID,
-                    DAILY_ADVISE_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
+from config import (ADMIN_DAILY_ADVISE_LIMIT, ADMIN_DAILY_AI_COACH_LIMIT,
+                    BUCKET_NAME, CLIENT_ID, DAILY_ADVISE_LIMIT,
+                    DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
-from storage import (ChatError, CoachLinkError, LLMRefused, LLMTruncated,
-                     RegistrationClosed, _fmt_duration, _fmt_pace,
-                     active_coach_sub, append_chat_message, archive_plan,
-                     attach_fit_details_to_run,
+from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
+                     LLMTruncated, RegistrationClosed, _fmt_duration, _fmt_pace,
+                     active_coach_sub, append_ai_message, append_chat_message,
+                     archive_ai_thread, archive_plan,
+                     attach_fit_details_to_run, build_ai_turn,
                      build_llm_context, build_plan_compliance, call_llm,
                      chat_unread, mark_chat_read, read_chat,
-                     clean_athlete_profile, clean_effort, cleanup_old_tmp,
-                     coach_can_access, compute_athlete_derived, create_plan,
+                     clean_ai_text, clean_athlete_profile, clean_effort,
+                     cleanup_old_tmp, coach_can_access,
+                     compute_athlete_derived, create_ai_thread, create_plan,
                      current_coach, find_plan, get_active_plan,
                      get_storage_client, increment_advice_usage,
-                     list_athletes_of, list_coaches, mask_key,
-                     migrate_legacy_to_user, parse_fit_file, parse_llm_json,
-                     read_advice_usage, read_athlete_history,
+                     list_ai_threads, list_athletes_of, list_coaches, mask_key,
+                     migrate_legacy_to_user, parse_coach_reply, parse_fit_file,
+                     parse_llm_json, read_advice_usage, read_ai_messages,
+                     read_ai_thread, read_athlete_history,
                      read_athlete_profile, read_latest_advice,
                      read_llm_config_full, read_plan_weeks, read_plans_index,
                      read_races, read_registry, read_run_details, read_runs,
@@ -375,6 +379,29 @@ def h_llm_config_test(c):
         return jresp({"ok": False, "error": str(e)[:200]}, 200)
 
 
+def _ask_llm(cfg, system_prompt, user_prompt, history=None):
+    """(ответ LLM, None) либо (None, готовый ответ с ошибкой).
+
+    Сбои провайдера приходят в разном виде — исключением, отказом внутри
+    HTTP 200, обрывом по бюджету. Раскладка по кодам одна на всех, кто зовёт
+    модель.
+    """
+    try:
+        return call_llm(cfg["provider"], cfg["model"], cfg["api_key"],
+                        system_prompt, user_prompt, effort=cfg.get("effort"),
+                        history=history), None
+    except LLMRefused as e:
+        return None, jresp({"error": f"Модель отклонила запрос: {str(e)[:300]}"}, 422)
+    except LLMTruncated:
+        return None, jresp({"error": "Ответ не поместился в лимит токенов — "
+                                     "понизьте глубину рассуждения в настройках."}, 502)
+    except httpx.HTTPStatusError as e:
+        return None, jresp({"error": f"Provider {e.response.status_code}: "
+                                     f"{e.response.text[:300]}"}, 502)
+    except Exception as e:
+        return None, jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+
+
 def h_advise_preview(c):
     ctx = build_llm_context(c.bucket, c.sub)
     return jresp({"prompt": format_context_for_llm(ctx),
@@ -400,18 +427,9 @@ def h_advise_post(c):
     if not ctx["last_runs"]:
         return jresp({"error": "Нужна хотя бы одна пробежка для рекомендаций"}, 400)
     user_prompt = format_context_for_llm(ctx)
-    try:
-        llm_res = call_llm(cfg["provider"], cfg["model"], cfg["api_key"],
-                           SYSTEM_PROMPT, user_prompt, effort=cfg.get("effort"))
-    except LLMRefused as e:
-        return jresp({"error": f"Модель отклонила запрос: {str(e)[:300]}"}, 422)
-    except LLMTruncated:
-        return jresp({"error": "Ответ не поместился в лимит токенов — "
-                               "понизьте глубину рассуждения в настройках."}, 502)
-    except httpx.HTTPStatusError as e:
-        return jresp({"error": f"Provider {e.response.status_code}: {e.response.text[:300]}"}, 502)
-    except Exception as e:
-        return jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+    llm_res, failure = _ask_llm(cfg, SYSTEM_PROMPT, user_prompt)
+    if failure:
+        return failure
     try:
         recommendation = parse_llm_json(llm_res["text"])
     except Exception as e:
@@ -425,6 +443,86 @@ def h_advise_post(c):
         cfg["version"], created_by=c.email)
     increment_advice_usage(c.bucket, c.sub)
     return jresp({"available": True, **payload}, 201)
+
+
+# ── ИИ-тренер (#46): разборы ──────────────────────────────────────────────────
+# Все маршруты работают только с c.sub: чужой разбор недостижим по построению
+# пути, отдельной проверки доступа здесь нет и быть не должно.
+
+def _ai_usage(c):
+    """Израсходовано и разрешено сообщений за сутки."""
+    limit = ADMIN_DAILY_AI_COACH_LIMIT if c.is_admin else DAILY_AI_COACH_LIMIT
+    return {"count": read_advice_usage(c.bucket, c.sub).get("count", 0), "limit": limit}
+
+
+def h_ai_threads_get(c):
+    return jresp({"threads": list_ai_threads(c.bucket, c.sub),
+                  "usage": _ai_usage(c)}, 200)
+
+
+def h_ai_threads_post(c):
+    thread = create_ai_thread(c.bucket, c.sub, c.body().get("title"),
+                              created_by=c.email)
+    return jresp({"thread": thread}, 201)
+
+
+def h_ai_thread_get(c):
+    thread = read_ai_thread(c.bucket, c.sub, c.args[0])
+    if not thread:
+        return jresp({"error": "thread not found"}, 404)
+    return jresp({"thread": thread,
+                  "messages": read_ai_messages(c.bucket, c.sub, thread["id"]),
+                  "usage": _ai_usage(c)}, 200)
+
+
+def h_ai_thread_archive(c):
+    if not archive_ai_thread(c.bucket, c.sub, c.args[0], archived_by=c.email):
+        return jresp({"error": "thread not found"}, 404)
+    return jresp({"ok": True}, 200)
+
+
+def h_ai_message_post(c):
+    thread = read_ai_thread(c.bucket, c.sub, c.args[0])
+    if not thread:
+        return jresp({"error": "thread not found"}, 404)
+    try:
+        text = clean_ai_text(c.body().get("text"))
+    except AICoachError as e:
+        return jresp({"error": str(e)}, 400)
+    cfg = read_llm_config_full(c.bucket)
+    if not cfg or not cfg.get("api_key"):
+        return jresp({"error": "LLM config not set. Обратитесь к администратору."}, 400)
+    usage = _ai_usage(c)
+    if usage["count"] >= usage["limit"]:
+        return jresp({"error": "daily_limit_reached", "limit": usage["limit"]}, 429)
+
+    turn = build_ai_turn(c.bucket, c.sub,
+                         read_ai_messages(c.bucket, c.sub, thread["id"]))
+    llm_res, failure = _ask_llm(cfg, turn["system"], text, history=turn["history"])
+    if failure:
+        return failure
+    try:
+        reply, _ = parse_coach_reply(llm_res["text"])
+    except ValueError as e:
+        return jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+
+    # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
+    # разборе реплику, на которую никто не ответил.
+    ctx = turn["ctx"]
+    question = append_ai_message(c.bucket, c.sub, thread["id"], "athlete", text,
+                                 {"created_by": c.email})
+    answer = append_ai_message(c.bucket, c.sub, thread["id"], "ai", reply, {
+        "provider": cfg["provider"], "model": cfg["model"],
+        "input_tokens": llm_res["input_tokens"],
+        "output_tokens": llm_res["output_tokens"],
+        "based_on_llm_config_version": cfg["version"],
+        "based_on_plan_id": ctx.get("plan_id"),
+        "based_on_plan_version": ctx.get("plan_version"),
+        "based_on_profile_version": ctx.get("profile_version", 0),
+        "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
+    })
+    usage["count"] = increment_advice_usage(c.bucket, c.sub)["count"]
+    return jresp({"messages": [question, answer], "usage": usage}, 201)
 
 
 def h_profile_history(c):
@@ -667,6 +765,12 @@ ROUTES = [
     ("GET",    r"^/advise$",                     h_advise_get,           False),
     ("POST",   r"^/advise$",                     h_advise_post,          False),
     ("GET",    r"^/advise/preview$",             h_advise_preview,       False),
+
+    ("GET",    r"^/ai-coach/threads$",                     h_ai_threads_get,    False),
+    ("POST",   r"^/ai-coach/threads$",                     h_ai_threads_post,   False),
+    ("GET",    r"^/ai-coach/threads/([\w-]+)$",            h_ai_thread_get,     False),
+    ("POST",   r"^/ai-coach/threads/([\w-]+)/archive$",    h_ai_thread_archive, False),
+    ("POST",   r"^/ai-coach/threads/([\w-]+)/messages$",   h_ai_message_post,   False),
 
     ("GET",    r"^/profile$",                    h_profile_get,          False),
     ("POST",   r"^/profile$",                    h_profile_post,         False),
