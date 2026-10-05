@@ -243,6 +243,41 @@ COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер. �
 COACH_CHAT_REPLY_FORMAT = """Формат ответа — СТРОГО JSON без текста до или после:
 {"reply": "текст ответа спортсмену"}"""
 
+# Формат с правками плана. Используется, только когда модели показана таблица
+# «План: что можно менять» — без неё адресовать правку нечем.
+COACH_CHAT_PROPOSAL_FORMAT = """Формат ответа — СТРОГО JSON без текста до или после:
+{"reply": "текст ответа спортсмену", "proposal": null}
+
+Когда нужно изменить план, вместо null передай правки:
+{"reply": "...", "proposal": {"summary": "что меняется и зачем, одной фразой", "changes": [{"week": 6, "day": "wed", "text": "новый текст ячейки", "reason": "почему"}]}}
+
+Правила для proposal:
+- Заполняй его, только когда спортсмен просит изменить план либо изменение явно необходимо (травма, перегруз, пропущена ключевая тренировка). На обычный вопрос или разбор тренировки — null.
+- week — номер недели, day — код дня (mon, tue, wed, thu, fri, sat, sun) из таблицы «План: что можно менять». Менять можно только дни этой таблицы, не помеченные как прошедшие.
+- text — новое содержимое ячейки целиком, в том же стиле, что остальной план. Пустая строка — день отдыха.
+- Не больше 14 правок. В reply объясни их словами: спортсмен увидит карточку «было → стало» и сам решит, применять ли. Не пиши, что план уже изменён."""
+
+
+def format_plan_window(window):
+    """Таблица недель, которые модель может править (#46).
+
+    На вход — список из storage.ai_plan_window. Дни идут по датам, а не
+    пн→вс: у строки вс→сб воскресенье — первый день, и модель не должна
+    считать его концом недели.
+    """
+    day_ru = dict(PLAN_DAYS)
+    lines = ["=== План: что можно менять ==="]
+    for week in window:
+        phase = PLAN_PHASE_LABELS.get(week.get("phase"), week.get("phase") or "")
+        head = f"Неделя {week['week']}" + (" (текущая)" if week.get("current") else "")
+        head += f", {week['start']} – {week['end']}" + (f", {phase}" if phase else "")
+        lines.append(head)
+        for day in week["days"]:
+            past = " (прошёл, менять нельзя)" if day["past"] else ""
+            lines.append(f"  {day['field']} ({day_ru[day['field']]} {day['date']}): "
+                         f"{day['text'] or '—'}{past}")
+    return "\n".join(lines)
+
 FOCUS_LAPS_MAX = 45           # марафон на километровом автокруге помещается целиком
 
 
@@ -329,7 +364,7 @@ def format_run_focus(focus):
     return "\n".join(lines)
 
 
-def coach_chat_system_prompt(context_text, focus_blocks=()):
+def coach_chat_system_prompt(context_text, focus_blocks=(), plan_window_text=""):
     """Системный промпт хода: роль, формат ответа и свежие данные спортсмена.
 
     Данные идут в системную часть, а не репликой: так история диалога
@@ -337,13 +372,17 @@ def coach_chat_system_prompt(context_text, focus_blocks=()):
     подставляется актуальный, не тот, что был на момент первого вопроса.
 
     focus_blocks — подробные блоки пробежек, которые спортсмен выбрал для
-    разбора; последняя в списке прикреплена позже всех.
+    разбора; последняя в списке прикреплена позже всех. plan_window_text —
+    таблица недель, открытых для правок; с ней модель получает и формат
+    предложения, без неё предлагать правки ей нечем.
     """
     parts = [
         COACH_CHAT_SYSTEM_PROMPT,
-        COACH_CHAT_REPLY_FORMAT,
+        COACH_CHAT_PROPOSAL_FORMAT if plan_window_text else COACH_CHAT_REPLY_FORMAT,
         "=== Данные спортсмена на момент сообщения ===\n" + context_text,
     ]
+    if plan_window_text:
+        parts.append(plan_window_text)
     if focus_blocks:
         parts.append(
             "=== Тренировки, выбранные спортсменом для разбора ===\n"

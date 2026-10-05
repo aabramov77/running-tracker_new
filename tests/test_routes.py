@@ -55,6 +55,8 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/ai-coach/threads/20260101T000000000000-deadbeef", "h_ai_thread_get"),
     ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/messages", "h_ai_message_post"),
     ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/archive",  "h_ai_thread_archive"),
+    ("POST",   "/ai-coach/threads/20260101T000000000000-deadbeef/messages/"
+               "20260101T000000000001-ai-deadbeef/apply",                   "h_ai_proposal_apply"),
     ("GET",    "/profile",               "h_profile_get"),
     ("POST",   "/profile",               "h_profile_post"),
     ("GET",    "/profile/history",       "h_profile_history"),

@@ -267,8 +267,22 @@ def test_ai_coach_generated_handlers_exist():
     for handler in re.findall(r'onclick="([^"]*)"', section):
         handler = re.sub(r"\$\{[^}]*\}", "", handler)     # подстановки — не вызовы обработчика
         called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
-    assert {"aiOpenThread", "aiArchiveThread", "aiStarter", "showRunDetail"} <= called
+    assert {"aiOpenThread", "aiArchiveThread", "aiStarter", "showRunDetail",
+            "aiApplyProposal"} <= called
     assert not (called - defined), sorted(called - defined)
+
+
+def test_plan_is_changed_only_by_the_apply_button():
+    """ИИ предлагает, применяет спортсмен: раздел ИИ-тренера сам план не
+    пишет — ни напрямую в PLAN, ни через сохранение недель. После применения
+    он перечитывает план с сервера."""
+    js = APP_JS.read_text(encoding="utf-8")
+    section = _js_section(js, "// ── ИИ-тренер (#46)", "function showTab(")
+    assert not re.search(r"(?<![.\w])PLAN\s*=[^=]", section)
+    assert "postPlanWeeks" not in section and "savePlanEdits" not in section
+    apply = _js_section(section, "async function aiApplyProposal(", "\n}\n")
+    assert "confirm(" in apply and "planEditMode" in apply
+    assert apply.index("/apply`") < apply.index("await loadPlan()")
 
 
 def test_run_review_entry_points_are_wired():

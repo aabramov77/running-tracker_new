@@ -20,16 +20,19 @@ from llm_prompt import SYSTEM_PROMPT, format_context_for_llm
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      LLMTruncated, RegistrationClosed, _fmt_duration, _fmt_pace,
                      active_coach_sub, append_ai_message, append_chat_message,
+                     apply_ai_proposal,
                      archive_ai_thread, archive_plan,
                      attach_fit_details_to_run, build_ai_turn,
                      build_llm_context, build_plan_compliance, call_llm,
                      chat_unread, mark_chat_read, read_chat,
                      clean_ai_text, clean_athlete_profile, clean_effort,
+                     clean_proposal,
                      cleanup_old_tmp, coach_can_access,
                      compute_athlete_derived, create_ai_thread, create_plan,
                      current_coach, find_own_run, find_plan, get_active_plan,
                      get_storage_client, increment_advice_usage,
-                     list_ai_threads, list_athletes_of, list_coaches, mask_key,
+                     list_ai_threads, list_athletes_of, list_coaches,
+                     mark_proposal_states, mask_key,
                      migrate_legacy_to_user, parse_coach_reply, parse_fit_file,
                      parse_llm_json, read_advice_usage, read_ai_messages,
                      read_ai_thread, read_athlete_history,
@@ -485,9 +488,9 @@ def h_ai_thread_get(c):
     thread = read_ai_thread(c.bucket, c.sub, c.args[0])
     if not thread:
         return jresp({"error": "thread not found"}, 404)
-    return jresp({"thread": thread,
-                  "messages": read_ai_messages(c.bucket, c.sub, thread["id"]),
-                  "usage": _ai_usage(c)}, 200)
+    messages = mark_proposal_states(c.bucket, c.sub, thread["id"],
+                                    read_ai_messages(c.bucket, c.sub, thread["id"]))
+    return jresp({"thread": thread, "messages": messages, "usage": _ai_usage(c)}, 200)
 
 
 def h_ai_thread_archive(c):
@@ -518,13 +521,18 @@ def h_ai_message_post(c):
     if failure:
         return failure
     try:
-        reply, _ = parse_coach_reply(llm_res["text"])
+        reply, envelope = parse_coach_reply(llm_res["text"])
     except ValueError as e:
         return jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
 
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
     ctx = turn["ctx"]
+    proposal = clean_proposal(envelope.get("proposal"), turn["plan_window"])
+    if proposal:
+        # К какой версии плана относится «было» — по ней apply решает,
+        # применимо ли ещё предложение.
+        proposal.update(plan_id=ctx["plan_id"], plan_version=ctx["plan_version"])
     asked = {"created_by": c.email}
     if run:
         # Подпись хранится снимком: позже пробежку могут скрыть или поправить,
@@ -541,9 +549,28 @@ def h_ai_message_post(c):
         "based_on_plan_version": ctx.get("plan_version"),
         "based_on_profile_version": ctx.get("profile_version", 0),
         "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
+        **({"proposal": proposal} if proposal else {}),
     })
+    if proposal:
+        answer = {**answer, "proposal_state": "open"}
     usage["count"] = increment_advice_usage(c.bucket, c.sub)["count"]
     return jresp({"messages": [question, answer], "usage": usage}, 201)
+
+
+def h_ai_proposal_apply(c):
+    thread = read_ai_thread(c.bucket, c.sub, c.args[0])
+    if not thread:
+        return jresp({"error": "thread not found"}, 404)
+    try:
+        applied = apply_ai_proposal(c.bucket, c.sub, thread["id"], c.args[1],
+                                    applied_by=c.email)
+    except AICoachError as e:
+        # Нечего применять — ошибка запроса; уже применено или устарело —
+        # конфликт с текущим состоянием плана.
+        return jresp({"error": str(e)}, 400 if str(e) == "no_proposal" else 409)
+    if not applied:
+        return jresp({"error": "message not found"}, 404)
+    return jresp({"applied": applied}, 201)
 
 
 def h_profile_history(c):
@@ -792,6 +819,7 @@ ROUTES = [
     ("GET",    r"^/ai-coach/threads/([\w-]+)$",            h_ai_thread_get,     False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/archive$",    h_ai_thread_archive, False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages$",   h_ai_message_post,   False),
+    ("POST",   r"^/ai-coach/threads/([\w-]+)/messages/([\w-]+)/apply$", h_ai_proposal_apply, False),
 
     ("GET",    r"^/profile$",                    h_profile_get,          False),
     ("POST",   r"^/profile$",                    h_profile_post,         False),

@@ -1957,12 +1957,13 @@ const AI_STARTERS = [
 // отбрасывается. pending — вопрос {text, runId}, на который модель ещё не
 // ответила.
 const AICOACH = { threads: [], thread: null, messages: [], usage: null,
-                  pending: null, loading: false, session: 0 };
+                  pending: null, loading: false, applying: false, session: 0 };
+const AI_DAY_LABELS = Object.fromEntries(PLAN_DAYS);    // mon → «Пн»
 
 function aiReset() {
   AICOACH.session++;
   Object.assign(AICOACH, { threads: [], thread: null, messages: [], usage: null,
-                           pending: null, loading: false });
+                           pending: null, loading: false, applying: false });
 }
 
 async function aiFetch(path, { method = 'GET', body = null } = {}) {
@@ -1981,6 +1982,7 @@ async function aiFetch(path, { method = 'GET', body = null } = {}) {
 function aiErrorText(e) {
   if (e.status === 429) return `Дневной лимит сообщений исчерпан (${e.limit}). Счётчик сбрасывается раз в сутки.`;
   if (e.code === 'message_too_long') return 'Сообщение длиннее 2000 символов';
+  if (e.code === 'proposal_stale') return 'План изменился после этого предложения — попросите тренера предложить правки заново';
   if (e.status === 404) return 'Разбор не найден — возможно, он скрыт в другой вкладке';
   return e.message || 'Не удалось получить ответ';
 }
@@ -2016,10 +2018,28 @@ function aiRunChipHtml(runId, title) {
   return `<span class="ai-chip" onclick="showRunDetail(${Number(runId)})">📎 ${escapeHtml(title)}</span>`;
 }
 
+// Карточка правок плана под ответом тренера. Сам план она не меняет: это
+// делает кнопка, и только пока предложение относится к текущей версии плана.
+function aiProposalHtml(m) {
+  const rows = m.proposal.changes.map(c => {
+    const date = c.date ? `${c.date.slice(8, 10)}.${c.date.slice(5, 7)}` : '';
+    return `<tr><td class="ai-prop-when">Нед ${Number(c.week)} · ${escapeHtml(AI_DAY_LABELS[c.day] || c.day)} ${date}</td>`
+      + `<td><span class="ai-prop-old">${escapeHtml(c.old || 'отдых')}</span> → <b>${escapeHtml(c.text || 'отдых')}</b>`
+      + (c.reason ? `<div class="ai-prop-why">${escapeHtml(c.reason)}</div>` : '') + '</td></tr>';
+  }).join('');
+  const state = m.proposal_state || 'open';
+  const footer = state === 'applied' ? '<div class="ai-prop-state done">✓ Применено к плану</div>'
+    : state === 'stale' ? '<div class="ai-prop-state">План с тех пор изменился — попросите тренера предложить правки заново</div>'
+    : `<button class="btn-primary" ${AICOACH.applying ? 'disabled' : ''} onclick="aiApplyProposal('${escapeHtml(m.id)}')">Применить к плану</button>`;
+  return `<div class="ai-proposal"><div class="ai-prop-title">Правки плана: ${escapeHtml(m.proposal.summary)}</div>`
+    + `<table>${rows}</table>${footer}</div>`;
+}
+
 function aiMessageHtml(m) {
   const mine = m.role === 'athlete';
   const chip = m.run_id ? aiRunChipHtml(m.run_id, m.run_title || 'тренировка') : '';
-  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+  const proposal = m.proposal ? aiProposalHtml(m) : '';
+  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
 }
 
 function aiRenderRunChoices() {
@@ -2180,6 +2200,41 @@ function aiStarter(index) {
   if (!starter.latestRun) { aiSend({ text: starter.text, title: starter.title }); return; }
   const latest = aiOwnRuns()[0];
   if (latest) aiSend({ text: starter.text, threadRunId: latest.id });
+}
+
+// Применение правок плана: сервер пишет новую версию плана, прежняя остаётся.
+async function aiApplyProposal(messageId) {
+  const thread = AICOACH.thread;
+  const message = AICOACH.messages.find(m => m.id === messageId);
+  if (!thread || !message || !message.proposal || AICOACH.applying) return;
+  if (planEditMode) {
+    // Иначе сохранение открытой правки записало бы план без этих изменений.
+    aiNote('Сначала сохраните или отмените правку плана на вкладке «План»');
+    return;
+  }
+  const count = message.proposal.changes.length;
+  if (!confirm(`Применить правки к плану (${count})? Будет создана новая версия плана, прежняя сохранится.`)) return;
+  const session = AICOACH.session;
+  AICOACH.applying = true;
+  aiNote('');
+  aiRender(false);
+  try {
+    await aiFetch(`threads/${encodeURIComponent(thread.id)}/messages/${encodeURIComponent(messageId)}/apply`,
+                  { method: 'POST' });
+    message.proposal_state = 'applied';
+    // Остальные предложения разбора относились к прежней версии плана.
+    AICOACH.messages.forEach(m => {
+      if (m !== message && m.proposal && (m.proposal_state || 'open') === 'open') m.proposal_state = 'stale';
+    });
+    await loadPlan();         // таблица плана и план/факт
+  } catch (e) {
+    if (e.code === 'proposal_stale') message.proposal_state = 'stale';
+    if (e.code === 'already_applied') message.proposal_state = 'applied';
+    else if (!e.handled) aiNote(aiErrorText(e));
+  } finally {
+    AICOACH.applying = false;
+    if (AICOACH.session === session) aiRender(false);
+  }
 }
 
 // Вход из журнала и карточки пробежки: новый разбор, посвящённый ей.

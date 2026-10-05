@@ -696,3 +696,366 @@ def test_planned_day_comes_from_the_runs_own_plan(api, llm, patched_api, fake_bu
     thread = _run_thread(api, run_id)
     _say(api, thread["id"])
     assert "«16 км легко»" in llm["calls"][0]["system"]
+
+
+# ══ Фаза 3: правки плана кнопкой ═════════════════════════════════════════════
+
+import datetime as dt
+
+WINDOW_WEEKS = [
+    {"w": 1, "start": "17.08", "type": "dev", "mon": "10 км", "wed": " 8 км ", "sun": "16 км"},
+    {"w": 2, "start": "24.08", "type": "peak", "mon": "12 км", "wed": "6×800 м"},
+    {"w": 3, "start": "31.08", "type": "taper", "mon": "8 км"},
+]
+WEDNESDAY = dt.date(2026, 8, 19)          # среда первой недели WINDOW_WEEKS
+
+
+def _window(storage_module, today=WEDNESDAY, weeks=WINDOW_WEEKS, week_idx=0, **kw):
+    return storage_module.ai_plan_window(weeks, "2026-08-17", week_idx, today=today, **kw)
+
+
+def _change(week=2, day="wed", text="6 км легко", reason="разгрузка", **over):
+    return {"week": week, "day": day, "text": text, "reason": reason, **over}
+
+
+def _proposal(*changes, summary="Разгрузить вторую неделю"):
+    return {"summary": summary, "changes": list(changes) or [_change()]}
+
+
+# ── окно плана, открытое для правок ───────────────────────────────────────────
+
+def test_plan_window_lists_weeks_days_and_what_already_passed(storage_module):
+    first, second, third = _window(storage_module)
+    assert (first["week"], first["current"], first["start"], first["end"]) == \
+        (1, True, "2026-08-17", "2026-08-23")
+    assert (second["week"], second["current"], second["phase"]) == (2, False, "peak")
+    assert third["week"] == 3
+
+    by_field = {d["field"]: d for d in first["days"]}
+    assert [d["field"] for d in first["days"]] == ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    assert by_field["wed"] == {"field": "wed", "date": "2026-08-19", "text": "8 км", "past": False}
+    assert by_field["mon"]["past"] and by_field["tue"]["past"]      # сегодня — среда
+    assert not by_field["sun"]["past"] and by_field["thu"]["text"] == ""
+    assert not any(d["past"] for d in second["days"])
+
+
+def test_plan_window_orders_days_by_date_for_a_sunday_first_row(storage_module):
+    weeks = [{"start": "16.08", "sun": "длительная", "mon": "отдых"}]
+    (week,) = storage_module.ai_plan_window(weeks, "2026-08-16", 0, today="2026-08-16")
+    assert [d["field"] for d in week["days"]][0] == "sun"
+    assert week["days"][0]["date"] == "2026-08-16"
+
+
+def test_plan_window_is_capped_and_starts_at_the_current_week(storage_module):
+    weeks = [{"start": (dt.date(2026, 8, 17) + dt.timedelta(days=7 * i)).strftime("%d.%m.%Y")}
+             for i in range(10)]
+    window = storage_module.ai_plan_window(weeks, "2026-08-17", 2, today="2026-09-01")
+    assert [w["week"] for w in window] == [3, 4, 5, 6]
+
+
+@pytest.mark.parametrize("weeks,plan_start,today", [
+    ([], "2026-08-17", WEDNESDAY),                                  # плана нет
+    ([{"mon": "10 км"}], None, WEDNESDAY),                          # план не датирован
+    (WINDOW_WEEKS, "2026-08-17", dt.date(2026, 12, 1)),             # план закончился
+])
+def test_plan_window_is_empty_when_there_is_nothing_safe_to_edit(storage_module, weeks,
+                                                                 plan_start, today):
+    idx = max(len(weeks) - 1, 0)
+    assert storage_module.ai_plan_window(weeks, plan_start, idx, today=today) == []
+
+
+def test_plan_window_text_names_every_editable_cell(storage_module):
+    import llm_prompt
+    text = llm_prompt.format_plan_window(_window(storage_module))
+    assert "Неделя 1 (текущая), 2026-08-17 – 2026-08-23, Развитие" in text
+    assert "  mon (пн 2026-08-17): 10 км (прошёл, менять нельзя)" in text
+    assert "  wed (ср 2026-08-19): 8 км" in text and "8 км (прошёл" not in text
+    assert "  thu (чт 2026-08-20): —" in text
+    assert "Неделя 2, 2026-08-24 – 2026-08-30, Пик формы" in text
+
+
+def test_reply_format_offers_proposals_only_with_a_plan_window(storage_module):
+    import llm_prompt
+    with_plan = llm_prompt.coach_chat_system_prompt("ctx", (), "=== План: что можно менять ===")
+    without = llm_prompt.coach_chat_system_prompt("ctx")
+    assert '"proposal"' in with_plan and "План: что можно менять" in with_plan
+    assert "proposal" not in without and "JSON" in without
+
+
+# ── проверка предложения модели ───────────────────────────────────────────────
+
+def test_valid_proposal_keeps_what_the_cell_held(storage_module):
+    cleaned = storage_module.clean_proposal(_proposal(), _window(storage_module))
+    assert cleaned == {"summary": "Разгрузить вторую неделю", "changes": [
+        {"week": 2, "day": "wed", "date": "2026-08-26", "old": "6×800 м",
+         "text": "6 км легко", "reason": "разгрузка"}]}
+
+
+@pytest.mark.parametrize("bad", [
+    _change(week=9), _change(week=0), _change(week="2"), _change(week=True), _change(week=2.0),
+    _change(day="funday"), _change(day=None), _change(day=["wed"]),
+    _change(week=1, day="mon"),                  # понедельник первой недели уже прошёл
+    _change(text="6×800 м"),                     # то же, что и так стоит в плане
+    _change(text="  6×800   м "),                # то же после схлопывания пробелов
+    _change(text=None), _change(text=42),
+    "не правка", None, ["week", 2],
+])
+def test_bad_change_is_dropped_and_nothing_else_makes_no_proposal(storage_module, bad):
+    assert storage_module.clean_proposal({"changes": [bad]}, _window(storage_module)) is None
+
+
+def test_bad_changes_do_not_take_the_good_ones_with_them(storage_module):
+    raw = _proposal(_change(week=9), _change(), _change(day="funday"), _change(week=3, day="mon", text=""))
+    cleaned = storage_module.clean_proposal(raw, _window(storage_module))
+    assert [(c["week"], c["day"], c["text"]) for c in cleaned["changes"]] == \
+        [(2, "wed", "6 км легко"), (3, "mon", "")]           # пустой текст — день отдыха
+
+
+@pytest.mark.parametrize("raw", [None, "текст", [], {}, {"changes": "нет"}, {"changes": []},
+                                 {"summary": "без правок"}])
+def test_malformed_proposal_is_no_proposal(storage_module, raw):
+    assert storage_module.clean_proposal(raw, _window(storage_module)) is None
+
+
+def test_proposal_for_a_plan_without_a_window_is_dropped(storage_module):
+    assert storage_module.clean_proposal(_proposal(), []) is None
+
+
+def test_repeated_cell_keeps_the_last_change(storage_module):
+    raw = _proposal(_change(text="первый вариант"), _change(text="второй вариант"))
+    (change,) = storage_module.clean_proposal(raw, _window(storage_module))["changes"]
+    assert change["text"] == "второй вариант"
+
+
+def test_changes_are_ordered_by_date_capped_and_trimmed(storage_module):
+    weeks = [{"start": (dt.date(2026, 8, 17) + dt.timedelta(days=7 * i)).strftime("%d.%m.%Y")}
+             for i in range(4)]
+    window = storage_module.ai_plan_window(weeks, "2026-08-17", 0, today="2026-08-17")
+    changes = [_change(week=w, day=d, text=f"тренировка {w}{d}" + " очень" * 80, reason=None)
+               for w in (4, 3, 2, 1) for d in ("sun", "wed", "mon", "fri", "tue")]
+    cleaned = storage_module.clean_proposal({"summary": 7, "changes": changes}, window)
+
+    assert cleaned["summary"] == "Корректировка плана"
+    assert len(cleaned["changes"]) == storage_module.AI_PROPOSAL_MAX_CHANGES
+    dates = [c["date"] for c in cleaned["changes"]]
+    assert dates == sorted(dates) and dates[0] == "2026-08-17"
+    assert all(len(c["text"]) == storage_module.AI_PROPOSAL_TEXT_MAX for c in cleaned["changes"])
+    assert all(c["reason"] == "" for c in cleaned["changes"])
+
+
+def test_history_reminds_the_model_what_it_proposed(storage_module):
+    cleaned = storage_module.clean_proposal(_proposal(), _window(storage_module))
+    messages = [{"role": "athlete", "text": "Облегчи неделю"},
+                {"role": "ai", "text": "Предлагаю так.",
+                 "proposal": {**cleaned, "plan_id": "p1", "plan_version": 3}}]
+    envelope = json.loads(storage_module.ai_history(messages)[1]["content"])
+    assert envelope == {"reply": "Предлагаю так.", "proposal": {
+        "summary": "Разгрузить вторую неделю",
+        "changes": [{"week": 2, "day": "wed", "text": "6 км легко", "reason": "разгрузка"}]}}
+
+
+# ── предложение и его применение через HTTP ───────────────────────────────────
+# Даты плана считаются от сегодняшнего дня: сервер сам решает, что уже
+# прошло, и план из прошлого года правке бы не подлежал.
+
+def _seed_current_plan(patched_api, fake_bucket, sub=SUB, name="HM"):
+    """План из трёх недель, первая — текущая. Возвращает id плана."""
+    today = dt.datetime.utcnow().date()
+    monday = today - dt.timedelta(days=today.weekday())
+    plan = patched_api.create_plan(fake_bucket, sub, {"race_name": name,
+                                                      "plan_start": monday.isoformat()})
+    patched_api.save_plan_weeks(fake_bucket, sub, plan["id"], [
+        {"w": i + 1, "start": (monday + dt.timedelta(days=7 * i)).strftime("%d.%m.%Y"),
+         "type": "dev", "mon": "10 км", "wed": "6×800 м", "sun": "16 км"}
+        for i in range(3)], "seed", "runner@example.com")
+    return plan["id"]
+
+
+def _propose(api, llm, *changes, thread=None, text="Облегчи вторую неделю"):
+    """Ход, на который модель отвечает предложением. Возвращает (thread, ответ ИИ)."""
+    thread = thread or _new_thread(api)
+    llm["replies"].append(_reply("Предлагаю разгрузить.", proposal=_proposal(*changes)))
+    body, code, _ = _say(api, thread["id"], text)
+    assert code == 201
+    return thread, json.loads(body)["messages"][1]
+
+
+def _apply(api, thread, message_id, **who):
+    return api(FakeRequest("POST",
+                           f"/ai-coach/threads/{thread['id']}/messages/{message_id}/apply"), **who)
+
+
+def _plan_state(patched_api, fake_bucket, plan_id, sub=SUB):
+    import storage
+    manifest = storage.read_plan_manifest(fake_bucket, sub, plan_id)
+    return manifest, storage.read_plan_weeks(fake_bucket, sub, plan_id)
+
+
+def test_model_sees_the_editable_plan_and_the_proposal_format(api, llm, patched_api, fake_bucket):
+    _seed_current_plan(patched_api, fake_bucket)
+    thread = _new_thread(api)
+    _say(api, thread["id"])
+    system = llm["calls"][0]["system"]
+    assert "=== План: что можно менять ===" in system
+    assert "Неделя 2, " in system and "): 6×800 м" in system
+    assert '"proposal"' in system
+
+
+def test_without_a_plan_the_model_is_not_offered_proposals(api, llm):
+    thread = _new_thread(api)
+    llm["replies"].append(_reply("Плана нет.", proposal=_proposal()))
+    _, answer = _json(_say(api, thread["id"]))["messages"]
+    assert "proposal" not in llm["calls"][0]["system"]
+    assert "proposal" not in answer and "proposal_state" not in answer
+
+
+def test_proposal_is_stored_with_the_plan_version_it_refers_to(api, llm, patched_api, fake_bucket, storage_module):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+
+    proposal = answer["proposal"]
+    assert (proposal["plan_id"], proposal["plan_version"]) == (plan_id, 1)
+    assert proposal["summary"] == "Разгрузить вторую неделю"
+    (change,) = proposal["changes"]
+    assert (change["week"], change["day"], change["old"], change["text"]) == \
+        (2, "wed", "6×800 м", "6 км легко")
+    assert answer["proposal_state"] == "open"
+
+    # Состояние считается на чтении и в объект реплики не пишется.
+    stored = storage_module.read_ai_message(fake_bucket, SUB, thread["id"], answer["id"])
+    assert stored["proposal"] == proposal and "proposal_state" not in stored
+    # Сам план предложение не трогает.
+    assert _plan_state(patched_api, fake_bucket, plan_id)[0]["current_version"] == 1
+
+
+def test_unusable_proposal_does_not_cost_the_answer(api, llm, patched_api, fake_bucket):
+    _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm, _change(week=40), _change(day="funday"))
+    assert answer["text"] == "Предлагаю разгрузить."
+    assert "proposal" not in answer and "proposal_state" not in answer
+
+
+def test_apply_writes_a_new_plan_version_and_keeps_the_old_one(api, llm, patched_api, fake_bucket):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm, _change(), _change(week=3, day="sun", text="12 км легко"))
+    old_path = _plan_state(patched_api, fake_bucket, plan_id)[0]["gcs_object_path"]
+    old_object = fake_bucket._store[old_path]
+
+    body, code, _ = _apply(api, thread, answer["id"])
+    assert code == 201
+    applied = json.loads(body)["applied"]
+    assert (applied["plan_id"], applied["from_version"], applied["to_version"]) == (plan_id, 1, 2)
+    assert applied["applied_by"] == "runner@example.com"
+
+    manifest, weeks = _plan_state(patched_api, fake_bucket, plan_id)
+    assert manifest["current_version"] == 2
+    assert manifest["change_reason"] == "ИИ-тренер: Разгрузить вторую неделю"
+    assert manifest["created_by"] == "runner@example.com"
+    assert weeks[1]["wed"] == "6 км легко" and weeks[2]["sun"] == "12 км легко"
+    # остальное — как было
+    assert weeks[0] == {**weeks[0], "mon": "10 км", "wed": "6×800 м", "sun": "16 км"}
+    assert weeks[1]["mon"] == "10 км" and weeks[1]["sun"] == "16 км"
+    version = json.loads(fake_bucket._store[manifest["gcs_object_path"]])
+    assert version["supersedes_version"] == 1
+    assert fake_bucket._store[old_path] == old_object           # прежняя версия цела
+
+
+def test_applied_proposal_is_reported_and_cannot_be_applied_twice(api, llm, patched_api, fake_bucket):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    assert _apply(api, thread, answer["id"])[1] == 201
+
+    view = _json(api(FakeRequest("GET", f"/ai-coach/threads/{thread['id']}")))
+    assert view["messages"][1]["proposal_state"] == "applied"
+
+    body, code, _ = _apply(api, thread, answer["id"])
+    assert code == 409 and json.loads(body) == {"error": "already_applied"}
+    assert _plan_state(patched_api, fake_bucket, plan_id)[0]["current_version"] == 2
+
+
+def test_proposal_goes_stale_when_the_plan_moves_on(api, llm, patched_api, fake_bucket):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    _, weeks = _plan_state(patched_api, fake_bucket, plan_id)
+    weeks[0]["fri"] = "5 км"                                     # спортсмен поправил план сам
+    assert api(FakeRequest("POST", f"/plans/{plan_id}/weeks", {"weeks": weeks}))[1] == 201
+    before = dict(fake_bucket._store)
+
+    body, code, _ = _apply(api, thread, answer["id"])
+    assert code == 409 and json.loads(body) == {"error": "proposal_stale"}
+    manifest, after = _plan_state(patched_api, fake_bucket, plan_id)
+    assert manifest["current_version"] == 2 and after[1]["wed"] == "6×800 м"
+    assert {k: v for k, v in fake_bucket._store.items() if "/ai_coach/" in k or "/plans/" in k} == \
+           {k: v for k, v in before.items() if "/ai_coach/" in k or "/plans/" in k}
+
+    view = _json(api(FakeRequest("GET", f"/ai-coach/threads/{thread['id']}")))
+    assert view["messages"][1]["proposal_state"] == "stale"
+
+
+def test_proposal_goes_stale_when_another_plan_becomes_active(api, llm, patched_api, fake_bucket):
+    first = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    _seed_current_plan(patched_api, fake_bucket, name="Другой")   # новый план становится активным
+
+    assert json.loads(_apply(api, thread, answer["id"])[0]) == {"error": "proposal_stale"}
+    assert _plan_state(patched_api, fake_bucket, first)[0]["current_version"] == 1
+
+
+def test_applying_one_proposal_makes_the_earlier_one_stale(api, llm, patched_api, fake_bucket):
+    _seed_current_plan(patched_api, fake_bucket)
+    thread, first = _propose(api, llm)
+    _, second = _propose(api, llm, _change(week=3, day="mon", text="отдых"), thread=thread)
+    assert _apply(api, thread, second["id"])[1] == 201
+
+    states = [m.get("proposal_state") for m in
+              _json(api(FakeRequest("GET", f"/ai-coach/threads/{thread['id']}")))["messages"]]
+    assert states == [None, "stale", None, "applied"]
+    assert _apply(api, thread, first["id"])[1] == 409
+
+
+def test_proposal_goes_stale_once_its_day_has_passed(api, llm, patched_api, fake_bucket, storage_module):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    later = dt.datetime.utcnow().date() + dt.timedelta(days=30)
+
+    with pytest.raises(storage_module.AICoachError, match="proposal_stale"):
+        storage_module.apply_ai_proposal(fake_bucket, SUB, thread["id"], answer["id"], today=later)
+    messages = storage_module.mark_proposal_states(
+        fake_bucket, SUB, thread["id"],
+        storage_module.read_ai_messages(fake_bucket, SUB, thread["id"]), today=later)
+    assert messages[1]["proposal_state"] == "stale"
+    assert _plan_state(patched_api, fake_bucket, plan_id)[0]["current_version"] == 1
+
+
+def test_apply_refuses_what_is_not_a_proposal(api, llm, patched_api, fake_bucket):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread = _new_thread(api)
+    question, answer = _json(_say(api, thread["id"]))["messages"]      # ответ без предложения
+
+    for message_id in (question["id"], answer["id"]):
+        body, code, _ = _apply(api, thread, message_id)
+        assert code == 400 and json.loads(body) == {"error": "no_proposal"}
+    assert _apply(api, thread, "20260101T000000000000-ai-deadbeef")[1] == 404
+    assert _apply(api, thread, "nope")[1] == 404
+    assert _apply(api, {"id": "20260101T000000000000-deadbeef"}, answer["id"])[1] == 404
+    assert _plan_state(patched_api, fake_bucket, plan_id)[0]["current_version"] == 1
+
+
+def test_another_user_cannot_apply_my_proposal(api, llm, patched_api, fake_bucket):
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    _seed_current_plan(patched_api, fake_bucket, sub=OTHER)
+    thread, answer = _propose(api, llm)
+    assert _apply(api, thread, answer["id"], **STRANGER)[1] == 404
+    assert _plan_state(patched_api, fake_bucket, plan_id)[0]["current_version"] == 1
+
+
+def test_next_turn_sees_the_applied_plan_and_the_earlier_proposal(api, llm, patched_api, fake_bucket):
+    _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    _apply(api, thread, answer["id"])
+    _say(api, thread["id"], "Спасибо, что дальше?")
+
+    call = llm["calls"][-1]
+    assert "): 6 км легко" in call["system"]                     # окно плана уже с правкой
+    remembered = json.loads(call["history"][1]["content"])
+    assert remembered["proposal"]["changes"][0]["text"] == "6 км легко"

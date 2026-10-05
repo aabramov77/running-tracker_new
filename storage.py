@@ -20,10 +20,13 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
-from compliance import current_week_idx, plan_compliance, planned_for_date
+from compliance import (DAY_FIELDS, DEFAULT as UNDATED, anchor_source,
+                        current_week_idx, day_date, plan_compliance,
+                        planned_for_date, to_date, week_window)
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, TYPE_LABELS, personal_bests
 from llm_prompt import (SYSTEM_PROMPT, coach_chat_system_prompt,
-                        format_context_for_llm, format_run_focus)
+                        format_context_for_llm, format_plan_window,
+                        format_run_focus)
 
 def get_storage_client():
     return gcs.Client()
@@ -62,6 +65,8 @@ def p_ai_thread(sub, tid):         return f"{p_ai_root(sub)}{tid}/thread.json"
 def p_ai_archived(sub, tid):       return f"{p_ai_root(sub)}{tid}/archived.json"
 def p_ai_msg_prefix(sub, tid):     return f"{p_ai_root(sub)}{tid}/m/"
 def p_ai_msg(sub, tid, msg_id):    return f"{p_ai_msg_prefix(sub, tid)}{msg_id}.json"
+def p_ai_applied_prefix(sub, tid): return f"{p_ai_root(sub)}{tid}/applied/"
+def p_ai_applied(sub, tid, msg_id): return f"{p_ai_applied_prefix(sub, tid)}{msg_id}.json"
 
 # Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
 LEGACY_RUNS = "runs.json"
@@ -1885,9 +1890,19 @@ def ai_history(messages, window=AI_HISTORY_WINDOW):
     recent = messages[-window:]
     while recent and recent[0]["role"] != "athlete":    # диалог открывает вопрос
         recent = recent[1:]
+
+    def envelope(message):
+        data = {"reply": message["text"]}
+        proposal = message.get("proposal")
+        if proposal:        # модель должна помнить, что именно она предлагала
+            data["proposal"] = {
+                "summary": proposal["summary"],
+                "changes": [{k: c[k] for k in ("week", "day", "text", "reason")}
+                            for c in proposal["changes"]]}
+        return json.dumps(data, ensure_ascii=False)
+
     return [{"role": "user", "content": m["text"]} if m["role"] == "athlete" else
-            {"role": "assistant", "content": json.dumps({"reply": m["text"]},
-                                                        ensure_ascii=False)}
+            {"role": "assistant", "content": envelope(m)}
             for m in recent]
 
 
@@ -1986,12 +2001,188 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
                  if rid in own]       # скрытая после разбора пробежка выпадает молча
     blocks = [format_run_focus(build_run_focus(bucket, sub, own[rid], ctx))
               for rid in focus_ids]
+    window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
     return {
         "ctx": ctx,
         "focus_run_ids": focus_ids,
-        "system": coach_chat_system_prompt(format_context_for_llm(ctx), blocks),
+        "plan_window": window,
+        "system": coach_chat_system_prompt(
+            format_context_for_llm(ctx), blocks,
+            format_plan_window(window) if window else ""),
         "history": ai_history(messages),
     }
+
+
+# ── Правки плана от ИИ-тренера (#46) ──────────────────────────────────────────
+# Модель план не меняет: она возвращает предложение, сервер сверяет его с
+# планом и хранит в реплике, а применяет спортсмен — отдельным запросом,
+# который пишет обычную новую версию плана.
+
+AI_PLAN_WINDOW_WEEKS = 4      # текущая неделя и три следующие открыты для правок
+AI_PROPOSAL_MAX_CHANGES = 14
+AI_PROPOSAL_TEXT_MAX = 200
+
+
+def ai_plan_window(weeks, plan_start, week_idx, today=None, count=AI_PLAN_WINDOW_WEEKS):
+    """Недели плана, которые ИИ может править, с датой и текстом каждого дня.
+
+    [] — плана нет или он ничем не датирован: править ячейку, не зная её
+    даты, значит гадать. Недели, закончившиеся до сегодня, в окно не входят,
+    прошедшие дни текущей помечены и правке не подлежат.
+    """
+    today = to_date(today) or datetime.utcnow().date()
+    if not weeks or anchor_source(plan_start, weeks) == UNDATED:
+        return []
+    window = []
+    for idx in range(max(week_idx, 0), min(len(weeks), week_idx + count)):
+        start, end = week_window(weeks, idx, plan_start)
+        if end < today:
+            continue
+        days = sorted((day_date(start, field), field) for field in DAY_FIELDS)
+        window.append({
+            "week": idx + 1,
+            "current": start <= today <= end,
+            "start": start.isoformat(), "end": end.isoformat(),
+            "phase": weeks[idx].get("type"),
+            "days": [{"field": field, "date": day.isoformat(),
+                      "text": str(weeks[idx].get(field) or "").strip(),
+                      "past": day < today}
+                     for day, field in days],
+        })
+    return window
+
+
+def _one_line(value, limit=AI_PROPOSAL_TEXT_MAX):
+    return " ".join(value.split())[:limit] if isinstance(value, str) else ""
+
+
+def clean_proposal(raw, window):
+    """Предложение модели, сверенное с окном плана; None — применять нечего.
+
+    Модель может ошибиться номером недели, выдумать день, тронуть прошедший
+    или вернуть то, что и так стоит в плане. Такая правка отбрасывается
+    молча — текстовый ответ тренера от этого не страдает. У каждой принятой
+    правки сохраняется, что было в ячейке: карточку «было → стало» можно
+    показать и после того, как план ушёл вперёд.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("changes"), list):
+        return None
+    cells = {(week["week"], day["field"]): day for week in window for day in week["days"]}
+    changes = {}
+    for item in raw["changes"]:
+        if not isinstance(item, dict):
+            continue
+        week, field, text = item.get("week"), item.get("day"), item.get("text")
+        if isinstance(week, bool) or not isinstance(week, int) \
+                or not isinstance(field, str) or not isinstance(text, str):
+            continue
+        cell = cells.get((week, field))
+        text = _one_line(text)
+        if cell is None or cell["past"] or text == cell["text"]:
+            continue
+        changes.pop((week, field), None)        # ячейка повторилась — в силе последняя правка
+        changes[(week, field)] = {"week": week, "day": field, "date": cell["date"],
+                                  "old": cell["text"], "text": text,
+                                  "reason": _one_line(item.get("reason"))}
+    if not changes:
+        return None
+    ordered = sorted(changes.values(), key=lambda change: change["date"])
+    return {"summary": _one_line(raw.get("summary")) or "Корректировка плана",
+            "changes": ordered[:AI_PROPOSAL_MAX_CHANGES]}
+
+
+def read_ai_message(bucket, sub, thread_id, msg_id):
+    if not _AI_MSG_ID_RE.match(str(msg_id)):
+        return None
+    blob = bucket.blob(p_ai_msg(sub, thread_id, msg_id))
+    return json.loads(blob.download_as_text()) if blob.exists() else None
+
+
+def _active_plan_version(bucket, sub):
+    """(id активного плана, номер его текущей версии, манифест) или тройка None."""
+    active = get_active_plan(bucket, sub)
+    manifest = read_plan_manifest(bucket, sub, active["id"]) if active else None
+    if not manifest:
+        return None, None, None
+    return active["id"], manifest["current_version"], manifest
+
+
+def _proposal_is_current(proposal, plan_id, version, today):
+    """Предложение ещё применимо: план тот же, той же версии, и ни один из
+    затронутых дней не успел пройти."""
+    return (plan_id is not None
+            and proposal.get("plan_id") == plan_id
+            and proposal.get("plan_version") == version
+            and all((to_date(c.get("date")) or today) >= today
+                    for c in proposal.get("changes", [])))
+
+
+def mark_proposal_states(bucket, sub, thread_id, messages, today=None):
+    """Проставляет репликам с предложением proposal_state: applied / stale / open.
+
+    Состояние считается на чтении и нигде не хранится: «устарело» — это
+    свойство текущего плана, а не реплики.
+    """
+    proposed = [m for m in messages if m.get("proposal")]
+    if not proposed:
+        return messages
+    today = to_date(today) or datetime.utcnow().date()
+    prefix = p_ai_applied_prefix(sub, thread_id)
+    applied = {blob.name[len(prefix):-len(".json")]
+               for blob in bucket.list_blobs(prefix=prefix)}
+    plan_id, version, _ = _active_plan_version(bucket, sub)
+    for message in proposed:
+        if message["id"] in applied:
+            message["proposal_state"] = "applied"
+        elif _proposal_is_current(message["proposal"], plan_id, version, today):
+            message["proposal_state"] = "open"
+        else:
+            message["proposal_state"] = "stale"
+    return messages
+
+
+def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=None):
+    """Применяет предложение из реплики: новая версия плана и событие применения.
+
+    None — реплики нет. AICoachError: no_proposal, already_applied,
+    proposal_stale. Прежняя версия плана остаётся в хранилище, вернуться к
+    ней можно обычной правкой.
+
+    Проверка «не применено ли уже» и запись идут не атомарно: два
+    одновременных запроса создадут две одинаковые версии плана подряд.
+    Данные при этом не теряются; полное решение — предусловия записи (#35).
+    """
+    message = read_ai_message(bucket, sub, thread_id, msg_id)
+    if not message:
+        return None
+    proposal = message.get("proposal")
+    if not proposal:
+        raise AICoachError("no_proposal")
+    marker_blob = bucket.blob(p_ai_applied(sub, thread_id, msg_id))
+    if marker_blob.exists():
+        raise AICoachError("already_applied")
+
+    today = to_date(today) or datetime.utcnow().date()
+    plan_id, version, manifest = _active_plan_version(bucket, sub)
+    if not _proposal_is_current(proposal, plan_id, version, today):
+        raise AICoachError("proposal_stale")
+    current = read_plan_version(bucket, manifest["gcs_object_path"]) or {}
+    weeks = [dict(week) for week in current.get("weeks", [])]
+    if any(not 1 <= change["week"] <= len(weeks) for change in proposal["changes"]):
+        raise AICoachError("proposal_stale")
+    for change in proposal["changes"]:
+        weeks[change["week"] - 1][change["day"]] = change["text"]
+
+    saved = save_plan_weeks(bucket, sub, plan_id, weeks,
+                            f"ИИ-тренер: {proposal['summary']}", applied_by)
+    marker = {
+        "thread_id": thread_id, "message_id": msg_id,
+        "applied_at": datetime.utcnow().isoformat() + "Z", "applied_by": applied_by,
+        "plan_id": plan_id, "from_version": version, "to_version": saved["version"],
+    }
+    marker_blob.upload_from_string(json.dumps(marker, ensure_ascii=False, indent=2),
+                                   content_type="application/json")
+    return marker
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────
