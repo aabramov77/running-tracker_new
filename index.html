@@ -322,10 +322,15 @@
         <div class="card-title" id="ai-title" style="margin:0">Новый разбор</div>
         <span class="hint" id="ai-usage" style="margin:0;white-space:nowrap"></span>
       </div>
+      <div id="ai-focus"></div>
       <div class="chat-log ai-log" id="ai-log" style="display:none"></div>
       <div id="ai-starters">
         <p class="hint">Спросите ИИ-тренера о тренировках и плане. Он видит ваш профиль, план, его выполнение и последние пробежки.</p>
         <div class="ai-starter-list" id="ai-starter-list"></div>
+      </div>
+      <div class="form-group ai-attach">
+        <label for="ai-run">📎 Прикрепить тренировку к вопросу</label>
+        <select id="ai-run"></select>
       </div>
       <div class="chat-form">
         <div class="form-group"><textarea id="ai-input" rows="2" maxlength="2000" placeholder="Вопрос ИИ-тренеру (Ctrl+Enter — отправить)" onkeydown="aiKey(event)"></textarea></div>
@@ -672,6 +677,7 @@
       <div id="rd-charts"></div>
       <div style="margin-top:20px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn-primary" onclick="closeRunDetail()">Закрыть</button>
+        <button class="btn-sm" id="rd-ai-btn">🤖 Разобрать с ИИ</button>
         <button class="btn-sm" id="rd-delete-btn" style="color:var(--c-danger)">Скрыть пробежку</button>
       </div>
     </div>

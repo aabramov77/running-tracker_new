@@ -20,10 +20,10 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
-from compliance import current_week_idx, plan_compliance
-from domain import HR_ZONE_BOUNDS, PLAN_DAYS, personal_bests
+from compliance import current_week_idx, plan_compliance, planned_for_date
+from domain import HR_ZONE_BOUNDS, PLAN_DAYS, TYPE_LABELS, personal_bests
 from llm_prompt import (SYSTEM_PROMPT, coach_chat_system_prompt,
-                        format_context_for_llm)
+                        format_context_for_llm, format_run_focus)
 
 def get_storage_client():
     return gcs.Client()
@@ -1111,6 +1111,57 @@ def lap_paces_str(details, limit=15):
     return ", ".join(paces)
 
 
+def half_paces(details):
+    """(темп первой половины, темп второй) в сек/км по кругам.
+
+    None, если кругов меньше четырёх: на двух-трёх кругах «половина» — это
+    разминка против заминки, а не раскладка сил.
+    """
+    laps = [l for l in (details.get("laps") or [])
+            if l.get("dist_km") and l.get("duration_sec")]
+    if len(laps) < 4:
+        return None
+    mid = len(laps) // 2
+
+    def pace(part):
+        return int(sum(l["duration_sec"] for l in part) / sum(l["dist_km"] for l in part))
+
+    return pace(laps[:mid]), pace(laps[mid:])
+
+
+# Сэмпл «держит» время до следующего. Разрыв длиннее — часы стояли на паузе,
+# и записывать его в зону последнего пульса нельзя.
+ZONE_GAP_CAP_SEC = 30
+
+
+def hr_zone_minutes(details, zones):
+    """Время в пульсовых зонах по сэмплам: [{name, min, pct}]. [] — считать не из чего.
+
+    zones — как в compute_athlete_derived: [{name, from, to}] по возрастанию.
+    Пульс ниже первой зоны идёт отдельной строкой, а не теряется: иначе
+    проценты остальных зон завышены.
+    """
+    samples = details.get("samples") or {}
+    times, hrs = samples.get("t_offset_sec") or [], samples.get("hr") or []
+    if not zones or len(times) < 2 or len(times) != len(hrs):
+        return []
+
+    seconds = [0.0] * (len(zones) + 1)          # [0] — ниже первой зоны
+    for i in range(len(times) - 1):
+        span = min(times[i + 1] - times[i], ZONE_GAP_CAP_SEC)
+        if not hrs[i] or span <= 0:
+            continue
+        slot = sum(1 for zone in zones if hrs[i] >= zone["from"])
+        seconds[slot] += span
+
+    total = sum(seconds)
+    if total <= 0:
+        return []
+    names = ["ниже " + zones[0]["name"].split()[0]] + [zone["name"] for zone in zones]
+    return [{"name": name, "min": round(sec / 60, 1), "pct": round(sec / total * 100)}
+            for name, sec in zip(names, seconds) if sec > 0]
+
+
 def build_llm_context(bucket, sub):
     """Собирает компактный богатый контекст для LLM: активный план и его пробежки."""
     active_plan = get_active_plan(bucket, sub)
@@ -1204,6 +1255,8 @@ def build_llm_context(bucket, sub):
         "weeks_total": len(plan) if plan else 0,
         "plan_id": plan_id,
         "plan_version": plan_version,
+        "plan_weeks": plan or [],
+        "plan_start": (active_plan or {}).get("plan_start"),
         "race": {f: (active_plan or {}).get(f, "") for f in PLAN_META_FIELDS},
         "heuristics": {
             "avg_pace_min_per_km": avg_pace,
@@ -1701,14 +1754,43 @@ def clean_ai_text(text):
     return text
 
 
-def create_ai_thread(bucket, sub, title, created_by="api"):
-    """Заводит разбор и возвращает его карточку. LLM здесь не вызывается."""
+def find_own_run(bucket, sub, run_id):
+    """Своя не скрытая пробежка по id; None — такой нет.
+
+    Читается только журнал самого пользователя, поэтому чужой id здесь
+    просто не находится — отдельной проверки владения не нужно.
+    """
+    try:
+        run_id = int(run_id)
+    except (TypeError, ValueError):
+        return None
+    return next((r for r in read_runs(bucket, sub)
+                 if r.get("id") == run_id and not r.get("deleted", False)), None)
+
+
+def run_title(run):
+    """«Длительный 14.2 км · 2026-10-03» — подпись пробежки в разборе."""
+    label = TYPE_LABELS.get(run.get("type"), "тренировка").capitalize()
+    try:
+        dist = f"{float(run.get('dist')):g} км"
+    except (TypeError, ValueError):
+        dist = ""
+    return " · ".join(part for part in (f"{label} {dist}".strip(), run.get("date")) if part)
+
+
+def create_ai_thread(bucket, sub, title, run=None, created_by="api"):
+    """Заводит разбор и возвращает его карточку. LLM здесь не вызывается.
+
+    run — пробежка, которой разбор посвящён: она остаётся в фокусе на всём
+    его протяжении и даёт заголовок, если своего не задали.
+    """
     now = datetime.utcnow()
+    title = " ".join(str(title or "").split())[:AI_TITLE_MAX]
     thread = {
         "id": f"{now.strftime(_AI_ID_TIME)}-{secrets_mod.token_hex(4)}",
-        "kind": "general",
-        "run_id": None,
-        "title": " ".join(str(title or "").split())[:AI_TITLE_MAX] or "Разбор",
+        "kind": "run" if run else "general",
+        "run_id": run["id"] if run else None,
+        "title": title or (run_title(run) if run else "Разбор"),
         "status": "active",
         "created_at": now.isoformat() + "Z",
         "created_by": created_by,
@@ -1829,16 +1911,85 @@ def parse_coach_reply(text):
     return reply, envelope
 
 
-def build_ai_turn(bucket, sub, messages):
+AI_FOCUS_RUNS_MAX = 3         # подробных блоков по пробежкам на один ход
+
+
+def ai_focus_run_ids(thread, messages, run_id=None, window=AI_HISTORY_WINDOW):
+    """Какие пробежки разбираются на этом ходу, от давно упомянутой к свежей.
+
+    Пробежка разбора, прикреплённые к репликам окна и прикреплённая сейчас.
+    Повторное упоминание поднимает пробежку в конец; лишние отбрасываются с
+    начала — подробный блок стоит токенов, а разговор уже ушёл дальше.
+    """
+    mentioned = ([thread.get("run_id")]
+                 + [m.get("run_id") for m in messages[-window:]] + [run_id])
+    ids = []
+    for rid in mentioned:
+        if rid is None:
+            continue
+        if rid in ids:
+            ids.remove(rid)
+        ids.append(rid)
+    return ids[-AI_FOCUS_RUNS_MAX:]
+
+
+def build_run_focus(bucket, sub, run, ctx):
+    """Подробные данные одной пробежки для разбора (форматирует llm_prompt)."""
+    focus = {"run": run, "laps": [], "hr_drift_pct": None, "half_paces": None,
+             "zones": [], "hr_max": None, "hr_max_estimated": False, "planned": None}
+
+    details = None
+    if run.get("details_available"):
+        try:
+            details = read_run_details(bucket, sub, run["id"])
+        except Exception:
+            details = None          # без деталей разбор идёт по сводке
+    if details:
+        derived = ctx.get("profile_derived") or {}
+        focus["laps"] = details.get("laps") or []
+        focus["hr_drift_pct"] = compute_hr_drift(details)
+        focus["half_paces"] = half_paces(details)
+        focus["zones"] = hr_zone_minutes(details, derived.get("hr_zones"))
+        focus["hr_max"] = derived.get("hr_max_effective")
+        focus["hr_max_estimated"] = bool(derived.get("hr_max_estimated"))
+
+    # Что стояло в плане на этот день. У пробежки без привязки (до #25)
+    # смотрим активный план: дата всё равно должна попасть в его недели.
+    plan_id = run.get("plan_id") or ctx.get("plan_id")
+    if plan_id and plan_id == ctx.get("plan_id"):
+        weeks, plan_start = ctx.get("plan_weeks") or [], ctx.get("plan_start")
+    elif plan_id:
+        plan = find_plan(read_plans_index(bucket, sub), plan_id)
+        weeks = read_plan_weeks(bucket, sub, plan_id) if plan else []
+        plan_start = (plan or {}).get("plan_start")
+    else:
+        weeks, plan_start = [], None
+    hit = planned_for_date(weeks, run.get("date"), plan_start)
+    if hit:
+        idx, field, text = hit
+        focus["planned"] = {"week": idx + 1, "day": field, "text": text,
+                            "phase": weeks[idx].get("type"),
+                            "accent": weeks[idx].get("accent", "")}
+    return focus
+
+
+def build_ai_turn(bucket, sub, thread, messages, run=None):
     """Всё, что уходит модели на очередной ход, кроме самого вопроса.
 
     Контекст пересобирается на каждый ход: между репликами спортсмен мог
-    добавить пробежку или поправить план.
+    добавить пробежку или поправить план. run — пробежка, прикреплённая к
+    новому вопросу.
     """
     ctx = build_llm_context(bucket, sub)
+    own = {r.get("id"): r for r in read_runs(bucket, sub) if not r.get("deleted", False)}
+    focus_ids = [rid for rid in ai_focus_run_ids(thread, messages, run and run["id"])
+                 if rid in own]       # скрытая после разбора пробежка выпадает молча
+    blocks = [format_run_focus(build_run_focus(bucket, sub, own[rid], ctx))
+              for rid in focus_ids]
     return {
         "ctx": ctx,
-        "system": coach_chat_system_prompt(format_context_for_llm(ctx)),
+        "focus_run_ids": focus_ids,
+        "system": coach_chat_system_prompt(format_context_for_llm(ctx), blocks),
         "history": ai_history(messages),
     }
 

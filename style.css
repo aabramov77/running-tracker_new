@@ -500,6 +500,13 @@ table.pb-table td:last-child { text-align: right; }
 .ai-thread { cursor: pointer; }
 .ai-thread.active .run-title { color: var(--c-accent); }
 #ai-msg { margin-top: 6px; }
+.ai-attach { margin-top: 10px; max-width: 420px; }
+.ai-chip {
+  display: block; width: fit-content; margin-top: 4px; padding: 1px 8px;
+  border-radius: 10px; border: 0.5px solid var(--border);
+  font-size: 11px; cursor: pointer; white-space: normal;
+}
+#ai-focus .ai-chip { margin: 0 0 8px; }
 .nav-badge {
   display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px;
   border-radius: 10px; background: var(--c-danger); color: #fff;

@@ -1248,13 +1248,16 @@ function renderLog() {
     weekLabel: getWeekLabel(r.date),
     planName: runScope === 'all' ? planName[r.plan_id] : '',
     deletable: true,
+    reviewable: true,
   })).join('');
 }
 
+const RUN_TYPE_LABELS = {easy:'Лёгкий',interval:'Интервалы',tempo:'Темповый',long:'Длительный',race:'Соревнование',recovery:'Восстановление'};
+
 // Строка журнала. Зависит только от аргументов — ею же рисуется журнал
-// спортсмена на экране тренера (#44), там без кнопки удаления.
-function runItemHtml(r, { onclick, weekLabel = '', planName = '', deletable = false }) {
-  const typeLabels = {easy:'Лёгкий',interval:'Интервалы',tempo:'Темповый',long:'Длительный',race:'Соревнование',recovery:'Восстановление'};
+// спортсмена на экране тренера (#44), там без кнопок удаления и разбора с ИИ.
+function runItemHtml(r, { onclick, weekLabel = '', planName = '', deletable = false, reviewable = false }) {
+  const typeLabels = RUN_TYPE_LABELS;
   const feelEmoji = {great:'😊',good:'🙂',ok:'😐',hard:'😓',bad:'😔'};
   const pace = parsePace(r.pace);
   const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
@@ -1266,6 +1269,7 @@ function runItemHtml(r, { onclick, weekLabel = '', planName = '', deletable = fa
         ${planName?`<div class="run-meta" style="opacity:.65">📋 ${escapeHtml(planName)}</div>`:''}
         ${r.notes?`<div class="run-note">${escapeHtml(r.notes)}</div>`:''}
       </div>
+      ${reviewable?`<button class="btn-sm" title="Разобрать с ИИ-тренером" onclick="event.stopPropagation();aiReviewRun(${r.id})" style="flex-shrink:0">🤖</button>`:''}
       ${deletable?`<button class="btn-sm" onclick="event.stopPropagation();deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>`:''}
     </div>`;
 }
@@ -1374,12 +1378,14 @@ function showRunDetail(id) {
   openRunDetail(run, {
     detailsUrl: `${API_URL}runs/${id}/details`,
     onDelete: () => { closeRunDetail(); deleteRun(id); },
+    onAiReview: () => aiReviewRun(id),
   });
 }
 
 // Карточка пробежки. Источник задаётся снаружи: своя пробежка или пробежка
-// спортсмена на экране тренера (#44) — там без onDelete, кнопка скрыта.
-function openRunDetail(run, { detailsUrl, onDelete = null }) {
+// спортсмена на экране тренера (#44) — там без onDelete и onAiReview, кнопки
+// скрыты: тренер чужую пробежку не скрывает и со своим ИИ её не разбирает.
+function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null }) {
   const typeLabels = {easy:'Лёгкий бег',interval:'Интервалы',tempo:'Темповый',
                       long:'Длительный',race:'Соревнование',recovery:'Восстановительный'};
   const feelLabels = {great:'Отлично 😊',good:'Хорошо 🙂',ok:'Нормально 😐',
@@ -1407,6 +1413,9 @@ function openRunDetail(run, { detailsUrl, onDelete = null }) {
   const deleteBtn = document.getElementById('rd-delete-btn');
   deleteBtn.style.display = onDelete ? '' : 'none';
   deleteBtn.onclick = onDelete;
+  const aiBtn = document.getElementById('rd-ai-btn');
+  aiBtn.style.display = onAiReview ? '' : 'none';
+  aiBtn.onclick = onAiReview;
   document.getElementById('run-detail-overlay').classList.add('active');
 
   // Графики из FIT-данных (если есть)
@@ -1933,7 +1942,10 @@ async function testLlmKey() {
 /// ── ИИ-тренер (#46) ───────────────────────────────────────────────────────────
 // Разбор — отдельная ветка диалога с моделью. Состояние живёт только в
 // памяти: источник истины — сервер. Опроса нет: ответ приходит на отправку.
+const AI_REVIEW_TEXT = 'Разбери эту тренировку: что получилось, что нет и что это значит для ближайших тренировок.';
+const AI_RUN_CHOICES = 30;    // столько последних пробежек в списке «прикрепить»
 const AI_STARTERS = [
+  { label: '🏃 Разобрать последнюю тренировку', latestRun: true, text: AI_REVIEW_TEXT },
   { label: '📊 Итоги недели', title: 'Итоги недели',
     text: 'Подведи итоги этой недели: что получилось, что нет и на что обратить внимание.' },
   { label: '🗓 Что поменять на следующей неделе', title: 'Корректировка следующей недели',
@@ -1942,7 +1954,8 @@ const AI_STARTERS = [
     text: 'Иду ли я по графику к целевому результату? Что сейчас сдерживает больше всего?' },
 ];
 // session растёт при смене разбора: ответ, пришедший уже в другой разбор,
-// отбрасывается. pending — вопрос, на который модель ещё не ответила.
+// отбрасывается. pending — вопрос {text, runId}, на который модель ещё не
+// ответила.
 const AICOACH = { threads: [], thread: null, messages: [], usage: null,
                   pending: null, loading: false, session: 0 };
 
@@ -1988,9 +2001,35 @@ function mdLite(text) {
     .replace(/^[ \t]*[-*•]\s+/gm, '• ');
 }
 
+// Свои пробежки, от свежих к старым, — их можно разобрать или прикрепить.
+function aiOwnRuns() {
+  return runs.filter(r => !r.deleted).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function aiRunLabel(r) {
+  return `${RUN_TYPE_LABELS[r.type] || 'Тренировка'} ${r.dist} км · ${r.date}`;
+}
+
+// Метка прикреплённой пробежки. Подпись приходит с сервера снимком, поэтому
+// видна и после того, как пробежку скрыли; тогда клик просто ничего не откроет.
+function aiRunChipHtml(runId, title) {
+  return `<span class="ai-chip" onclick="showRunDetail(${Number(runId)})">📎 ${escapeHtml(title)}</span>`;
+}
+
 function aiMessageHtml(m) {
   const mine = m.role === 'athlete';
-  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+  const chip = m.run_id ? aiRunChipHtml(m.run_id, m.run_title || 'тренировка') : '';
+  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+}
+
+function aiRenderRunChoices() {
+  const select = document.getElementById('ai-run');
+  const chosen = select.value;
+  select.innerHTML = '<option value="">— без тренировки —</option>' +
+    aiOwnRuns().slice(0, AI_RUN_CHOICES).map(r =>
+      `<option value="${Number(r.id)}">${escapeHtml(aiRunLabel(r))}</option>`).join('');
+  select.value = chosen;
+  if (select.selectedIndex < 0) select.value = '';
 }
 
 function aiRenderThreads() {
@@ -2016,22 +2055,30 @@ function aiRender(scrollToEnd = true) {
   document.getElementById('ai-title').textContent = thread && thread.title ? thread.title : 'Новый разбор';
   document.getElementById('ai-usage').textContent =
     usage ? `сегодня ${usage.count} из ${usage.limit}` : '';
+  document.getElementById('ai-focus').innerHTML = thread && thread.run_id
+    ? aiRunChipHtml(thread.run_id, 'открыть тренировку') : '';
 
   let html = loading ? '<div class="empty">Загрузка…</div>' : messages.map(aiMessageHtml).join('');
-  if (pending) html += `<div class="chat-msg mine">${escapeHtml(pending)}</div>`
-                     + '<div class="chat-msg ai-thinking">Тренер думает…</div>';
+  if (pending) {
+    const run = pending.runId && runs.find(r => r.id === pending.runId);
+    html += `<div class="chat-msg mine">${escapeHtml(pending.text)}${run ? aiRunChipHtml(run.id, aiRunLabel(run)) : ''}</div>`
+          + '<div class="chat-msg ai-thinking">Тренер думает…</div>';
+  }
   const log = document.getElementById('ai-log');
   log.innerHTML = html;
   log.style.display = html ? '' : 'none';
   if (scrollToEnd) log.scrollTop = log.scrollHeight;
 
+  const hasRuns = aiOwnRuns().length > 0;
   document.getElementById('ai-starters').style.display = html ? 'none' : '';
-  document.getElementById('ai-starter-list').innerHTML = AI_STARTERS.map((s, i) =>
-    `<button class="btn-sm" onclick="aiStarter(${i})">${escapeHtml(s.label)}</button>`).join('');
+  document.getElementById('ai-starter-list').innerHTML = AI_STARTERS
+    .map((s, i) => (s.latestRun && !hasRuns) ? '' :
+      `<button class="btn-sm" onclick="aiStarter(${i})">${escapeHtml(s.label)}</button>`).join('');
   document.getElementById('ai-send').disabled = !!pending || loading;
 }
 
 function openAiCoachTab() {
+  aiRenderRunChoices();
   aiRender(false);
   aiLoadThreads();
 }
@@ -2085,23 +2132,32 @@ function aiNewThread() {
 
 // Отправка вопроса. Разбор заводится на первом вопросе, а не кнопкой
 // «Новый разбор»: пустых веток в хранилище не остаётся.
-async function aiSend(preset = null, title = null) {
+//
+// Без аргумента вопрос берётся из формы — с пробежкой, выбранной в списке
+// «прикрепить». preset — готовый вопрос: {text, title} от подсказки или
+// {text, threadRunId} для разбора, целиком посвящённого одной пробежке.
+async function aiSend(preset = null) {
   const input = document.getElementById('ai-input');
-  const text = (preset || input.value).trim();
+  const select = document.getElementById('ai-run');
+  const text = (preset ? preset.text : input.value).trim();
   if (!text || AICOACH.pending || AICOACH.loading) return;
+  const runId = preset ? null : (Number(select.value) || null);
   const session = AICOACH.session;
-  AICOACH.pending = text;
-  if (!preset) input.value = '';
+  AICOACH.pending = { text, runId };
+  if (!preset) { input.value = ''; select.value = ''; }
   aiNote('');
   aiRender();
   try {
     if (!AICOACH.thread) {
-      const created = await aiFetch('threads', { method: 'POST', body: { title: title || text } });
+      const head = preset && preset.threadRunId
+        ? { run_id: preset.threadRunId }            // заголовок сервер возьмёт из пробежки
+        : { title: (preset && preset.title) || text };
+      const created = await aiFetch('threads', { method: 'POST', body: head });
       if (AICOACH.session !== session) return;
       AICOACH.thread = created.thread;
     }
     const data = await aiFetch(`threads/${encodeURIComponent(AICOACH.thread.id)}/messages`,
-                               { method: 'POST', body: { text } });
+                               { method: 'POST', body: runId ? { text, run_id: runId } : { text } });
     if (AICOACH.session !== session) { aiLoadThreads(); return; }
     AICOACH.messages = AICOACH.messages.concat(data.messages || []);
     AICOACH.usage = data.usage || AICOACH.usage;
@@ -2112,6 +2168,7 @@ async function aiSend(preset = null, title = null) {
     if (AICOACH.session !== session) return;
     AICOACH.pending = null;
     if (!input.value) input.value = text;       // вопрос не теряется — можно отправить снова
+    if (runId && !select.value) select.value = String(runId);
     aiRender();
     if (!e.handled) aiNote(aiErrorText(e));
   }
@@ -2119,7 +2176,18 @@ async function aiSend(preset = null, title = null) {
 
 function aiStarter(index) {
   const starter = AI_STARTERS[index];
-  if (starter) aiSend(starter.text, starter.title);
+  if (!starter) return;
+  if (!starter.latestRun) { aiSend({ text: starter.text, title: starter.title }); return; }
+  const latest = aiOwnRuns()[0];
+  if (latest) aiSend({ text: starter.text, threadRunId: latest.id });
+}
+
+// Вход из журнала и карточки пробежки: новый разбор, посвящённый ей.
+function aiReviewRun(id) {
+  closeRunDetail();
+  showTab('aicoach', document.getElementById('nav-aicoach-btn'));
+  aiNewThread();
+  aiSend({ text: AI_REVIEW_TEXT, threadRunId: id });
 }
 
 function aiKey(event) {

@@ -27,7 +27,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      clean_ai_text, clean_athlete_profile, clean_effort,
                      cleanup_old_tmp, coach_can_access,
                      compute_athlete_derived, create_ai_thread, create_plan,
-                     current_coach, find_plan, get_active_plan,
+                     current_coach, find_own_run, find_plan, get_active_plan,
                      get_storage_client, increment_advice_usage,
                      list_ai_threads, list_athletes_of, list_coaches, mask_key,
                      migrate_legacy_to_user, parse_coach_reply, parse_fit_file,
@@ -36,7 +36,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      read_athlete_profile, read_latest_advice,
                      read_llm_config_full, read_plan_weeks, read_plans_index,
                      read_races, read_registry, read_run_details, read_runs,
-                     resolve_user, save_plan_weeks, set_active_plan,
+                     resolve_user, run_title, save_plan_weeks, set_active_plan,
                      set_coach_flag, set_user_coach, set_user_status,
                      update_plan_meta, write_advice_version,
                      write_athlete_version, write_llm_config_version,
@@ -460,9 +460,24 @@ def h_ai_threads_get(c):
                   "usage": _ai_usage(c)}, 200)
 
 
+class RunNotFound(Exception):
+    """К разбору прикладывают пробежку, которой у пользователя нет → 404."""
+
+
+def _attached_run(c):
+    """Пробежка из тела запроса (run_id) или None, если её не прикладывали."""
+    run_id = c.body().get("run_id")
+    if run_id is None:
+        return None
+    run = find_own_run(c.bucket, c.sub, run_id)
+    if not run:
+        raise RunNotFound()
+    return run
+
+
 def h_ai_threads_post(c):
     thread = create_ai_thread(c.bucket, c.sub, c.body().get("title"),
-                              created_by=c.email)
+                              run=_attached_run(c), created_by=c.email)
     return jresp({"thread": thread}, 201)
 
 
@@ -489,6 +504,7 @@ def h_ai_message_post(c):
         text = clean_ai_text(c.body().get("text"))
     except AICoachError as e:
         return jresp({"error": str(e)}, 400)
+    run = _attached_run(c)
     cfg = read_llm_config_full(c.bucket)
     if not cfg or not cfg.get("api_key"):
         return jresp({"error": "LLM config not set. Обратитесь к администратору."}, 400)
@@ -496,8 +512,8 @@ def h_ai_message_post(c):
     if usage["count"] >= usage["limit"]:
         return jresp({"error": "daily_limit_reached", "limit": usage["limit"]}, 429)
 
-    turn = build_ai_turn(c.bucket, c.sub,
-                         read_ai_messages(c.bucket, c.sub, thread["id"]))
+    turn = build_ai_turn(c.bucket, c.sub, thread,
+                         read_ai_messages(c.bucket, c.sub, thread["id"]), run=run)
     llm_res, failure = _ask_llm(cfg, turn["system"], text, history=turn["history"])
     if failure:
         return failure
@@ -509,9 +525,14 @@ def h_ai_message_post(c):
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
     ctx = turn["ctx"]
-    question = append_ai_message(c.bucket, c.sub, thread["id"], "athlete", text,
-                                 {"created_by": c.email})
+    asked = {"created_by": c.email}
+    if run:
+        # Подпись хранится снимком: позже пробежку могут скрыть или поправить,
+        # а в разборе должно остаться, о чём шла речь.
+        asked.update(run_id=run["id"], run_title=run_title(run))
+    question = append_ai_message(c.bucket, c.sub, thread["id"], "athlete", text, asked)
     answer = append_ai_message(c.bucket, c.sub, thread["id"], "ai", reply, {
+        "run_ids": turn["focus_run_ids"],
         "provider": cfg["provider"], "model": cfg["model"],
         "input_tokens": llm_res["input_tokens"],
         "output_tokens": llm_res["output_tokens"],
@@ -865,6 +886,8 @@ def handle_request(request):
         return handler(Ctx(request, bucket, user, match.groups()))
     except Forbidden:
         return jresp({"error": "forbidden"}, 403)
+    except RunNotFound:
+        return jresp({"error": "run not found"}, 404)
     except NoCoach:
         return jresp({"error": "no_coach"}, 409)
     except Exception as e:

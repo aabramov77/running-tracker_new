@@ -265,9 +265,28 @@ def test_ai_coach_generated_handlers_exist():
     defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
     called = set()
     for handler in re.findall(r'onclick="([^"]*)"', section):
+        handler = re.sub(r"\$\{[^}]*\}", "", handler)     # подстановки — не вызовы обработчика
         called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
-    called -= {"escapeHtml"}            # подстановка в шаблоне, не обработчик
-    assert called and not (called - defined), sorted(called - defined)
+    assert {"aiOpenThread", "aiArchiveThread", "aiStarter", "showRunDetail"} <= called
+    assert not (called - defined), sorted(called - defined)
+
+
+def test_run_review_entry_points_are_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert 'id="rd-ai-btn"' in html and 'id="ai-run"' in html
+    assert "getElementById('rd-ai-btn')" in js
+    assert "onAiReview: () => aiReviewRun(id)" in js
+    assert "reviewable: true" in js
+
+
+def test_coach_screen_offers_no_ai_review_of_an_athletes_run():
+    """Разбор идёт по данным и лимиту самого пользователя — пробежка
+    спортсмена на экране тренера в него попасть не должна."""
+    js = APP_JS.read_text(encoding="utf-8")
+    section = _js_section(js, "const COACH = {", "function renderAll()")
+    for leak in ("aiReviewRun", "onAiReview", "reviewable"):
+        assert leak not in section, leak
 
 
 def test_ai_coach_answers_are_escaped_before_markup():

@@ -387,6 +387,41 @@ def test_empty_plan_does_not_crash():
     assert result["totals"]["weeks_total"] == 0
 
 
+# ── Что стояло в плане на дату (#46) ──────────────────────────────────────────
+
+PLANNED = [{"start": "17.08", "mon": "10 км", "wed": " интервалы 6×800м ", "sun": "16 км"},
+           {"start": "24.08", "mon": "12 км"}]
+
+
+@pytest.mark.parametrize("day,expected", [
+    ("2026-08-17", (0, "mon", "10 км")),
+    ("2026-08-19", (0, "wed", "интервалы 6×800м")),      # пробелы по краям срезаны
+    ("2026-08-18", (0, "tue", "")),                       # день в плане, тренировки нет
+    ("2026-08-24", (1, "mon", "12 км")),
+    (date(2026, 8, 23), (0, "sun", "16 км")),
+])
+def test_planned_for_date_finds_the_cell(day, expected):
+    assert c.planned_for_date(PLANNED, day, "2026-08-17") == expected
+
+
+@pytest.mark.parametrize("day", ["2026-08-16", "2026-08-31", "не дата", None, ""])
+def test_planned_for_date_outside_the_plan_is_none(day):
+    assert c.planned_for_date(PLANNED, day, "2026-08-17") is None
+
+
+def test_planned_for_date_follows_the_row_label_not_the_weekday():
+    """Строка вс→сб: воскресенье — первый день окна, а не последний."""
+    weeks = [{"start": "10.05", "sun": "длительная 18 км", "mon": "отдых"}]
+    assert c.planned_for_date(weeks, "2026-05-10", "2026-05-10") == (0, "sun", "длительная 18 км")
+    assert c.planned_for_date(weeks, "2026-05-17", "2026-05-10") is None
+
+
+def test_planned_for_date_refuses_to_guess_for_an_undated_plan():
+    """Ни подписей, ни plan_start: недели легли бы на даты по умолчанию."""
+    assert c.planned_for_date([{"mon": "10 км"}], c.DEFAULT_PLAN_START) is None
+    assert c.planned_for_date([], "2026-08-17", "2026-08-17") is None
+
+
 # ── Совместимость с прежней точкой входа ──────────────────────────────────────
 
 def test_storage_delegates_to_compliance(storage_module):
