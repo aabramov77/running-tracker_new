@@ -20,9 +20,9 @@ from google.cloud import storage as gcs
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
-from compliance import (DAY_FIELDS, DEFAULT as UNDATED, anchor_source,
-                        current_week_idx, day_date, plan_compliance,
-                        planned_for_date, to_date, week_window)
+from compliance import (DEFAULT as UNDATED, anchor_source,
+                        current_week_idx, plan_compliance,
+                        planned_for_date, to_date, week_days, week_window)
 from domain import HR_ZONE_BOUNDS, PLAN_DAYS, TYPE_LABELS, personal_bests
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_plan_window,
@@ -1989,7 +1989,7 @@ def ai_plan_window(weeks, plan_start, week_idx, today=None, count=AI_PLAN_WINDOW
         start, end = week_window(weeks, idx, plan_start)
         if end < today:
             continue
-        days = sorted((day_date(start, field), field) for field in DAY_FIELDS)
+        days = week_days(start, end)
         window.append({
             "week": idx + 1,
             "current": start <= today <= end,

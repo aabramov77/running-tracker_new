@@ -171,6 +171,48 @@ function weekStart(i) {
   return labelled ||
     new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 7 * i);
 }
+function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); }
+// Окна строк плана: [[первый день, последний], …] — зеркало week_windows из
+// compliance.py. Обычно это семь дней; короче, если строка сама подписана
+// короче («04.10–04.10») или в эти семь дней уже начинается другая строка.
+// Иначе день принадлежал бы двум строкам сразу.
+//   naive — окна по одним подписям, без обрезки по соседним строкам.
+function weekWindows(naive) {
+  const starts = (PLAN || []).map((_, i) => weekStart(i));
+  return starts.map((s, i) => {
+    let e = addDays(s, 6);
+    const labelled = labelToDate(PLAN[i].end, s);
+    if (labelled && labelled >= s && labelled < e) e = labelled;
+    if (!naive) starts.forEach(o => { if (o > s && o <= e) e = addDays(o, -1); });
+    return [s, e];
+  });
+}
+function ddmm(d) {
+  return `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+// Что в датах недель помешает сопоставить план с фактом: пересекающиеся
+// строки и тренировки в днях, которые в даты своей строки не попадают.
+function planDateWarnings() {
+  if (!PLAN || !PLAN.length || !planIsDated()) return [];
+  const natural = weekWindows(true), wins = weekWindows();
+  const label = Object.fromEntries(PLAN_DAYS);
+  const out = [];
+  natural.forEach(([s, e], i) => {
+    const same = natural.findIndex(([o], j) => j > i && +o === +s);
+    if (same >= 0)
+      out.push(`Недели ${i + 1} и ${same + 1} начинаются в один день (${ddmm(s)}) — пробежки попадут в обе`);
+    const next = natural.findIndex(([o]) => o > s && o <= e);
+    if (next >= 0)
+      out.push(`Недели ${i + 1} и ${next + 1} пересекаются по датам — неделя ${i + 1} считается по ${ddmm(wins[i][1])}`);
+    // Колонка дня → дата: как day_date на бэкенде (getDay: вс = 0, колонки с пн)
+    const outside = PLAN_DAYS.map(([f]) => f).filter((f, k) =>
+      String(PLAN[i][f] || '').trim() &&
+      addDays(s, (k - (s.getDay() + 6) % 7 + 7) % 7) > wins[i][1]);
+    if (outside.length)
+      out.push(`Неделя ${i + 1}: ${outside.map(f => label[f]).join(', ')} — вне дат недели, в план/факт не попадут`);
+  });
+  return out;
+}
 // Привязан ли план к календарю: подписью первой недели или plan_start. Без
 // этого недели отсчитываются от даты по умолчанию — то есть наугад.
 function planIsDated() {
@@ -615,9 +657,9 @@ function getCurrentWeek() {
     // Идём по окнам строк: подписи могут идти не ровно через семь дней,
     // поэтому арифметикой индекс не вычислить.
     let latest = 0;
+    const wins = weekWindows();
     for (let i = 0; i < PLAN.length; i++) {
-      const s = weekStart(i);
-      const e = new Date(s.getFullYear(), s.getMonth(), s.getDate() + 6);
+      const [s, e] = wins[i];
       if (today >= s && today <= e) return Math.min(i, n - 1);
       if (today >= s) latest = i;
     }
@@ -637,9 +679,13 @@ function formatPace(v) {
   const m = Math.floor(v), s = Math.round((v - m) * 60);
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
+// Неделя плана, в чьё окно попадает дата, — по тем же окнам, что и таблица:
+// отсчёт семидневок от plan_start расходился с подписями строк.
 function getWeekLabel(dateStr) {
-  const w = Math.floor((new Date(dateStr) - planStartDate()) / (7 * 24 * 3600 * 1000)) + 1;
-  return (w >= 1 && w <= planWeeks()) ? `Нед ${w}` : '';
+  const d = localDate(dateStr);
+  if (!d || !PLAN || !PLAN.length || !planIsDated()) return '';
+  const i = weekWindows().findIndex(([s, e]) => d >= s && d <= e);
+  return i >= 0 ? `Нед ${i + 1}` : '';
 }
 
 async function saveRun() {
@@ -909,7 +955,8 @@ function planWeekHtml(plan, weeks, cw, idx) {
   // Дни идут по датам, а не по колонкам таблицы: неделя плана вс→сб
   // начинается с воскресенья. Без дат остаётся порядок колонок.
   const fields = PLAN_DAYS.map(([f]) => f);
-  if (week) fields.sort((a, b) => (byField[a]?.date || '').localeCompare(byField[b]?.date || ''));
+  // У строки короче семи дней части колонок нет в её датах — они в конце.
+  if (week) fields.sort((a, b) => (byField[a]?.date || '9').localeCompare(byField[b]?.date || '9'));
 
   const planned = week ? plannedKmLabel(week) : '';
   const km = !week ? '' : past
@@ -1050,12 +1097,12 @@ function renderToday() {
   }
 
   const cw = getCurrentWeek();
-  const start = weekStart(cw);
-  const offset = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) - start) / 86400000);
-  if (offset < 0 || offset > 6) {
-    const title = offset < 0
-      ? `План начнётся ${String(start.getDate()).padStart(2, '0')}.${String(start.getMonth() + 1).padStart(2, '0')}`
-      : 'План завершён';
+  const [start, end] = weekWindows()[cw];
+  const date = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (date < start || date > end) {
+    // После окна строки, но не последней: день попал в разрыв между неделями
+    const title = date < start ? `План начнётся ${ddmm(start)}`
+      : cw === PLAN.length - 1 ? 'План завершён' : 'На сегодня в плане нет недели';
     el.innerHTML = hero(when, title, '', recordBtn + planBtn) + recentHtml;
     return;
   }
@@ -1267,7 +1314,8 @@ function applyImportedPlan(weeks, fileName, warnings, race) {
   document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
   document.getElementById('plan-save-bar').style.display = 'none';  // свой бар
   renderPlan();
-  renderImportBar({ fileName, count: weeks.length, warnings });
+  renderImportBar({ fileName, count: weeks.length,
+                    warnings: [...warnings, ...planDateWarnings()] });
 }
 
 function renderImportBar({ fileName, count, warnings, errors }) {
@@ -1808,10 +1856,9 @@ function closeRunDetail(event) {
 // (#41). Прежняя формула делила миллисекунды на семь суток от plan_start и
 // с подписями недель не совпадала.
 function weekBuckets(runsList, n) {
-  const bounds = Array.from({length: n}, (_, i) => {
-    const s = weekStart(i);
-    return [s, new Date(s.getFullYear(), s.getMonth(), s.getDate() + 6)];
-  });
+  const wins = weekWindows();
+  const bounds = Array.from({length: n}, (_, i) =>
+    wins[i] || [weekStart(i), addDays(weekStart(i), 6)]);
   const km = Array(n).fill(0);
   runsList.forEach(r => {
     const d = localDate(r.date);

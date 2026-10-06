@@ -97,17 +97,44 @@ def plan_week_zero(plan_start=None, weeks=None):
     return to_date(plan_start) or to_date(DEFAULT_PLAN_START)
 
 
-def week_window(weeks, idx, plan_start=None):
-    """(первый день, последний день) строки idx — 7 дней от её подписи.
+def week_windows(weeks, plan_start=None):
+    """Окна всех строк плана: [(первый день, последний день)].
 
     Окно берётся из подписи каждой строки, а не отсчитывается от первой:
     так подпись и расчёт совпадают по построению и не разъезжаются на
     вставленной неделе, опечатке в дате или смене разметки посреди плана.
     Строка без подписи получает окно от якоря плана.
+
+    Обычно окно — семь дней. Короче оно в двух случаях: строка сама
+    подписана короче («04.10–04.10» — план стартует в воскресенье) либо в
+    эти семь дней уже начинается другая строка. Иначе один день принадлежал
+    бы двум строкам сразу: пробежка засчитывалась дважды, текущей неделей
+    оказывалась предыдущая, а на дату находилась чужая пустая ячейка.
     """
-    row = weeks[idx] if weeks and 0 <= idx < len(weeks) else None
-    labelled = label_to_date((row or {}).get("start"), plan_start) if row else None
-    first = labelled or (plan_week_zero(plan_start, weeks) + timedelta(days=7 * idx))
+    weeks = weeks or []
+    zero = plan_week_zero(plan_start, weeks)
+    starts = [label_to_date((row or {}).get("start"), plan_start)
+              or zero + timedelta(days=7 * idx)
+              for idx, row in enumerate(weeks)]
+
+    windows = []
+    for row, first in zip(weeks, starts):
+        last = first + timedelta(days=6)
+        labelled_end = label_to_date((row or {}).get("end"), first)
+        if labelled_end and first <= labelled_end < last:
+            last = labelled_end
+        for other in starts:
+            if first < other <= last:
+                last = other - timedelta(days=1)
+        windows.append((first, last))
+    return windows
+
+
+def week_window(weeks, idx, plan_start=None):
+    """(первый день, последний день) строки idx — см. week_windows."""
+    if weeks and 0 <= idx < len(weeks):
+        return week_windows(weeks, plan_start)[idx]
+    first = plan_week_zero(plan_start, weeks) + timedelta(days=7 * idx)
     return first, first + timedelta(days=6)
 
 
@@ -120,6 +147,17 @@ def day_date(week_start, field):
     """
     weekday = DAY_FIELDS.index(field)
     return week_start + timedelta(days=(weekday - week_start.weekday()) % 7)
+
+
+def week_days(week_start, week_end=None):
+    """[(дата, колонка)] дней окна по порядку дат.
+
+    У строки короче семи дней колонок меньше: день за её последней датой
+    принадлежит другой строке или не принадлежит ни одной.
+    """
+    last = week_end or week_start + timedelta(days=6)
+    days = sorted((day_date(week_start, field), field) for field in DAY_FIELDS)
+    return [(day, field) for day, field in days if day <= last]
 
 
 LABEL = "label"
@@ -150,8 +188,7 @@ def planned_for_date(weeks, day, plan_start=None):
     day = to_date(day)
     if day is None or not weeks or anchor_source(plan_start, weeks) == DEFAULT:
         return None
-    for idx in range(len(weeks)):
-        start, end = week_window(weeks, idx, plan_start)
+    for idx, (start, end) in enumerate(week_windows(weeks, plan_start)):
         if start <= day <= end:
             field = DAY_FIELDS[day.weekday()]
             return idx, field, str((weeks[idx] or {}).get(field) or "").strip()
@@ -184,8 +221,7 @@ def current_week_idx(plan_start=None, weeks_count=0, today=None, weeks=None):
         # Идём по окнам строк: подписи могут идти не ровно через семь дней,
         # поэтому арифметикой индекс не вычислить.
         latest_started = None
-        for i in range(len(weeks)):
-            start, end = week_window(weeks, i, plan_start)
+        for i, (start, end) in enumerate(week_windows(weeks, plan_start)):
             if start <= day <= end:
                 return min(i, n - 1)
             if start <= day:
@@ -305,8 +341,10 @@ def _run_km(runs):
     return round(total, 2)
 
 
-def week_compliance(week, week_start, runs_by_date):
-    """Один ряд плана против факта. week_start — понедельник этой недели."""
+def week_compliance(week, week_start, runs_by_date, week_end=None):
+    """Один ряд плана против факта. week_start — первый день окна строки,
+    week_end — последний; без него окно семидневное."""
+    last = week_end or week_start + timedelta(days=6)
     days = []
     planned_km = 0.0
     unparsed = 0
@@ -319,6 +357,8 @@ def week_compliance(week, week_start, runs_by_date):
 
     for field in DAY_FIELDS:
         this_day = day_date(week_start, field)
+        if this_day > last:
+            continue    # день вне окна короткой строки — не её день
         plan = parse_planned_day((week or {}).get(field))
         day_runs = runs_by_date.get(this_day, [])
         day_km = _run_km(day_runs)
@@ -368,7 +408,7 @@ def week_compliance(week, week_start, runs_by_date):
 
     return {
         "start": week_start.isoformat(),
-        "end": (week_start + timedelta(days=6)).isoformat(),
+        "end": last.isoformat(),
         "planned_km": planned_km,
         "actual_km": actual_km,
         "delta_km": round(actual_km - planned_km, 2) if complete else None,
@@ -390,8 +430,8 @@ def plan_compliance(weeks, runs, plan_start=None, plan_id=None):
     runs_by_date = _runs_by_date(runs, plan_id)
     zero = plan_week_zero(plan_start, weeks)
 
-    rows = [week_compliance(week, week_window(weeks, i, plan_start)[0], runs_by_date)
-            for i, week in enumerate(weeks)]
+    rows = [week_compliance(week, start, runs_by_date, end)
+            for week, (start, end) in zip(weeks, week_windows(weeks, plan_start))]
 
     complete = all(r["complete"] for r in rows) if rows else True
     planned_km = round(sum(r["planned_km"] for r in rows), 2)

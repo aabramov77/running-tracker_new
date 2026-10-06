@@ -746,6 +746,18 @@ def test_plan_window_orders_days_by_date_for_a_sunday_first_row(storage_module):
     assert week["days"][0]["date"] == "2026-08-16"
 
 
+def test_plan_window_gives_a_short_row_only_its_own_days(storage_module):
+    """Строка из одного дня: остальные даты принадлежат следующей, и
+    предлагать на них правку в двух строках сразу нельзя."""
+    weeks = [{"start": "04.10", "end": "04.10", "sun": "5 км"},
+             {"start": "05.10", "end": "11.10", "tue": "33 мин"}]
+    first, second = storage_module.ai_plan_window(weeks, "2026-10-04", 0, today="2026-10-04")
+    assert [(d["field"], d["date"]) for d in first["days"]] == [("sun", "2026-10-04")]
+    assert (first["end"], second["start"]) == ("2026-10-04", "2026-10-05")
+    dates = [d["date"] for week in (first, second) for d in week["days"]]
+    assert len(dates) == len(set(dates)) == 8
+
+
 def test_plan_window_is_capped_and_starts_at_the_current_week(storage_module):
     weeks = [{"start": (dt.date(2026, 8, 17) + dt.timedelta(days=7 * i)).strftime("%d.%m.%Y")}
              for i in range(10)]

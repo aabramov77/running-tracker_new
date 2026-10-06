@@ -416,6 +416,18 @@ def test_today_screen_does_not_guess_for_an_undated_plan():
     assert body.index("planIsDated()") < body.index("getCurrentWeek()")
 
 
+def test_week_boundaries_come_from_one_place():
+    """Окно строки плана считает только weekWindows — зеркало week_windows
+    бэкенда. Своя «+6 дней» в другом месте снова разойдётся с таблицей на
+    строке короче недели: текущей окажется не та неделя."""
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("getCurrentWeek", "getWeekLabel", "weekBuckets", "renderToday"):
+        body = _js_section(js, f"function {name}(", "\n}\n")
+        assert "weekWindows()" in body, name
+    assert "getDate() + 6" not in js
+    assert "planDateWarnings()" in _js_section(js, "function applyImportedPlan(", "\n}\n")
+
+
 def test_day_edit_writes_a_new_plan_version_over_fresh_weeks():
     """Правка дня на телефоне — та же версионная запись плана, что и из
     конструктора. Сервер версию не сверяет, поэтому основа записи — только
