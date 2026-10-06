@@ -404,7 +404,7 @@ def test_mobile_plan_views_call_existing_handlers():
     for handler in re.findall(r'onclick="([^"]*)"', section):
         handler = re.sub(r"\$\{[^}]*\}", "", handler)
         called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
-    assert {"planWeekStep", "planWeekToday", "openAddSheet", "showTab"} <= called
+    assert {"planWeekStep", "planWeekToday", "openDaySheet", "openAddSheet", "showTab"} <= called
     assert not (called - defined), sorted(called - defined)
 
 
@@ -414,3 +414,21 @@ def test_today_screen_does_not_guess_for_an_undated_plan():
     js = APP_JS.read_text(encoding="utf-8")
     body = _js_section(js, "function renderToday() {", "\n}\n")
     assert body.index("planIsDated()") < body.index("getCurrentWeek()")
+
+
+def test_day_edit_writes_a_new_plan_version_over_fresh_weeks():
+    """Правка дня на телефоне — та же версионная запись плана, что и из
+    конструктора. Сервер версию не сверяет, поэтому основа записи — только
+    что прочитанные недели, и изменившийся день не затирается молча."""
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="day-sheet"' in html and 'onclick="saveDayEdit()"' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "async function saveDayEdit() {", "\n}\n")
+    assert "planEditMode" in body, "открытый конструктор записал бы план без этой правки"
+    fresh, stale, write, reload = (body.index(s) for s in (
+        "await fetchPlanWeeks()", "cell !== edit.was", "await postPlanWeeks(", "await loadPlan();         //"))
+    assert fresh < stale < write < reload
+    # основа записи — свежие недели, локальный PLAN не трогаем и не отправляем
+    assert "fresh.map(" in body
+    assert not re.search(r"(?<![.\w])PLAN\s*(\[[^\]]*\]\s*)*(\.\w+\s*)?=[^=]", body)
+    assert "postPlanWeeks(PLAN" not in body

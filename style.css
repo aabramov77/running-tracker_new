@@ -665,6 +665,7 @@ table.pb-table td:last-child { text-align: right; }
     margin: 0 -8px; padding: 10px 8px;
     border-bottom: 0.5px solid var(--border); font-size: 14px;
   }
+  .pw-day { cursor: pointer; }
   .pw-day:last-child { border-bottom: none; }
   .pw-day.today {
     background: var(--c-accent-light); color: var(--c-accent-dark);
@@ -676,6 +677,31 @@ table.pb-table td:last-child { text-align: right; }
   .pw-rest { opacity: .5; }
   .pw-fact { flex-shrink: 0; text-align: right; font-family: 'DM Mono', monospace; }
   .pw-today { width: 100%; margin-top: 10px; }
+
+  /* Листы (карточка пробежки, «+», правка дня) — во всю ширину от нижнего края */
+  .run-detail-overlay { padding: 0; }
+  .run-detail-card {
+    max-width: none; max-height: 92dvh;
+    border-radius: 16px 16px 0 0;
+    padding-bottom: calc(20px + env(safe-area-inset-bottom));
+  }
+  .run-detail-card.more-list { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+  .run-detail-card::before {            /* «ручка» листа */
+    content: ''; display: block;
+    width: 36px; height: 4px; margin: -8px auto 12px;
+    border-radius: 2px; background: var(--text-muted); opacity: .35;
+  }
+
+  /* Чаты: поле ввода держится над нижней панелью, лента занимает экран */
+  .chat-form {
+    position: sticky; bottom: calc(56px + env(safe-area-inset-bottom)); z-index: 1;
+    padding: 8px 0; background: var(--bg-card);
+  }
+  .ai-log { max-height: 52dvh; }
+  #ai-threads { max-height: 124px; }
+
+  /* Главная кнопка формы тянется на свободную ширину строки */
+  .form-grid + div > .btn-primary { flex: 1 1 auto; }
 
   /* На телефоне сначала форма пробежки, калькулятор — под ней */
   #tab-add.active { display: flex; flex-direction: column; }

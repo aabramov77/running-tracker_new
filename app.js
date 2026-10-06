@@ -421,14 +421,19 @@ function setStatus(msg, type = 'ok') {
   el.style.color = type === 'ok' ? 'var(--c-accent)' : type === 'warn' ? 'var(--c-warn)' : 'var(--c-danger)';
 }
 
+/** Недели активного плана с сервера, мимо кэша. */
+async function fetchPlanWeeks() {
+  const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
 async function loadPlan() {
   const cached = localStorage.getItem(planCacheKey());
   if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
   try {
-    const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
-    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const weeks = await res.json();
+    const weeks = await fetchPlanWeeks();
     if (Array.isArray(weeks)) {
       // [] — новый пользователь без плана (покажем пустое состояние + «Создать план»)
       PLAN = weeks;
@@ -916,7 +921,7 @@ function planWeekHtml(plan, weeks, cw, idx) {
     const date = day ? `${day.date.slice(8)}.${day.date.slice(5, 7)}` : '';
     // Сегодняшний и будущие дни текущей недели ещё не пропущены
     const pending = day && day.status === 'missed' && day.date >= today;
-    return `<div class="pw-day${day && day.date === today ? ' today' : ''}">
+    return `<div class="pw-day${day && day.date === today ? ' today' : ''}" onclick="openDaySheet(${idx},'${f}')">
         <div class="pw-dow">${label[f]}<span>${date}</span></div>
         <div class="pw-text">${escapeHtml(r[f] || '') || '<span class="pw-rest">—</span>'}</div>
         <div class="pw-fact">${dayFactHtml(day, past && !pending)}</div>
@@ -938,6 +943,69 @@ function planWeekHtml(plan, weeks, cw, idx) {
     </div>
     <div class="pw-days">${rows}</div>
     ${idx !== cw ? '<button class="btn-sm pw-today" onclick="planWeekToday()">К текущей неделе</button>' : ''}`;
+}
+
+// ── Правка одного дня (#48): конструктора на телефоне нет, день правится в листе ──
+let dayEdit = null;   // { idx, field, was } — открытая ячейка и её текст на момент открытия
+
+function dayNote(text, isError = false) {
+  const el = document.getElementById('day-sheet-msg');
+  el.textContent = text;
+  el.style.color = isError ? 'var(--c-danger)' : '';
+  el.style.display = text ? 'inline' : 'none';
+}
+
+function openDaySheet(idx, field) {
+  if (planEditMode || !PLAN || !PLAN[idx]) return;
+  const r = PLAN[idx];
+  dayEdit = { idx, field, was: r[field] || '' };
+  document.getElementById('day-sheet-title').textContent =
+    `${Object.fromEntries(PLAN_DAYS)[field]} · неделя ${r.w ?? idx + 1}`;
+  document.getElementById('day-sheet-text').value = dayEdit.was;
+  dayNote('');
+  document.getElementById('day-sheet').classList.add('active');
+}
+
+function closeDaySheet(event) {
+  if (event && event.target !== document.getElementById('day-sheet')) return;
+  document.getElementById('day-sheet').classList.remove('active');
+  dayEdit = null;
+}
+
+async function saveDayEdit() {
+  const edit = dayEdit;
+  if (!edit) return;
+  // Иначе сохранение открытого конструктора записало бы план без этой правки.
+  if (planEditMode) { dayNote('Сначала сохраните или отмените правку плана', true); return; }
+  const text = document.getElementById('day-sheet-text').value.trim();
+  if (text === edit.was.trim()) { closeDaySheet(); return; }
+  const btn = document.getElementById('day-sheet-save');
+  btn.disabled = true; btn.textContent = 'Сохранение…';
+  try {
+    // Сервер версию плана при записи не сверяет. Поэтому пишем поверх только
+    // что прочитанных недель, а не локальной копии: правка с другого
+    // устройства или от ИИ-тренера в остальных днях сохранится.
+    const fresh = await fetchPlanWeeks();
+    if (dayEdit !== edit) return;                        // лист закрыли, пока шёл запрос
+    const cell = Array.isArray(fresh) && fresh[edit.idx] ? (fresh[edit.idx][edit.field] || '') : null;
+    if (cell !== edit.was) {
+      // Сам день изменился с момента открытия — молча затирать нельзя.
+      await loadPlan();
+      if (cell === null) { closeDaySheet(); alert('План изменился: этой недели в нём больше нет.'); return; }
+      edit.was = cell;
+      dayNote(`План изменился: сейчас здесь «${cell || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
+      return;
+    }
+    const weeks = fresh.map((w, i) => i === edit.idx ? { ...w, [edit.field]: text } : w);
+    const week = fresh[edit.idx].w ?? edit.idx + 1;
+    await postPlanWeeks(weeks, `Правка дня: неделя ${week}, ${Object.fromEntries(PLAN_DAYS)[edit.field]}`);
+    closeDaySheet();
+    await loadPlan();         // новая версия плана и свежий план/факт
+  } catch (e) {
+    dayNote('Не удалось сохранить: ' + e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Сохранить';
+  }
 }
 
 // ── Экран «Сегодня» (#48): главный на телефоне ──
