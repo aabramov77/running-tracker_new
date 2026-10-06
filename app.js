@@ -130,6 +130,12 @@ function localDate(iso) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
   return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
 }
+// Дата как 'YYYY-MM-DD' в местном времени — в том же виде, в каком бэкенд
+// отдаёт даты дней плана. toISOString() считает в UTC и ночью уезжает на сутки.
+function localIso(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
 function planStartDate() {
   return localDate(ACTIVE_PLAN?.plan_start) || localDate('2026-05-10');
 }
@@ -164,6 +170,12 @@ function weekStart(i) {
   const labelled = (PLAN && PLAN[i]) ? labelToDate(PLAN[i].start, anchor) : null;
   return labelled ||
     new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 7 * i);
+}
+// Привязан ли план к календарю: подписью первой недели или plan_start. Без
+// этого недели отсчитываются от даты по умолчанию — то есть наугад.
+function planIsDated() {
+  const labelled = PLAN && PLAN.length ? labelToDate(PLAN[0].start, planStartDate()) : null;
+  return !!(labelled || localDate(ACTIVE_PLAN?.plan_start));
 }
 function activePlanId() { return ACTIVE_PLAN ? ACTIVE_PLAN.id : null; }
 // Кэш недель — свой у каждого плана, иначе планы затирали бы друг друга
@@ -737,7 +749,15 @@ function renderComplianceNote() {
   }
 }
 
+// План рисуется в трёх местах: таблица, неделя списком дней и экран
+// «Сегодня» на телефоне (#48). Обновляются всегда вместе.
 function renderPlan() {
+  renderPlanTable();
+  renderPlanWeek();
+  renderToday();
+}
+
+function renderPlanTable() {
   const body = document.getElementById('plan-body');
 
   // ── Режим конструктора (может быть 0 строк) ──
@@ -780,33 +800,38 @@ function renderPlan() {
   body.innerHTML = planViewRowsHtml(PLAN, compliantWeeks(), getCurrentWeek());
 }
 
+// Общее для таблицы плана и мобильного списка дней (#48).
+const PLAN_BADGE = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
+const PLAN_TYPE_LABEL = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
+
+// Отметка факта у дня. Показываем только для прошедших и текущей недели: у
+// будущих факта быть не может, и прочерки там читались бы как пропуски.
+function dayFactHtml(day, past) {
+  if (!day || !past) return '';
+  if (day.status === 'done')
+    return `<div style="font-size:11px;color:var(--c-accent)">✓ ${km1(day.actual_km)}</div>`;
+  if (day.status === 'missed')
+    return `<div style="font-size:11px;opacity:.45">—</div>`;
+  if (day.status === 'extra')
+    return `<div style="font-size:11px;color:var(--c-blue)" title="Не было в плане">+${km1(day.actual_km)}</div>`;
+  return '';
+}
+
+// Плановый объём недели. «≥32» — точный объём из текста плана не вывести,
+// показана нижняя граница. Это свойство записи в плане, а не выполнения.
+function plannedKmLabel(week) {
+  return week.planned_km
+    ? `${week.complete ? '' : '≥'}${km1(week.planned_km)}`
+    : (week.complete ? '' : '?');
+}
+
 // Строки таблицы плана с план/фактом. Зависит только от аргументов, поэтому
 // ею же рисуется план спортсмена на экране тренера (#44).
 //   plan  — недели плана; weeks — недели compliance или null; cw — индекс текущей.
 function planViewRowsHtml(plan, weeks, cw) {
-  const badgeMap = {dev:'badge-dev',peak:'badge-peak',taper:'badge-taper',load:'badge-load',race:'badge-race'};
-  const labelMap = {dev:'Развитие',peak:'Пик',taper:'Тейпер',load:'Разгрузка',race:'Старт'};
-
-  // Факт показываем только для прошедших и текущей недели: у будущих его
-  // быть не может, и прочерки там читались бы как пропуски.
-  const factCell = (day, past) => {
-    if (!day || !past) return '';
-    if (day.status === 'done')
-      return `<div style="font-size:11px;color:var(--c-accent)">✓ ${km1(day.actual_km)}</div>`;
-    if (day.status === 'missed')
-      return `<div style="font-size:11px;opacity:.45">—</div>`;
-    if (day.status === 'extra')
-      return `<div style="font-size:11px;color:var(--c-blue)" title="Не было в плане">+${km1(day.actual_km)}</div>`;
-    return '';
-  };
-
   const kmCell = (week, past) => {
     if (!week) return '<td></td>';
-    // «≥32» — точный объём из текста плана не вывести, показана нижняя
-    // граница. Это свойство записи в плане, а не выполнения.
-    const planned = week.planned_km
-      ? `${week.complete ? '' : '≥'}${km1(week.planned_km)}`
-      : (week.complete ? '' : '?');
+    const planned = plannedKmLabel(week);
     const reasons = [];
     if (week.unparsed) reasons.push(`интервалы или время (${week.unparsed})`);
     if (week.approx) reasons.push(`диапазон (${week.approx})`);
@@ -840,11 +865,165 @@ function planViewRowsHtml(plan, weeks, cw) {
     <tr class="${i===cw?'current-week':''} ${r.type==='race'?'race-week':''}">
       <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w ?? i+1}</td>
       <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${escapeHtml(r.start ?? '')}<br>${escapeHtml(r.end ?? '')}</td>
-      <td><span class="badge ${badgeMap[r.type]||''}">${labelMap[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
+      <td><span class="badge ${PLAN_BADGE[r.type]||''}">${PLAN_TYPE_LABEL[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
       ${kmCell(week, past)}
-      ${PLAN_DAYS.map(([f]) => dayCell(r[f], f, factCell(byField[f], past))).join('')}
+      ${PLAN_DAYS.map(([f]) => dayCell(r[f], f, dayFactHtml(byField[f], past))).join('')}
     </tr>`;
   }).join('');
+}
+
+// ── План неделей (#48): на телефоне вместо таблицы из 11 колонок ──
+let planWeekIdx = null;       // null — показывать текущую неделю
+let planWeekPlanId = null;    // для какого плана выбран planWeekIdx
+
+function renderPlanWeek() {
+  const el = document.getElementById('plan-week');
+  // Конструктор и пустой план остаются в таблице: пустой список её и показывает
+  if (planEditMode || !PLAN?.length) { el.innerHTML = ''; return; }
+  if (planWeekPlanId !== activePlanId()) { planWeekIdx = null; planWeekPlanId = activePlanId(); }
+  const cw = getCurrentWeek();
+  const idx = Math.max(0, Math.min(PLAN.length - 1, planWeekIdx ?? cw));
+  el.innerHTML = planWeekHtml(PLAN, compliantWeeks(), cw, idx);
+}
+
+function planWeekStep(delta) {
+  planWeekIdx = (planWeekIdx ?? getCurrentWeek()) + delta;
+  renderPlanWeek();
+}
+function planWeekToday() { planWeekIdx = null; renderPlanWeek(); }
+
+// Одна неделя списком дней. Как и planViewRowsHtml, зависит только от аргументов.
+function planWeekHtml(plan, weeks, cw, idx) {
+  const r = plan[idx];
+  const week = weeks ? weeks[idx] : null;
+  const past = idx <= cw;
+  const today = localIso(new Date());
+  const label = Object.fromEntries(PLAN_DAYS);
+  const byField = {};
+  (week?.days || []).forEach(d => { byField[d.field] = d; });
+  // Дни идут по датам, а не по колонкам таблицы: неделя плана вс→сб
+  // начинается с воскресенья. Без дат остаётся порядок колонок.
+  const fields = PLAN_DAYS.map(([f]) => f);
+  if (week) fields.sort((a, b) => (byField[a]?.date || '').localeCompare(byField[b]?.date || ''));
+
+  const planned = week ? plannedKmLabel(week) : '';
+  const km = !week ? '' : past
+    ? `${km1(week.actual_km)} / ${planned || '—'} км`
+    : (planned ? `${planned} км` : '');
+
+  const rows = fields.map(f => {
+    const day = byField[f];
+    const date = day ? `${day.date.slice(8)}.${day.date.slice(5, 7)}` : '';
+    // Сегодняшний и будущие дни текущей недели ещё не пропущены
+    const pending = day && day.status === 'missed' && day.date >= today;
+    return `<div class="pw-day${day && day.date === today ? ' today' : ''}">
+        <div class="pw-dow">${label[f]}<span>${date}</span></div>
+        <div class="pw-text">${escapeHtml(r[f] || '') || '<span class="pw-rest">—</span>'}</div>
+        <div class="pw-fact">${dayFactHtml(day, past && !pending)}</div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="pw-head">
+      <button class="btn-sm" onclick="planWeekStep(-1)"${idx === 0 ? ' disabled' : ''} aria-label="Предыдущая неделя">‹</button>
+      <div class="pw-title">Неделя ${r.w ?? idx + 1} <span>из ${plan.length}</span>
+        <div class="pw-dates">${escapeHtml(r.start ?? '')} – ${escapeHtml(r.end ?? '')}</div>
+      </div>
+      <button class="btn-sm" onclick="planWeekStep(1)"${idx === plan.length - 1 ? ' disabled' : ''} aria-label="Следующая неделя">›</button>
+    </div>
+    <div class="pw-meta">
+      <span><span class="badge ${PLAN_BADGE[r.type] || ''}">${PLAN_TYPE_LABEL[r.type] || escapeHtml(r.type || '')}</span>
+        <span class="pw-accent">${escapeHtml(r.accent ?? '')}</span></span>
+      <span class="pw-km">${km}</span>
+    </div>
+    <div class="pw-days">${rows}</div>
+    ${idx !== cw ? '<button class="btn-sm pw-today" onclick="planWeekToday()">К текущей неделе</button>' : ''}`;
+}
+
+// ── Экран «Сегодня» (#48): главный на телефоне ──
+function renderToday() {
+  const el = document.getElementById('today-body');
+  const now = new Date();
+  const today = localIso(now);
+  const when = now.toLocaleDateString('ru-RU', { weekday: 'short', day: 'numeric', month: 'long' });
+
+  const recent = runs.filter(r => !r.deleted)
+    .sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 3);
+  const recentHtml = `<div class="card">
+      <div class="week-header">
+        <div class="card-title" style="margin:0">Последние пробежки</div>
+        <button class="btn-sm" onclick="showTab('log')">Весь журнал</button>
+      </div>
+      ${recent.length
+        ? recent.map(r => runItemHtml(r, { onclick: `showRunDetail(${r.id})`, weekLabel: getWeekLabel(r.date) })).join('')
+        : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>'}
+    </div>`;
+
+  const hero = (meta, title, sub, actions) => `<div class="card today-hero">
+      <div class="today-when">${meta}</div>
+      <div class="today-title">${title}</div>
+      ${sub ? `<div class="today-sub">${sub}</div>` : ''}
+      <div class="today-actions">${actions}</div>
+    </div>`;
+  const recordBtn = `<button class="btn-primary" onclick="openAddSheet()">Записать</button>`;
+  const planBtn = `<button class="btn-sm" onclick="showTab('plan')">Открыть план</button>`;
+
+  if (!PLAN?.length) {
+    el.innerHTML = hero(when, 'Плана пока нет', '', recordBtn + planBtn) + recentHtml;
+    return;
+  }
+  // Недели, размеченные наугад, на «сегодня» не переводим: получилась бы
+  // правдоподобная, но чужая тренировка.
+  if (!planIsDated()) {
+    el.innerHTML = hero(when, 'У плана нет дат',
+      'Заполните «Старт плана» в карточке гонки — здесь появится тренировка на сегодня.',
+      recordBtn + planBtn) + recentHtml;
+    return;
+  }
+
+  const cw = getCurrentWeek();
+  const start = weekStart(cw);
+  const offset = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) - start) / 86400000);
+  if (offset < 0 || offset > 6) {
+    const title = offset < 0
+      ? `План начнётся ${String(start.getDate()).padStart(2, '0')}.${String(start.getMonth() + 1).padStart(2, '0')}`
+      : 'План завершён';
+    el.innerHTML = hero(when, title, '', recordBtn + planBtn) + recentHtml;
+    return;
+  }
+
+  // Колонка плана — по дню недели, как на бэкенде: так сходятся и пн→вс, и вс→сб.
+  const field = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'][now.getDay()];
+  const week = (compliantWeeks() || [])[cw] || null;
+  const day = week ? (week.days || []).find(d => d.date === today) : null;
+  const ran = day && (day.status === 'done' || day.status === 'extra');
+  const heroHtml = hero(
+    `${when} · неделя ${cw + 1} из ${PLAN.length}`,
+    escapeHtml(PLAN[cw][field] || '') || 'Отдых',
+    ran ? `✓ Сделано: ${km1(day.actual_km)} км` : '',
+    recordBtn + `<button class="btn-sm" onclick="showTab('aicoach')">Спросить ИИ</button>`);
+
+  let stripHtml = '';
+  if (week) {
+    const label = Object.fromEntries(PLAN_DAYS);
+    const dots = week.days.slice().sort((a, b) => a.date.localeCompare(b.date)).map(d => {
+      const did = d.status === 'done' || d.status === 'extra';
+      const state = did ? 'done'
+        : (d.status === 'missed' && d.date < today) ? 'missed'
+        : (d.status === 'empty' ? 'rest' : '');
+      return `<div class="ws-day ${state}${d.date === today ? ' today' : ''}">
+          <span class="ws-dot">${did ? '✓' : state === 'missed' ? '—' : ''}</span>${label[d.field]}
+        </div>`;
+    }).join('');
+    stripHtml = `<div class="card" onclick="showTab('plan')" style="cursor:pointer">
+        <div class="week-header">
+          <div class="card-title" style="margin:0">Неделя</div>
+          <div class="pw-km">${km1(week.actual_km)} / ${plannedKmLabel(week) || '—'} км</div>
+        </div>
+        <div class="week-strip">${dots}</div>
+      </div>`;
+  }
+  el.innerHTML = heroHtml + stripHtml + recentHtml;
 }
 
 function togglePlanEdit() {
@@ -2291,17 +2470,17 @@ function showTab(name){
 // Вкладка → пункт нижней панели: на телефоне разделы сведены к четырём пунктам.
 // Десктопу группа не нужна — у него своё меню со всеми вкладками.
 const TAB_GROUP = {
-  plan: 'plan', add: 'add',
+  today: 'today', plan: 'plan', add: 'add',
   log: 'progress', stats: 'progress',
   more: 'more', aicoach: 'more', races: 'more', profile: 'more', coach: 'more', users: 'more',
 };
-const MOBILE_ONLY_TABS = ['more'];   // у десктопа в меню таких пунктов нет
+const MOBILE_ONLY_TABS = ['today', 'more'];   // у десктопа в меню таких пунктов нет
 const MOBILE_MQ = window.matchMedia('(max-width: 600px)');
 function isMobile() { return MOBILE_MQ.matches; }
 let progressTab = 'log';             // что открыть по «Прогресс»: журнал или аналитику
 
 function openProgress() { showTab(progressTab); }
-function homeTab() { return 'plan'; }
+function homeTab() { return isMobile() ? 'today' : 'plan'; }
 
 // Окно расширили (поворот, десктоп) — с вкладки без пункта в меню не выбраться.
 MOBILE_MQ.addEventListener('change', () => {

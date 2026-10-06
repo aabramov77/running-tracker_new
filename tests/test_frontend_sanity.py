@@ -374,3 +374,43 @@ def test_gated_menu_items_are_handled_by_apply_role():
     for gate in gates:
         assert f"gate('{gate}'" in body, gate
         assert html.count(f'data-gate="{gate}"') == 2, "пункт должен быть и в меню, и в «Ещё»"
+
+
+def test_plan_week_list_sits_right_before_the_table():
+    """Таблицу на телефоне прячет соседний селектор «.plan-week:not(:empty) +
+    .plan-table-wrap». Элемент между ними вернул бы таблицу под список."""
+    html = INDEX.read_text(encoding="utf-8")
+    assert re.search(r'<div id="plan-week" class="plan-week"></div>\s*<div class="plan-table-wrap"', html)
+    assert ".plan-week:not(:empty) + .plan-table-wrap" in STYLE.read_text(encoding="utf-8")
+    assert 'id="tab-today"' in html and 'id="today-body"' in html
+
+
+def test_render_plan_refreshes_every_view_of_the_plan():
+    """Таблица, неделя списком и «Сегодня» показывают один и тот же план —
+    обновление по отдельности оставило бы на экране два разных."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "function renderPlan() {", "\n}\n")
+    for view in ("renderPlanTable()", "renderPlanWeek()", "renderToday()"):
+        assert view in body, view
+
+
+def test_mobile_plan_views_call_existing_handlers():
+    """Кнопки недели и экрана «Сегодня» рисует app.js — проверка
+    inline-обработчиков из index.html их не видит."""
+    js = APP_JS.read_text(encoding="utf-8")
+    section = _js_section(js, "// ── План неделей (#48)", "function togglePlanEdit(")
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    called = set()
+    for handler in re.findall(r'onclick="([^"]*)"', section):
+        handler = re.sub(r"\$\{[^}]*\}", "", handler)
+        called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
+    assert {"planWeekStep", "planWeekToday", "openAddSheet", "showTab"} <= called
+    assert not (called - defined), sorted(called - defined)
+
+
+def test_today_screen_does_not_guess_for_an_undated_plan():
+    """У плана без дат недели отсчитываются от даты по умолчанию. Перевести
+    такую неделю на «сегодня» значит показать чужую тренировку как свою."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "function renderToday() {", "\n}\n")
+    assert body.index("planIsDated()") < body.index("getCurrentWeek()")

@@ -516,7 +516,7 @@ table.pb-table td:last-child { text-align: right; }
 
 /* ── Мобильная раскладка (#48) ── */
 /* На широком экране этих элементов нет: там работает обычное меню вкладок. */
-.tabbar, .segmented, .back-row { display: none; }
+.tabbar, .segmented, .back-row, .plan-week { display: none; }
 
 /* Список-меню: вкладка «Ещё» и лист «+» */
 .more-list { padding-top: 4px; padding-bottom: 4px; }
@@ -617,6 +617,65 @@ table.pb-table td:last-child { text-align: right; }
     border: none; background: none; cursor: pointer;
     color: var(--c-accent); font-family: inherit; font-size: 15px;
   }
+
+  /* Плитки метрик на «Сегодня» уходят в конец экрана: первой идёт тренировка */
+  .app { display: flex; flex-direction: column; }
+  .app > .tab { min-width: 0; }
+  .metrics { order: 1; margin-bottom: 12px; }
+
+  /* Экран «Сегодня» */
+  .today-hero { background: var(--c-accent-light); color: var(--c-accent-dark); border-color: transparent; }
+  .today-when { font-size: 12px; }
+  .today-title { margin: 4px 0; font-size: 20px; font-weight: 500; line-height: 1.3; overflow-wrap: anywhere; }
+  .today-sub { font-size: 13px; }
+  .today-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .today-actions .btn-sm { min-height: 44px; padding: 5px 14px; background: var(--bg-card); font-size: 13px; }
+  .week-strip { display: flex; justify-content: space-between; }
+  .ws-day {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    font-size: 11px; color: var(--text-muted);
+  }
+  .ws-dot {
+    display: flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 1px solid var(--border); font-size: 13px;
+  }
+  .ws-day.rest .ws-dot { border-style: dashed; }
+  .ws-day.missed .ws-dot { background: var(--bg-metric); }
+  .ws-day.done .ws-dot { background: var(--c-accent); border-color: var(--c-accent); color: #fff; }
+  .ws-day.today { color: var(--c-accent); font-weight: 500; }
+  .ws-day.today .ws-dot { border: 2px solid var(--c-accent); }
+
+  /* План неделей. Таблица остаётся запасным видом: конструктор и пустой план
+     рисуются в ней, поэтому она скрыта только пока список не пуст. */
+  .desktop-only { display: none !important; }
+  .plan-week:not(:empty) { display: block; }
+  .plan-week:not(:empty) + .plan-table-wrap { display: none; }
+  .pw-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .pw-head .btn-sm { min-width: 44px; min-height: 44px; font-size: 20px; }
+  .pw-head .btn-sm:disabled { opacity: .3; }
+  .pw-title { text-align: center; font-size: 16px; font-weight: 500; }
+  .pw-title span, .pw-dates { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+  .pw-dates { font-family: 'DM Mono', monospace; }
+  .pw-meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .pw-accent { color: var(--text-muted); }
+  .pw-km { font-family: 'DM Mono', monospace; font-size: 12px; white-space: nowrap; }
+  .pw-day {
+    display: flex; align-items: flex-start; gap: 10px;
+    margin: 0 -8px; padding: 10px 8px;
+    border-bottom: 0.5px solid var(--border); font-size: 14px;
+  }
+  .pw-day:last-child { border-bottom: none; }
+  .pw-day.today {
+    background: var(--c-accent-light); color: var(--c-accent-dark);
+    border-radius: 8px; border-bottom-color: transparent;
+  }
+  .pw-dow { flex: 0 0 40px; font-weight: 500; }
+  .pw-dow span { display: block; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 400; opacity: .7; }
+  .pw-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .pw-rest { opacity: .5; }
+  .pw-fact { flex-shrink: 0; text-align: right; font-family: 'DM Mono', monospace; }
+  .pw-today { width: 100%; margin-top: 10px; }
 
   /* На телефоне сначала форма пробежки, калькулятор — под ней */
   #tab-add.active { display: flex; flex-direction: column; }

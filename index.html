@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=25">
+<link rel="stylesheet" href="style.css?v=26">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -93,6 +93,11 @@
   </div>
   <button class="back-row" id="more-back" onclick="showTab('more')">‹ Ещё</button>
 
+  <!-- СЕГОДНЯ (#48): главный экран на телефоне -->
+  <div id="tab-today" class="tab">
+    <div id="today-body"></div>
+  </div>
+
   <!-- ПЛАН -->
   <div id="tab-plan" class="tab active">
     <div class="card">
@@ -103,15 +108,15 @@
           <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
+          <label class="btn-sm desktop-only" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
             ⤒ Загрузить
             <input type="file" id="plan-import-file" accept=".csv,.json"
                    onchange="importPlanFile(this.files[0])" style="display:none">
           </label>
-          <button class="btn-sm" onclick="exportPlanCSV()" title="Скачать текущий план в CSV">⤓ CSV</button>
-          <button class="btn-sm" onclick="exportPlanJSON()" title="Скачать текущий план в JSON">⤓ JSON</button>
-          <button class="btn-sm" onclick="downloadPlanTemplate()" title="Скачать пример формата">Шаблон</button>
-          <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
+          <button class="btn-sm desktop-only" onclick="exportPlanCSV()" title="Скачать текущий план в CSV">⤓ CSV</button>
+          <button class="btn-sm desktop-only" onclick="exportPlanJSON()" title="Скачать текущий план в JSON">⤓ JSON</button>
+          <button class="btn-sm desktop-only" onclick="downloadPlanTemplate()" title="Скачать пример формата">Шаблон</button>
+          <button class="btn-sm desktop-only" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
         </div>
       </div>
       <div id="plan-import-bar" class="plan-import-bar" style="display:none">
@@ -159,7 +164,8 @@
         <span id="plan-save-msg" class="save-msg"></span>
       </div>
       <div id="plan-compliance-note" class="hint" style="display:none;margin:0 0 8px"></div>
-      <div style="overflow-x:auto">
+      <div id="plan-week" class="plan-week"></div>
+      <div class="plan-table-wrap" style="overflow-x:auto">
         <table class="plan">
           <thead><tr><th>Нед</th><th>Даты</th><th>Акцент</th><th title="План и факт за неделю, км">км</th><th>Пн</th><th>Вт</th><th>Ср</th><th>Чт</th><th>Пт</th><th>Сб</th><th>Вс</th></tr></thead>
           <tbody id="plan-body"></tbody>
@@ -723,6 +729,9 @@
 
 <!-- Нижняя панель (#48): видна только на узком экране -->
 <nav class="tabbar" id="tabbar">
+  <button class="tabbar-btn" data-group="today" onclick="showTab('today')">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-4v-6h-6v6H5a1 1 0 0 1-1-1z"/></svg>Сегодня
+  </button>
   <button class="tabbar-btn" data-group="plan" onclick="showTab('plan')">
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>План
   </button>
@@ -737,6 +746,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=37"></script>
+<script src="app.js?v=38"></script>
 </body>
 </html>
