@@ -8,6 +8,7 @@ if (!IS_PROD) {
   // DEV-бейдж в углу, чтобы случайно не путать с prod
   const badge = document.createElement('span');
   badge.textContent = 'DEV';
+  badge.className = 'dev-badge';
   badge.style.cssText = 'position:fixed;top:8px;left:8px;background:var(--c-warn);color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;z-index:300;font-family:DM Mono,monospace';
   document.addEventListener('DOMContentLoaded', () => document.body.appendChild(badge));
 }
@@ -52,9 +53,13 @@ function showAccessScreen(id) {
 
 function applyRole(role) {
   const isAdmin = role === 'admin';
-  document.getElementById('nav-users-btn').style.display = isAdmin ? '' : 'none';
+  // Пункт есть и в меню десктопа, и в «Ещё» на телефоне (#48) — оба по data-gate
+  const gate = (name, on) => document.querySelectorAll(`[data-gate="${name}"]`)
+    .forEach(el => { el.style.display = on ? '' : 'none'; });
+  gate('admin', isAdmin);
   // #44: вкладка «Тренер» нужна и тренеру, и спортсмену, у которого тренер есть
-  document.getElementById('nav-coach-btn').style.display = (currentIsCoach || myCoach) ? '' : 'none';
+  gate('coach', currentIsCoach || myCoach);
+  document.getElementById('more-user').textContent = currentUser.name || currentUser.email || '';
   document.getElementById('llm-settings-card').style.display = isAdmin ? '' : 'none';
   document.getElementById('llm-settings-note').style.display = isAdmin ? 'none' : '';
 }
@@ -2240,7 +2245,7 @@ async function aiApplyProposal(messageId) {
 // Вход из журнала и карточки пробежки: новый разбор, посвящённый ей.
 function aiReviewRun(id) {
   closeRunDetail();
-  showTab('aicoach', document.getElementById('nav-aicoach-btn'));
+  showTab('aicoach');
   aiNewThread();
   aiSend({ text: AI_REVIEW_TEXT, threadRunId: id });
 }
@@ -2261,11 +2266,18 @@ async function aiArchiveThread(id) {
   aiLoadThreads();
 }
 
-function showTab(name,btn){
+// Кнопку не передаём: активные пункты ищутся по имени вкладки, потому что у
+// неё их несколько — меню десктопа, нижняя панель и подменю телефона (#48).
+function showTab(name){
+  const group = TAB_GROUP[name];
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
-  btn.classList.add('active');
+  document.querySelectorAll('.nav-btn, .seg-btn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  document.querySelectorAll('.tabbar-btn').forEach(b=>b.classList.toggle('active', b.dataset.group===group));
+  document.body.dataset.tab = name;       // по ним CSS решает, что показать на телефоне
+  document.body.dataset.group = group;
+  if(group==='progress')progressTab = name;
+  if(isMobile())window.scrollTo(0, 0);
   if(name==='stats')renderCharts();
   if(name==='aicoach')openAiCoachTab();   // #46
   if(name==='races')renderRaces();
@@ -2273,6 +2285,45 @@ function showTab(name,btn){
   if(name==='users')loadUsers();
   // #44: открытого спортсмена перерисовываем (график в скрытой вкладке не имел размера)
   if(name==='coach')openCoachTab();
+}
+
+// ── Мобильная раскладка (#48) ──
+// Вкладка → пункт нижней панели: на телефоне разделы сведены к четырём пунктам.
+// Десктопу группа не нужна — у него своё меню со всеми вкладками.
+const TAB_GROUP = {
+  plan: 'plan', add: 'add',
+  log: 'progress', stats: 'progress',
+  more: 'more', aicoach: 'more', races: 'more', profile: 'more', coach: 'more', users: 'more',
+};
+const MOBILE_ONLY_TABS = ['more'];   // у десктопа в меню таких пунктов нет
+const MOBILE_MQ = window.matchMedia('(max-width: 600px)');
+function isMobile() { return MOBILE_MQ.matches; }
+let progressTab = 'log';             // что открыть по «Прогресс»: журнал или аналитику
+
+function openProgress() { showTab(progressTab); }
+function homeTab() { return 'plan'; }
+
+// Окно расширили (поворот, десктоп) — с вкладки без пункта в меню не выбраться.
+MOBILE_MQ.addEventListener('change', () => {
+  if (!isMobile() && MOBILE_ONLY_TABS.includes(document.body.dataset.tab)) showTab('plan');
+});
+
+function openAddSheet() {
+  document.getElementById('add-sheet').classList.add('active');
+}
+function closeAddSheet(event) {
+  if (event && event.target !== document.getElementById('add-sheet')) return;
+  document.getElementById('add-sheet').classList.remove('active');
+}
+// Пункт листа «+». Выбор файла открываем прямо из обработчика клика: вне
+// жеста пользователя браузер окно выбора не покажет.
+function addSheetGo(kind) {
+  closeAddSheet();
+  if (kind === 'race') { showTab('races'); return; }
+  showTab('add');
+  if (kind === 'fit') document.getElementById('garmin-fit-file').click();
+  if (kind === 'csv') document.getElementById('garmin-file').click();
+  if (kind === 'calc') document.getElementById('calc-card').scrollIntoView();
 }
 
 // ── Admin: управление пользователями ──
@@ -2787,8 +2838,13 @@ function coachTabVisible() {
 // Число непрочитанных на кнопке «Тренер»: у спортсмена — от тренера,
 // у тренера — сумма по спортсменам.
 async function refreshCoachBadge() {
-  const badge = document.getElementById('nav-coach-badge');
-  if (!idToken || (!myCoach && !currentIsCoach)) { badge.style.display = 'none'; return; }
+  // Счётчик стоит в трёх местах: меню десктопа, «Ещё» и строка «Тренер» (#48)
+  const badges = document.querySelectorAll('.coach-unread');
+  const show = n => badges.forEach(b => {
+    b.textContent = n > 99 ? '99+' : n;
+    b.style.display = n ? '' : 'none';
+  });
+  if (!idToken || (!myCoach && !currentIsCoach)) { show(0); return; }
   let total = 0;
   try {
     if (myCoach) {
@@ -2800,8 +2856,7 @@ async function refreshCoachBadge() {
       if (res.ok) total += ((await res.json()).athletes || []).reduce((s, a) => s + (a.unread || 0), 0);
     }
   } catch (e) { return; }
-  badge.textContent = total > 99 ? '99+' : total;
-  badge.style.display = total ? '' : 'none';
+  show(total);
 }
 
 setInterval(() => {
@@ -2832,6 +2887,7 @@ async function userAction(action, sub) {
 function renderAll(){renderMetrics();renderLog();renderPlan();}
 
 function initApp() {
+  showTab(homeTab());
   const today = new Date().toISOString().slice(0, 10);
   document.getElementById('f-date').value = today;
   document.getElementById('r-date').value = today;

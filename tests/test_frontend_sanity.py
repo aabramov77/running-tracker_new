@@ -323,3 +323,54 @@ def test_coach_screen_keeps_out_of_own_data():
     assert "localStorage" not in section
     for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races"):
         assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"
+
+
+# ── Мобильная раскладка (#48) ─────────────────────────────────────────────────
+
+def _tab_groups(js):
+    literal = re.search(r"const TAB_GROUP = \{(.*?)\};", js, re.S)
+    assert literal, "TAB_GROUP не найден"
+    return dict(re.findall(r"(\w+):\s*'(\w+)'", literal.group(1)))
+
+
+def test_mobile_shell_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    for element in ('id="tabbar"', 'id="tab-more"', 'id="add-sheet"',
+                    'id="progress-switch"', 'id="more-back"'):
+        assert element in html, element
+    assert "viewport-fit=cover" in html, "без него env(safe-area-inset-*) равны нулю"
+
+
+def test_every_tab_belongs_to_a_tabbar_item():
+    """Вкладка без группы на телефоне не подсветит ни одного пункта панели и
+    не покажет возврат в «Ещё» — из неё останется выходить наугад."""
+    html = INDEX.read_text(encoding="utf-8")
+    groups = _tab_groups(APP_JS.read_text(encoding="utf-8"))
+    tabs = set(re.findall(r'id="tab-(\w+)"', html))
+    assert tabs == set(groups), f"расхождение: {sorted(tabs ^ set(groups))}"
+    buttons = set(re.findall(r'class="tabbar-btn[^"]*" data-group="(\w+)"', html))
+    assert set(groups.values()) == buttons, sorted(set(groups.values()) ^ buttons)
+
+
+def test_show_tab_targets_exist():
+    """showTab берёт вкладку по имени: опечатка падает на getElementById(...)
+    только при клике."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    tabs = set(re.findall(r'id="tab-(\w+)"', html))
+    called = set(re.findall(r"showTab\('(\w+)'", html + js))
+    assert called <= tabs, f"нет вкладок: {sorted(called - tabs)}"
+
+
+def test_gated_menu_items_are_handled_by_apply_role():
+    """Пункты «Тренер» и «Пользователи» продублированы в «Ещё». Видимость
+    обоих экземпляров ставит applyRole по data-gate — пункт с неизвестным
+    значением остался бы скрыт навсегда."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "function applyRole(", "\n}\n")
+    gates = set(re.findall(r'data-gate="(\w+)"', html))
+    assert gates == {"admin", "coach"}
+    for gate in gates:
+        assert f"gate('{gate}'" in body, gate
+        assert html.count(f'data-gate="{gate}"') == 2, "пункт должен быть и в меню, и в «Ещё»"
