@@ -229,22 +229,11 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .empty { text-align: center; padding: 2rem; color: var(--text-muted); font-size: 13px; }
 
 @media (max-width: 600px) {
-  /* Layout */
-  .app { padding: 0.875rem 0.75rem 4rem; }
+  /* Layout — шапка, меню и нижняя панель описаны в блоке «Мобильная раскладка» */
   .metrics { grid-template-columns: repeat(2, 1fr); }
   .form-grid { grid-template-columns: 1fr; }
   .form-group.full { grid-column: 1; }
   .card { padding: 0.875rem 0.875rem; }
-
-  /* Header */
-  .header { flex-direction: column; gap: 6px; }
-  .header h1 { font-size: 18px; }
-  .countdown { font-size: 18px; }
-
-  /* Nav — горизонтальный скролл без скроллбара */
-  .nav { overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
-  .nav::-webkit-scrollbar { display: none; }
-  .nav-btn { padding: 8px 12px; font-size: 12px; white-space: nowrap; flex-shrink: 0; min-height: 44px; }
 
   /* Метрики */
   .metric { padding: 10px 12px; }
@@ -523,4 +512,198 @@ table.pb-table td:last-child { text-align: right; }
   display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px;
   border-radius: 10px; background: var(--c-danger); color: #fff;
   font-size: 10px; font-weight: 500; line-height: 16px; text-align: center;
+}
+
+/* ── Мобильная раскладка (#48) ── */
+/* На широком экране этих элементов нет: там работает обычное меню вкладок. */
+.tabbar, .segmented, .back-row, .plan-week { display: none; }
+
+/* Список-меню: вкладка «Ещё» и лист «+» */
+.more-list { padding-top: 4px; padding-bottom: 4px; }
+.run-detail-card.more-list { padding: 16px 20px 8px; }
+.more-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  width: 100%; min-height: 48px; padding: 10px 0;
+  border: none; border-bottom: 0.5px solid var(--border);
+  background: none; color: var(--text); cursor: pointer;
+  font-family: inherit; font-size: 15px; text-align: left;
+}
+.more-row:last-child { border-bottom: none; }
+.more-chev { color: var(--text-muted); font-size: 18px; }
+.more-hint { color: var(--text-muted); font-size: 12px; }
+.more-user {
+  padding: 12px 0; font-size: 13px; color: var(--text-muted);
+  border-bottom: 0.5px solid var(--border);
+}
+.more-user:empty { display: none; }
+
+@media (max-width: 600px) {
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    min-height: 100dvh;
+    overscroll-behavior-y: contain;             /* без «резинки» всей страницы */
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Снизу — место под панель, сверху отступ даёт липкая шапка */
+  .app { padding: 0 0.75rem calc(72px + env(safe-area-inset-bottom)); }
+
+  /* Шапка — одна липкая строка: название слева, отсчёт справа */
+  .header {
+    position: sticky; top: 0; z-index: 40;
+    align-items: center; gap: 12px;
+    margin: 0 -0.75rem 0.75rem;
+    padding: calc(10px + env(safe-area-inset-top)) 0.75rem 8px;
+    background: var(--bg);
+    border-bottom: 0.5px solid var(--border);
+  }
+  .header > div:first-child { min-width: 0; }
+  .header h1 { font-size: 17px; }
+  .header h1, .subtitle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .subtitle { font-size: 11px; }
+  /* Имя пользователя и «Выйти» живут во вкладке «Ещё»; !important — их
+     видимостью управляет inline-стиль из app.js */
+  #header-subtitle, #signout-btn { display: none !important; }
+  .countdown-block { white-space: nowrap; }
+  .countdown { font-size: 17px; }
+  /* Бейдж стенда: вниз, чтобы не закрывал название, и под листы с панелью */
+  .dev-badge { top: auto !important; bottom: calc(68px + env(safe-area-inset-bottom)); z-index: 45 !important; }
+
+  /* Плитки метрик — только на главном экране, остальным нужна высота */
+  body:not([data-tab="today"]) .metrics { display: none; }
+
+  /* Меню вкладок заменяет нижняя панель */
+  .nav { display: none; }
+  .tabbar {
+    display: flex;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+    padding: 4px 4px env(safe-area-inset-bottom);
+    background: var(--bg-card);
+    border-top: 0.5px solid var(--border);
+  }
+  .tabbar-btn {
+    flex: 1; position: relative;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+    min-height: 52px;
+    border: none; background: none; cursor: pointer;
+    color: var(--text-muted); font-family: inherit; font-size: 11px;
+  }
+  .tabbar-btn svg {
+    width: 22px; height: 22px;
+    fill: none; stroke: currentColor; stroke-width: 1.7;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  .tabbar-btn.active { color: var(--c-accent); font-weight: 500; }
+  .tabbar-add { color: var(--c-accent); }
+  .tabbar-add svg { width: 34px; height: 34px; stroke-width: 1.4; }
+  .tabbar-badge { position: absolute; top: 4px; left: 50%; margin-left: 6px; }
+
+  /* «Прогресс» = журнал + аналитика под одним пунктом панели */
+  body[data-group="progress"] .segmented { display: flex; }
+  .segmented {
+    gap: 4px; padding: 3px; margin-bottom: 12px;
+    background: var(--bg-metric); border-radius: 10px;
+  }
+  .seg-btn {
+    flex: 1; min-height: 36px;
+    border: none; border-radius: 8px; background: none; cursor: pointer;
+    color: var(--text-muted); font-family: inherit; font-size: 13px;
+  }
+  .seg-btn.active { background: var(--bg-card); color: var(--text); font-weight: 500; }
+
+  /* Возврат из раздела, открытого через «Ещё» */
+  body[data-group="more"]:not([data-tab="more"]) .back-row { display: block; }
+  .back-row {
+    min-height: 40px; margin: -4px 0 6px; padding: 0 2px;
+    border: none; background: none; cursor: pointer;
+    color: var(--c-accent); font-family: inherit; font-size: 15px;
+  }
+
+  /* Плитки метрик на «Сегодня» уходят в конец экрана: первой идёт тренировка */
+  .app { display: flex; flex-direction: column; }
+  .app > .tab { min-width: 0; }
+  .metrics { order: 1; margin-bottom: 12px; }
+
+  /* Экран «Сегодня» */
+  .today-hero { background: var(--c-accent-light); color: var(--c-accent-dark); border-color: transparent; }
+  .today-when { font-size: 12px; }
+  .today-title { margin: 4px 0; font-size: 20px; font-weight: 500; line-height: 1.3; overflow-wrap: anywhere; }
+  .today-sub { font-size: 13px; }
+  .today-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .today-actions .btn-sm { min-height: 44px; padding: 5px 14px; background: var(--bg-card); font-size: 13px; }
+  .week-strip { display: flex; justify-content: space-between; }
+  .ws-day {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    font-size: 11px; color: var(--text-muted);
+  }
+  .ws-dot {
+    display: flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 1px solid var(--border); font-size: 13px;
+  }
+  .ws-day.rest .ws-dot { border-style: dashed; }
+  .ws-day.missed .ws-dot { background: var(--bg-metric); }
+  .ws-day.done .ws-dot { background: var(--c-accent); border-color: var(--c-accent); color: #fff; }
+  .ws-day.today { color: var(--c-accent); font-weight: 500; }
+  .ws-day.today .ws-dot { border: 2px solid var(--c-accent); }
+
+  /* План неделей. Таблица остаётся запасным видом: конструктор и пустой план
+     рисуются в ней, поэтому она скрыта только пока список не пуст. */
+  .desktop-only { display: none !important; }
+  .plan-week:not(:empty) { display: block; }
+  .plan-week:not(:empty) + .plan-table-wrap { display: none; }
+  .pw-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .pw-head .btn-sm { min-width: 44px; min-height: 44px; font-size: 20px; }
+  .pw-head .btn-sm:disabled { opacity: .3; }
+  .pw-title { text-align: center; font-size: 16px; font-weight: 500; }
+  .pw-title span, .pw-dates { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+  .pw-dates { font-family: 'DM Mono', monospace; }
+  .pw-meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .pw-accent { color: var(--text-muted); }
+  .pw-km { font-family: 'DM Mono', monospace; font-size: 12px; white-space: nowrap; }
+  .pw-day {
+    display: flex; align-items: flex-start; gap: 10px;
+    margin: 0 -8px; padding: 10px 8px;
+    border-bottom: 0.5px solid var(--border); font-size: 14px;
+  }
+  .pw-day { cursor: pointer; }
+  .pw-day:last-child { border-bottom: none; }
+  .pw-day.today {
+    background: var(--c-accent-light); color: var(--c-accent-dark);
+    border-radius: 8px; border-bottom-color: transparent;
+  }
+  .pw-dow { flex: 0 0 40px; font-weight: 500; }
+  .pw-dow span { display: block; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 400; opacity: .7; }
+  .pw-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .pw-rest { opacity: .5; }
+  .pw-fact { flex-shrink: 0; text-align: right; font-family: 'DM Mono', monospace; }
+  .pw-today { width: 100%; margin-top: 10px; }
+
+  /* Листы (карточка пробежки, «+», правка дня) — во всю ширину от нижнего края */
+  .run-detail-overlay { padding: 0; }
+  .run-detail-card {
+    max-width: none; max-height: 92dvh;
+    border-radius: 16px 16px 0 0;
+    padding-bottom: calc(20px + env(safe-area-inset-bottom));
+  }
+  .run-detail-card.more-list { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+  .run-detail-card::before {            /* «ручка» листа */
+    content: ''; display: block;
+    width: 36px; height: 4px; margin: -8px auto 12px;
+    border-radius: 2px; background: var(--text-muted); opacity: .35;
+  }
+
+  /* Чаты: поле ввода держится над нижней панелью, лента занимает экран */
+  .chat-form {
+    position: sticky; bottom: calc(56px + env(safe-area-inset-bottom)); z-index: 1;
+    padding: 8px 0; background: var(--bg-card);
+  }
+  .ai-log { max-height: 52dvh; }
+  #ai-threads { max-height: 124px; }
+
+  /* Главная кнопка формы тянется на свободную ширину строки */
+  .form-grid + div > .btn-primary { flex: 1 1 auto; }
+
+  /* На телефоне сначала форма пробежки, калькулятор — под ней */
+  #tab-add.active { display: flex; flex-direction: column; }
+  #calc-card { order: 2; }
 }

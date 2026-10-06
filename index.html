@@ -2,10 +2,12 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#f8f7f4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=24">
+<link rel="stylesheet" href="style.css?v=27">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -73,16 +75,28 @@
   </div>
 
   <nav class="nav">
-    <button class="nav-btn active" onclick="showTab('plan',this)">План</button>
-    <button class="nav-btn" onclick="showTab('add',this)">+ Пробежка</button>
-    <button class="nav-btn" onclick="showTab('log',this)">Журнал</button>
-    <button class="nav-btn" onclick="showTab('stats',this)">Аналитика</button>
-    <button class="nav-btn" id="nav-aicoach-btn" onclick="showTab('aicoach',this)">🤖 ИИ-тренер</button>
-    <button class="nav-btn" onclick="showTab('races',this)">🏅 Старты</button>
-    <button class="nav-btn" onclick="showTab('profile',this)">👤 Профиль</button>
-    <button class="nav-btn" id="nav-coach-btn" onclick="showTab('coach',this)" style="display:none">⏱ Тренер<span id="nav-coach-badge" class="nav-badge" style="display:none"></span></button>
-    <button class="nav-btn" id="nav-users-btn" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
+    <button class="nav-btn active" data-tab="plan" onclick="showTab('plan',this)">План</button>
+    <button class="nav-btn" data-tab="add" onclick="showTab('add',this)">+ Пробежка</button>
+    <button class="nav-btn" data-tab="log" onclick="showTab('log',this)">Журнал</button>
+    <button class="nav-btn" data-tab="stats" onclick="showTab('stats',this)">Аналитика</button>
+    <button class="nav-btn" id="nav-aicoach-btn" data-tab="aicoach" onclick="showTab('aicoach',this)">🤖 ИИ-тренер</button>
+    <button class="nav-btn" data-tab="races" onclick="showTab('races',this)">🏅 Старты</button>
+    <button class="nav-btn" data-tab="profile" onclick="showTab('profile',this)">👤 Профиль</button>
+    <button class="nav-btn" id="nav-coach-btn" data-tab="coach" data-gate="coach" onclick="showTab('coach',this)" style="display:none">⏱ Тренер<span id="nav-coach-badge" class="nav-badge coach-unread" style="display:none"></span></button>
+    <button class="nav-btn" id="nav-users-btn" data-tab="users" data-gate="admin" onclick="showTab('users',this)" style="display:none">👥 Пользователи</button>
   </nav>
+
+  <!-- Мобильная раскладка (#48): подменю «Прогресс» и возврат из разделов «Ещё» -->
+  <div class="segmented" id="progress-switch">
+    <button class="seg-btn" data-tab="log" onclick="showTab('log')">Журнал</button>
+    <button class="seg-btn" data-tab="stats" onclick="showTab('stats')">Аналитика</button>
+  </div>
+  <button class="back-row" id="more-back" onclick="showTab('more')">‹ Ещё</button>
+
+  <!-- СЕГОДНЯ (#48): главный экран на телефоне -->
+  <div id="tab-today" class="tab">
+    <div id="today-body"></div>
+  </div>
 
   <!-- ПЛАН -->
   <div id="tab-plan" class="tab active">
@@ -94,15 +108,15 @@
           <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
+          <label class="btn-sm desktop-only" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
             ⤒ Загрузить
             <input type="file" id="plan-import-file" accept=".csv,.json"
                    onchange="importPlanFile(this.files[0])" style="display:none">
           </label>
-          <button class="btn-sm" onclick="exportPlanCSV()" title="Скачать текущий план в CSV">⤓ CSV</button>
-          <button class="btn-sm" onclick="exportPlanJSON()" title="Скачать текущий план в JSON">⤓ JSON</button>
-          <button class="btn-sm" onclick="downloadPlanTemplate()" title="Скачать пример формата">Шаблон</button>
-          <button class="btn-sm" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
+          <button class="btn-sm desktop-only" onclick="exportPlanCSV()" title="Скачать текущий план в CSV">⤓ CSV</button>
+          <button class="btn-sm desktop-only" onclick="exportPlanJSON()" title="Скачать текущий план в JSON">⤓ JSON</button>
+          <button class="btn-sm desktop-only" onclick="downloadPlanTemplate()" title="Скачать пример формата">Шаблон</button>
+          <button class="btn-sm desktop-only" id="plan-edit-btn" onclick="togglePlanEdit()">✏ Редактировать</button>
         </div>
       </div>
       <div id="plan-import-bar" class="plan-import-bar" style="display:none">
@@ -150,7 +164,8 @@
         <span id="plan-save-msg" class="save-msg"></span>
       </div>
       <div id="plan-compliance-note" class="hint" style="display:none;margin:0 0 8px"></div>
-      <div style="overflow-x:auto">
+      <div id="plan-week" class="plan-week"></div>
+      <div class="plan-table-wrap" style="overflow-x:auto">
         <table class="plan">
           <thead><tr><th>Нед</th><th>Даты</th><th>Акцент</th><th title="План и факт за неделю, км">км</th><th>Пн</th><th>Вт</th><th>Ср</th><th>Чт</th><th>Пт</th><th>Сб</th><th>Вс</th></tr></thead>
           <tbody id="plan-body"></tbody>
@@ -163,7 +178,7 @@
   <div id="tab-add" class="tab">
 
     <!-- КАЛЬКУЛЯТОР -->
-    <div class="card" style="margin-bottom:12px">
+    <div class="card" id="calc-card" style="margin-bottom:12px">
       <div class="card-title">Калькулятор</div>
       <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
         <button class="calc-tab-btn active" onclick="switchCalc('pace',this)">⚡ Темп → по дист. + времени</button>
@@ -204,7 +219,7 @@
     </div>
 
     <!-- ФОРМА ЗАПИСИ -->
-    <div class="card">
+    <div class="card" id="run-form-card">
       <div class="card-title">Записать пробежку</div>
       <!-- Импорт из Garmin -->
       <div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -651,6 +666,21 @@
     </div>
   </div>
 
+  <!-- ЕЩЁ (#48): разделы, которым не хватило места в нижней панели -->
+  <div id="tab-more" class="tab">
+    <div class="card more-list">
+      <button class="more-row" onclick="showTab('aicoach')"><span>🤖 ИИ-тренер</span><span class="more-chev">›</span></button>
+      <button class="more-row" onclick="showTab('races')"><span>🏅 Старты</span><span class="more-chev">›</span></button>
+      <button class="more-row" onclick="showTab('profile')"><span>👤 Профиль</span><span class="more-chev">›</span></button>
+      <button class="more-row" data-gate="coach" onclick="showTab('coach')" style="display:none"><span>⏱ Тренер<span class="nav-badge coach-unread" style="display:none"></span></span><span class="more-chev">›</span></button>
+      <button class="more-row" data-gate="admin" onclick="showTab('users')" style="display:none"><span>👥 Пользователи</span><span class="more-chev">›</span></button>
+    </div>
+    <div class="card more-list">
+      <div class="more-user" id="more-user"></div>
+      <button class="more-row" onclick="signOut()" style="color:var(--c-danger)">Выйти</button>
+    </div>
+  </div>
+
   <!-- Контекст для ИИ (#32) -->
   <div id="llm-preview-overlay" class="run-detail-overlay" onclick="closeLlmPreview(event)">
     <div class="run-detail-card">
@@ -683,8 +713,59 @@
     </div>
   </div>
 
+  <!-- Правка одного дня плана (#48) -->
+  <div id="day-sheet" class="run-detail-overlay" onclick="closeDaySheet(event)">
+    <div class="run-detail-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="card-title" id="day-sheet-title" style="margin:0"></div>
+        <button class="btn-sm" onclick="closeDaySheet()" style="color:var(--text-muted);font-size:16px">✕</button>
+      </div>
+      <div class="form-group">
+        <label for="day-sheet-text">Тренировка по плану</label>
+        <textarea id="day-sheet-text" rows="3" placeholder="Например: 8 км легко. Пусто — отдых"></textarea>
+      </div>
+      <p class="hint" style="margin:8px 0 0">Сохранение создаёт новую версию плана, прежняя остаётся в истории.</p>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn-primary" id="day-sheet-save" onclick="saveDayEdit()">Сохранить</button>
+        <button class="btn-sm" onclick="closeDaySheet()">Отмена</button>
+        <span id="day-sheet-msg" class="save-msg"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Лист «+» (#48) -->
+  <div id="add-sheet" class="run-detail-overlay" onclick="closeAddSheet(event)">
+    <div class="run-detail-card more-list">
+      <div class="card-title">Новая запись</div>
+      <button class="more-row" onclick="addSheetGo('fit')"><span>🏃 Загрузить .fit</span><span class="more-hint">с кругами и пульсом</span></button>
+      <button class="more-row" onclick="addSheetGo('csv')"><span>📁 Загрузить .csv</span><span class="more-hint">только сводка</span></button>
+      <button class="more-row" onclick="addSheetGo('manual')"><span>✏ Ввести вручную</span></button>
+      <button class="more-row" onclick="addSheetGo('calc')"><span>⚡ Калькулятор темпа</span></button>
+      <button class="more-row" onclick="addSheetGo('race')"><span>🏅 Результат забега</span></button>
+    </div>
+  </div>
+
 </div>
+
+<!-- Нижняя панель (#48): видна только на узком экране -->
+<nav class="tabbar" id="tabbar">
+  <button class="tabbar-btn" data-group="today" onclick="showTab('today')">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-4v-6h-6v6H5a1 1 0 0 1-1-1z"/></svg>Сегодня
+  </button>
+  <button class="tabbar-btn" data-group="plan" onclick="showTab('plan')">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>План
+  </button>
+  <button class="tabbar-btn tabbar-add" data-group="add" onclick="openAddSheet()" aria-label="Новая запись">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+  </button>
+  <button class="tabbar-btn" data-group="progress" onclick="openProgress()">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7"/></svg>Прогресс
+  </button>
+  <button class="tabbar-btn" data-group="more" onclick="showTab('more')">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>Ещё<span class="nav-badge coach-unread tabbar-badge" style="display:none"></span>
+  </button>
+</nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=36"></script>
+<script src="app.js?v=39"></script>
 </body>
 </html>
