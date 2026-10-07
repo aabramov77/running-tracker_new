@@ -10,6 +10,7 @@ on:
       - '**.py'
       - '!tests/**'          # правки тестов деплой не меняют
       - 'requirements.txt'
+      - '.gitignore'         # по нему gcloud решает, что уходит в образ
       - '.github/workflows/deploy-cloudrun.yml'
   workflow_dispatch:  # ручной запуск из UI на случай если нужно передеплоить без изменений
 
