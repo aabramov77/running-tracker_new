@@ -14,6 +14,10 @@ if (!IS_PROD) {
 }
 
 let PLAN = null;
+// Версия недель в PLAN: { plan_id, version }. Уходит на сервер вместе с правкой,
+// и тот отклоняет запись, если план с тех пор изменился (#51). null — версия
+// неизвестна (бэкенд до #51): запись идёт без сверки.
+let PLAN_BASE = null;
 let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
 let currentRole = null;
@@ -222,6 +226,14 @@ function planIsDated() {
 function activePlanId() { return ACTIVE_PLAN ? ACTIVE_PLAN.id : null; }
 // Кэш недель — свой у каждого плана, иначе планы затирали бы друг друга
 function planCacheKey() { return ck('running_tracker_plan') + '__' + (activePlanId() || 'none'); }
+/** Недели с сервера и их версия — в память и в кэш, всегда вместе: иначе
+ *  недели из кэша ушли бы на запись без сверки или с чужой версией. */
+function rememberPlan(weeks, base) {
+  PLAN = weeks;
+  PLAN_BASE = base;
+  localStorage.setItem(planCacheKey(), JSON.stringify(weeks));
+  localStorage.setItem(planCacheKey() + '__base', JSON.stringify(base));
+}
 function livePlans() { return PLANS.filter(p => !p.archived); }
 function planLabel(p) {
   return p.race_name || (p.race_date ? `Забег ${p.race_date}` : 'Без названия');
@@ -463,23 +475,24 @@ function setStatus(msg, type = 'ok') {
   el.style.color = type === 'ok' ? 'var(--c-accent)' : type === 'warn' ? 'var(--c-warn)' : 'var(--c-danger)';
 }
 
-/** Недели активного плана с сервера, мимо кэша. */
-async function fetchPlanWeeks() {
-  const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
-  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
 async function loadPlan() {
   const cached = localStorage.getItem(planCacheKey());
-  if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
+  if (cached) {
+    PLAN = JSON.parse(cached);
+    PLAN_BASE = JSON.parse(localStorage.getItem(planCacheKey() + '__base') || 'null');
+    renderPlan();
+  }
   try {
-    const weeks = await fetchPlanWeeks();
+    const res = await fetch(API_URL + 'plan?meta=1', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // Бэкенд до #51 параметра не знает и отдаёт голый массив недель — без версии.
+    const bare = Array.isArray(data);
+    const weeks = bare ? data : (data || {}).weeks;
     if (Array.isArray(weeks)) {
       // [] — новый пользователь без плана (покажем пустое состояние + «Создать план»)
-      PLAN = weeks;
-      localStorage.setItem(planCacheKey(), JSON.stringify(PLAN));
+      rememberPlan(weeks, bare ? null : { plan_id: data.plan_id, version: data.version });
       renderPlan();
       applyProfileToHeader();  // «план N недель» зависит от длины плана
       loadCompliance();        // план/факт — отдельным запросом, не блокирует таблицу
@@ -1028,27 +1041,26 @@ async function saveDayEdit() {
   if (text === edit.was.trim()) { closeDaySheet(); return; }
   const btn = document.getElementById('day-sheet-save');
   btn.disabled = true; btn.textContent = 'Сохранение…';
+  const planId = activePlanId();
   try {
-    // Сервер версию плана при записи не сверяет. Поэтому пишем поверх только
-    // что прочитанных недель, а не локальной копии: правка с другого
-    // устройства или от ИИ-тренера в остальных днях сохранится.
-    const fresh = await fetchPlanWeeks();
-    if (dayEdit !== edit) return;                        // лист закрыли, пока шёл запрос
-    const cell = Array.isArray(fresh) && fresh[edit.idx] ? (fresh[edit.idx][edit.field] || '') : null;
-    if (cell !== edit.was) {
-      // Сам день изменился с момента открытия — молча затирать нельзя.
-      await loadPlan();
-      if (cell === null) { closeDaySheet(); alert('План изменился: этой недели в нём больше нет.'); return; }
-      edit.was = cell;
-      dayNote(`План изменился: сейчас здесь «${cell || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
-      return;
-    }
-    const weeks = fresh.map((w, i) => i === edit.idx ? { ...w, [edit.field]: text } : w);
-    const week = fresh[edit.idx].w ?? edit.idx + 1;
+    // Пишем поверх локальных недель: их версию сервер сверит сам (#51), так что
+    // правка с другого устройства или от ИИ-тренера молча не затрётся.
+    const weeks = PLAN.map((w, i) => i === edit.idx ? { ...w, [edit.field]: text } : w);
+    const week = PLAN[edit.idx].w ?? edit.idx + 1;
     await postPlanWeeks(weeks, `Правка дня: неделя ${week}, ${Object.fromEntries(PLAN_DAYS)[edit.field]}`);
     closeDaySheet();
-    await loadPlan();         // новая версия плана и свежий план/факт
+    await loadPlan();         // свежий план/факт
   } catch (e) {
+    if (e.code === 'plan_stale') {
+      if (dayEdit !== edit) return;                      // лист закрыли, пока шёл запрос
+      // План уже перечитан. Тот же план и неделя на месте — показываем, что
+      // теперь стоит в этом дне; иначе править здесь больше нечего.
+      const row = activePlanId() === planId ? PLAN[edit.idx] : null;
+      if (!row) { closeDaySheet(); alert(e.message); return; }
+      edit.was = row[edit.field] || '';
+      dayNote(`План изменился: сейчас здесь «${edit.was || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
+      return;
+    }
     dayNote('Не удалось сохранить: ' + e.message, true);
   } finally {
     btn.disabled = false; btn.textContent = 'Сохранить';
@@ -1375,7 +1387,17 @@ async function saveImportedPlan() {
     finishImport();
     renderPlan();
     applyProfileToHeader();
-  } catch (e) { importFlash('⚠ Не удалось сохранить: ' + e.message); }
+  } catch (e) {
+    if (e.code === 'plan_stale') {
+      // План уже перечитан: предпросмотр файла закрываем, иначе «Отмена»
+      // вернула бы недели, которых на сервере больше нет.
+      finishImport();
+      renderPlan();
+      alert(e.message + ' Если план всё ещё нужно заменить, загрузите файл ещё раз.');
+      return;
+    }
+    importFlash('⚠ Не удалось сохранить: ' + e.message);
+  }
 }
 
 async function saveImportedAsNewPlan() {
@@ -1477,17 +1499,35 @@ function downloadPlanTemplate() {
   downloadFile('plan-template.csv', '﻿' + planToCSV(sample), 'text/csv');
 }
 
-/** Пишет недели в активный план (бэкенд создаёт новую версию). */
+const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства или правкой ИИ-тренера. ' +
+  'Загружена его свежая версия, ваша правка не сохранена.';
+
+/** Пишет недели в активный план (бэкенд создаёт новую версию).
+ *
+ *  Вместе с неделями уходит версия, поверх которой сделана правка. Если план
+ *  с тех пор изменился (другое устройство, правка ИИ-тренера), сервер отвечает
+ *  409: план перечитывается, а вызывающему уходит ошибка с code 'plan_stale'
+ *  и готовым текстом для пользователя. */
 async function postPlanWeeks(weeks, changeReason) {
+  const base = PLAN_BASE;
   const res = await fetch(API_URL + 'plan', {
     method: 'POST',
     headers: authHeaders({'Content-Type': 'application/json'}),
-    body: JSON.stringify({ weeks, change_reason: changeReason })
+    body: JSON.stringify({
+      weeks, change_reason: changeReason,
+      ...(base ? { base_plan_id: base.plan_id, base_version: base.version } : {}),
+    })
   });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (res.status === 409) {
+    await loadPlans();      // активным могли сделать и другой план
+    await loadPlan();
+    throw Object.assign(new Error(PLAN_STALE_TEXT), { code: 'plan_stale', status: 409 });
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  localStorage.setItem(planCacheKey(), JSON.stringify(weeks));
-  return res.json();
+  const saved = await res.json();
+  rememberPlan(weeks, base ? { ...base, version: saved.version } : null);
+  return saved;
 }
 
 async function savePlanEdits() {
@@ -1502,7 +1542,9 @@ async function savePlanEdits() {
     msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
   } catch(e) {
-    alert('Ошибка сохранения: ' + e.message);
+    // При plan_stale конструктор остаётся открытым уже со свежими неделями.
+    alert(e.code === 'plan_stale' ? e.message + ' Внесите её заново.'
+                                  : 'Ошибка сохранения: ' + e.message);
   } finally {
     btn.disabled = false; btn.textContent = 'Сохранить изменения';
   }

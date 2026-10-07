@@ -205,6 +205,140 @@ def test_dispatch_surfaces_handler_validation(api):
 def test_dispatch_plan_shortcut_without_plans(api):
     body, code, _ = api(FakeRequest("GET", "/plan"))
     assert code == 200 and body == "[]"
+    body, code, _ = api(FakeRequest("GET", "/plan", args={"meta": "1"}))
+    assert code == 200 and json.loads(body) == {"plan_id": None, "version": 0, "weeks": []}
+
+
+# ── Оптимистическая блокировка записи недель (#51) ────────────────────────────
+
+W1 = [{"w": 1, "type": "dev", "sun": "10 км"}]
+W2 = [{"w": 1, "type": "dev", "sun": "12 км"}]
+W3 = [{"w": 1, "type": "dev", "sun": "чужая правка"}]
+
+
+def _new_plan(api, patched_api, fake_bucket, weeks=W1, name="HM"):
+    """Активный план u1 с одной версией недель. Возвращает id плана."""
+    api(FakeRequest("GET", "/plans"))            # регистрирует u1
+    plan = patched_api.create_plan(fake_bucket, "u1", {"race_name": name})
+    if weeks is not None:
+        patched_api.save_plan_weeks(fake_bucket, "u1", plan["id"], weeks, "seed")
+    return plan["id"]
+
+
+def _versions(fake_bucket, plan_id):
+    """Номера записанных версий недель плана."""
+    marker = f"/plans/{plan_id}/v"
+    return sorted(int(name.split(marker)[1].split("/")[0])
+                  for name in fake_bucket._store if marker in name)
+
+
+def _plan_objects(fake_bucket, plan_id):
+    """Всё, что лежит в хранилище по плану: версии и манифест."""
+    return {name: data for name, data in fake_bucket._store.items()
+            if f"/plans/{plan_id}/" in name}
+
+
+def _plan_meta(api, path="/plan"):
+    return json.loads(api(FakeRequest("GET", path, args={"meta": "1"}))[0])
+
+
+def _weeks_paths(plan_id):
+    return ["/plan", f"/plans/{plan_id}/weeks"]
+
+
+def test_plan_weeks_stay_a_bare_array_for_the_old_frontend(api, patched_api, fake_bucket):
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    for path in _weeks_paths(plan_id):
+        assert json.loads(api(FakeRequest("GET", path))[0]) == W1
+        # любое другое значение параметра формат не меняет
+        assert json.loads(api(FakeRequest("GET", path, args={"meta": "0"}))[0]) == W1
+
+
+def test_plan_weeks_come_with_their_version_on_request(api, patched_api, fake_bucket):
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    for path in _weeks_paths(plan_id):
+        assert _plan_meta(api, path) == {"plan_id": plan_id, "version": 1, "weeks": W1}
+
+    api(FakeRequest("POST", "/plan", {"weeks": W2}))
+    assert _plan_meta(api) == {"plan_id": plan_id, "version": 2, "weeks": W2}
+
+
+def test_new_plan_without_weeks_reports_version_zero(api, patched_api, fake_bucket):
+    plan_id = _new_plan(api, patched_api, fake_bucket, weeks=None)
+    assert _plan_meta(api) == {"plan_id": plan_id, "version": 0, "weeks": []}
+    body, code, _ = api(FakeRequest("POST", "/plan", {"weeks": W1, "base_version": 0}))
+    assert code == 201 and json.loads(body)["version"] == 1
+
+
+@pytest.mark.parametrize("shortcut", [True, False])
+def test_plan_write_with_the_current_version_passes(api, patched_api, fake_bucket, shortcut):
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    path = "/plan" if shortcut else f"/plans/{plan_id}/weeks"
+    base = _plan_meta(api, path)["version"]
+
+    body, code, _ = api(FakeRequest("POST", path, {"weeks": W2, "change_reason": "manual edit",
+                                                   "base_version": base}))
+    assert code == 201 and json.loads(body)["version"] == 2
+    assert _plan_meta(api, path) == {"plan_id": plan_id, "version": 2, "weeks": W2}
+    # версия из ответа годится как основа следующей правки
+    body, code, _ = api(FakeRequest("POST", path, {"weeks": W1, "base_version": 2}))
+    assert code == 201 and _versions(fake_bucket, plan_id) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("shortcut", [True, False])
+def test_plan_write_over_a_stale_version_is_409(api, patched_api, fake_bucket, shortcut):
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    path = "/plan" if shortcut else f"/plans/{plan_id}/weeks"
+    base = _plan_meta(api, path)["version"]
+    # пока конструктор открыт, план правят с другого устройства
+    assert api(FakeRequest("POST", path, {"weeks": W3, "base_version": base}))[1] == 201
+    before = _plan_objects(fake_bucket, plan_id)
+
+    body, code, _ = api(FakeRequest("POST", path, {"weeks": W2, "base_version": base}))
+    assert code == 409 and json.loads(body) == {"error": "plan_stale"}
+    # версия не создана, манифест не тронут
+    assert _plan_objects(fake_bucket, plan_id) == before
+    assert _versions(fake_bucket, plan_id) == [1, 2]
+    assert _plan_meta(api, path) == {"plan_id": plan_id, "version": 2, "weeks": W3}
+
+
+@pytest.mark.parametrize("shortcut", [True, False])
+def test_plan_write_without_base_version_keeps_old_behaviour(api, patched_api, fake_bucket,
+                                                            shortcut):
+    """Закэшированный старый фронтенд версию не шлёт — пишет, как раньше."""
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    path = "/plan" if shortcut else f"/plans/{plan_id}/weeks"
+    for expected, body in [(2, {"weeks": W2}), (3, {"weeks": W3, "base_version": None})]:
+        res, code, _ = api(FakeRequest("POST", path, body))
+        assert code == 201 and json.loads(res)["version"] == expected
+    assert _plan_meta(api, path)["weeks"] == W3
+
+
+@pytest.mark.parametrize("bad", ["1", 1.0, True, -1, [1]])
+def test_plan_write_rejects_a_malformed_base_version(api, patched_api, fake_bucket, bad):
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    for path in _weeks_paths(plan_id):
+        body, code, _ = api(FakeRequest("POST", path, {"weeks": W2, "base_version": bad}))
+        assert code == 400 and "base_version" in body
+    assert _versions(fake_bucket, plan_id) == [1]
+
+
+def test_plan_write_is_409_when_another_plan_became_active(api, patched_api, fake_bucket):
+    """Номера версий у планов свои: «версия 1» старого плана не должна
+    открыть запись в новый активный план той же версии."""
+    first = _new_plan(api, patched_api, fake_bucket)
+    base = _plan_meta(api)
+    second = _new_plan(api, patched_api, fake_bucket, weeks=W3, name="Марафон")   # теперь активен он
+    stale = {"weeks": W2, "base_plan_id": base["plan_id"], "base_version": base["version"]}
+
+    body, code, _ = api(FakeRequest("POST", "/plan", stale))
+    assert code == 409 and json.loads(body) == {"error": "plan_stale"}
+    assert _versions(fake_bucket, first) == [1] and _versions(fake_bucket, second) == [1]
+
+    fresh = _plan_meta(api)
+    assert (fresh["plan_id"], fresh["weeks"]) == (second, W3)
+    ok = {"weeks": W2, "base_plan_id": fresh["plan_id"], "base_version": fresh["version"]}
+    assert api(FakeRequest("POST", "/plan", ok))[1] == 201
 
 
 def test_entry_point_delegates_to_api(monkeypatch):

@@ -428,19 +428,36 @@ def test_week_boundaries_come_from_one_place():
     assert "planDateWarnings()" in _js_section(js, "function applyImportedPlan(", "\n}\n")
 
 
-def test_day_edit_writes_a_new_plan_version_over_fresh_weeks():
+def test_plan_writes_carry_the_version_they_were_based_on():
+    """#51: версия приходит вместе с неделями и уходит обратно с правкой;
+    отказ сервера — это перечитанный план и ошибка с кодом, а не «HTTP 409»."""
+    js = APP_JS.read_text(encoding="utf-8")
+    load = _js_section(js, "async function loadPlan() {", "\n}\n")
+    assert "'plan?meta=1'" in load and "rememberPlan(" in load
+    post = _js_section(js, "async function postPlanWeeks(", "\n}\n")
+    assert "base_version: base.version" in post and "base_plan_id: base.plan_id" in post
+    stale, reload, raised = (post.index(s) for s in (
+        "res.status === 409", "await loadPlan();", "code: 'plan_stale'"))
+    assert stale < reload < raised
+    # недели и их версия попадают в кэш только вместе
+    assert js.count("localStorage.setItem(planCacheKey()") == 2
+    assert _js_section(js, "function rememberPlan(", "\n}\n").count("localStorage.setItem(") == 2
+
+
+def test_day_edit_writes_a_new_plan_version_and_leaves_staleness_to_the_server():
     """Правка дня на телефоне — та же версионная запись плана, что и из
-    конструктора. Сервер версию не сверяет, поэтому основа записи — только
-    что прочитанные недели, и изменившийся день не затирается молча."""
+    конструктора. Версию сверяет сервер (#51): изменившийся план — это
+    plan_stale, после которого лист показывает, что теперь стоит в этом дне."""
     html = INDEX.read_text(encoding="utf-8")
     assert 'id="day-sheet"' in html and 'onclick="saveDayEdit()"' in html
     js = APP_JS.read_text(encoding="utf-8")
     body = _js_section(js, "async function saveDayEdit() {", "\n}\n")
     assert "planEditMode" in body, "открытый конструктор записал бы план без этой правки"
-    fresh, stale, write, reload = (body.index(s) for s in (
-        "await fetchPlanWeeks()", "cell !== edit.was", "await postPlanWeeks(", "await loadPlan();         //"))
-    assert fresh < stale < write < reload
-    # основа записи — свежие недели, локальный PLAN не трогаем и не отправляем
-    assert "fresh.map(" in body
+    write, reload, stale = (body.index(s) for s in (
+        "await postPlanWeeks(", "await loadPlan();         //", "e.code === 'plan_stale'"))
+    assert write < reload < stale
+    assert "edit.was = " in body[stale:], "после отказа лист должен знать новое содержимое дня"
+    # на запись уходит копия недель с одной ячейкой; локальный PLAN не трогаем
+    assert "PLAN.map(" in body
     assert not re.search(r"(?<![.\w])PLAN\s*(\[[^\]]*\]\s*)*(\.\w+\s*)?=[^=]", body)
     assert "postPlanWeeks(PLAN" not in body

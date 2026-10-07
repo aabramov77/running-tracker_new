@@ -618,15 +618,22 @@ def read_plan_version(bucket, object_path):
     return json.loads(blob.download_as_text())
 
 
+def read_plan_state(bucket, sub, plan_id):
+    """Недели текущей версии плана вместе с её номером.
+
+    version клиент возвращает как base_version при записи (см.
+    save_plan_weeks); 0 — недель у плана ещё нет или нет самого плана.
+    """
+    manifest = read_plan_manifest(bucket, sub, plan_id) if plan_id else None
+    data = read_plan_version(bucket, manifest["gcs_object_path"]) if manifest else None
+    return {"plan_id": plan_id,
+            "version": manifest["current_version"] if manifest else 0,
+            "weeks": (data or {}).get("weeks", [])}
+
+
 def read_plan_weeks(bucket, sub, plan_id):
     """Недели текущей версии плана; [] если плана/версии нет."""
-    if not plan_id:
-        return []
-    manifest = read_plan_manifest(bucket, sub, plan_id)
-    if not manifest:
-        return []
-    data = read_plan_version(bucket, manifest["gcs_object_path"])
-    return (data or {}).get("weeks", [])
+    return read_plan_state(bucket, sub, plan_id)["weeks"]
 
 
 def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api"):
@@ -666,11 +673,27 @@ def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, crea
     return {"version": version, "gcs_object_path": object_path}
 
 
-def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="api"):
-    """Пишет следующую версию недель плана."""
+class PlanStale(Exception):
+    """Правка сделана поверх версии плана, которая уже не текущая."""
+
+
+def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="api",
+                    base_version=None):
+    """Пишет следующую версию недель плана.
+
+    base_version — версия, поверх которой сделана правка (0 — недель ещё не
+    было). Текущая уже другая → PlanStale, ничего не пишется. None — без
+    сверки: так пишет фронтенд, загруженный до #51.
+
+    Сверка и запись идут не атомарно: два одновременных запроса с одной
+    base_version пройдут оба. Закрыто окно «прочитал — правил — записал»;
+    полное решение — предусловия записи (#35).
+    """
     manifest = read_plan_manifest(bucket, sub, plan_id)
-    next_version = (manifest["current_version"] + 1) if manifest else 1
-    return write_plan_version(bucket, sub, plan_id, next_version, weeks,
+    current = manifest["current_version"] if manifest else 0
+    if base_version is not None and base_version != current:
+        raise PlanStale("plan_stale")
+    return write_plan_version(bucket, sub, plan_id, current + 1, weeks,
                               change_reason, created_by)
 
 
@@ -2124,8 +2147,13 @@ def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=No
     for change in proposal["changes"]:
         weeks[change["week"] - 1][change["day"]] = change["text"]
 
-    saved = save_plan_weeks(bucket, sub, plan_id, weeks,
-                            f"ИИ-тренер: {proposal['summary']}", applied_by)
+    try:
+        saved = save_plan_weeks(bucket, sub, plan_id, weeks,
+                                f"ИИ-тренер: {proposal['summary']}", applied_by,
+                                base_version=version)
+    except PlanStale:
+        # План переписали между сверкой выше и записью.
+        raise AICoachError("proposal_stale")
     marker = {
         "thread_id": thread_id, "message_id": msg_id,
         "applied_at": datetime.utcnow().isoformat() + "Z", "applied_by": applied_by,

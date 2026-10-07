@@ -1034,6 +1034,30 @@ def test_applying_one_proposal_makes_the_earlier_one_stale(api, llm, patched_api
     assert _apply(api, thread, first["id"])[1] == 409
 
 
+def test_plan_rewritten_during_apply_is_not_overwritten(api, llm, patched_api, fake_bucket,
+                                                        storage_module, monkeypatch):
+    """План переписали между сверкой версии и записью: storage отклоняет
+    запись тем же предусловием, что и ручную правку (#51)."""
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    read_version = storage_module.read_plan_version
+
+    def lose_the_race(bucket, path):
+        monkeypatch.setattr(storage_module, "read_plan_version", read_version)   # один раз
+        data = read_version(bucket, path)
+        fri = [{**week, "fri": "5 км"} for week in data["weeks"]]
+        storage_module.save_plan_weeks(bucket, SUB, plan_id, fri, "правка с телефона")
+        return data
+    monkeypatch.setattr(storage_module, "read_plan_version", lose_the_race)
+
+    body, code, _ = _apply(api, thread, answer["id"])
+    assert code == 409 and json.loads(body) == {"error": "proposal_stale"}
+    manifest, weeks = _plan_state(patched_api, fake_bucket, plan_id)
+    assert manifest["current_version"] == 2 and manifest["change_reason"] == "правка с телефона"
+    assert weeks[1]["fri"] == "5 км" and weeks[1]["wed"] == "6×800 м"
+    assert not any("/applied/" in name for name in fake_bucket._store)
+
+
 def test_proposal_goes_stale_once_its_day_has_passed(api, llm, patched_api, fake_bucket, storage_module):
     plan_id = _seed_current_plan(patched_api, fake_bucket)
     thread, answer = _propose(api, llm)
