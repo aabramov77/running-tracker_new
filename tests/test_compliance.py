@@ -95,6 +95,80 @@ def test_irregular_labels_do_not_shift_later_rows():
     assert c.current_week_idx("2026-05-10", 4, "2026-06-03", weeks=weeks) == 2
 
 
+# ── Строка короче семи дней ───────────────────────────────────────────────────
+
+# Реальный план: старт в воскресенье, поэтому первая строка — один день, а
+# дальше обычные недели пн→вс. Семидневное окно первой строки накрывало
+# почти всю вторую.
+SHORT_FIRST = [
+    {"start": "04.10", "end": "04.10", "sun": "5 км легко"},
+    {"start": "05.10", "end": "11.10", "tue": "33 мин легко", "sun": "5 км длительная"},
+    {"start": "12.10", "end": "18.10", "sun": "6 км длительная"},
+]
+
+
+def test_short_row_window_ends_where_its_label_says():
+    assert c.week_windows(SHORT_FIRST, "2026-10-04") == [
+        (date(2026, 10, 4), date(2026, 10, 4)),
+        (date(2026, 10, 5), date(2026, 10, 11)),
+        (date(2026, 10, 12), date(2026, 10, 18)),
+    ]
+    assert c.week_window(SHORT_FIRST, 0, "2026-10-04") == \
+        (date(2026, 10, 4), date(2026, 10, 4))
+
+
+def test_window_stops_before_the_next_row_even_without_an_end_label():
+    weeks = [{"start": "04.10"}, {"start": "05.10"}, {"start": "12.10"}]
+    assert c.week_window(weeks, 0, "2026-10-04") == (date(2026, 10, 4), date(2026, 10, 4))
+
+
+@pytest.mark.parametrize("end", ["", "мусор", "03.10", "17.10", "10.10"])
+def test_end_label_never_stretches_or_inverts_the_window(end):
+    """Подпись конца только укорачивает окно: раньше начала или дальше
+    семи дней она — опечатка, а колонок дней всё равно семь."""
+    weeks = [{"start": "04.10", "end": end}]
+    assert c.week_window(weeks, 0, "2026-10-04") == (date(2026, 10, 4), date(2026, 10, 10))
+
+
+def test_end_label_across_new_year_takes_the_year_of_its_row():
+    weeks = [{"start": "28.12", "end": "31.12"}]
+    assert c.week_window(weeks, 0, "2026-10-04") == (date(2026, 12, 28), date(2026, 12, 31))
+
+
+@pytest.mark.parametrize("day,expected", [
+    ("2026-10-04", 0),
+    ("2026-10-05", 1),   # раньше до 10.10 текущей оставалась первая строка
+    ("2026-10-06", 1),
+    ("2026-10-11", 1),
+    ("2026-10-12", 2),
+])
+def test_current_week_does_not_linger_on_a_short_row(day, expected):
+    assert c.current_week_idx("2026-10-04", 3, day, weeks=SHORT_FIRST) == expected
+
+
+def test_planned_cell_comes_from_the_row_that_owns_the_date():
+    """06.10 принадлежит второй строке; раньше находилась пустая ячейка первой."""
+    assert c.planned_for_date(SHORT_FIRST, "2026-10-06", "2026-10-04") == \
+        (1, "tue", "33 мин легко")
+
+
+def test_run_is_counted_in_one_row_only():
+    runs = [{"date": "2026-10-04", "dist": 4.09}, {"date": "2026-10-06", "dist": 4.24}]
+    result = c.plan_compliance(SHORT_FIRST, runs, "2026-10-04")
+    first, second, _ = result["weeks"]
+    assert (first["start"], first["end"]) == ("2026-10-04", "2026-10-04")
+    assert [d["field"] for d in first["days"]] == ["sun"]
+    assert (first["actual_km"], first["extra"], first["pct"]) == (4.09, 0, 82)
+    assert second["actual_km"] == 4.24
+    assert result["totals"]["actual_km"] == 8.33
+
+
+def test_week_days_follow_the_window():
+    assert c.week_days(date(2026, 10, 4), date(2026, 10, 4)) == [(date(2026, 10, 4), "sun")]
+    assert [f for _, f in c.week_days(date(2026, 10, 4))] == \
+        ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+
+
 # ── Якорь по подписи первой недели (#40) ──────────────────────────────────────
 
 # Реальная конфигурация из #40: plan_start остался воскресным с прежних

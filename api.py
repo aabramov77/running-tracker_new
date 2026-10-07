@@ -16,7 +16,8 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
-                     LLMTruncated, RegistrationClosed, _fmt_duration, _fmt_pace,
+                     LLMTruncated, PlanStale, RegistrationClosed, _fmt_duration,
+                     _fmt_pace,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
@@ -35,7 +36,8 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      read_advice_usage, read_ai_messages,
                      read_ai_thread, read_athlete_history,
                      read_athlete_profile,
-                     read_llm_config_full, read_plan_weeks, read_plans_index,
+                     read_llm_config_full, read_plan_state, read_plan_weeks,
+                     read_plans_index,
                      read_races, read_registry, read_run_details, read_runs,
                      resolve_user, run_title, save_plan_weeks, set_active_plan,
                      set_coach_flag, set_user_coach, set_user_status,
@@ -636,11 +638,37 @@ def h_plan_archive(c):
     return jresp({"ok": True, "plan": plan}, 200)
 
 
+def _plan_weeks_resp(c, plan_id):
+    """Недели плана. С ?meta=1 — вместе с plan_id и версией, которую клиент
+    вернёт в base_version; без параметра — голый массив, как его ждёт
+    фронтенд, загруженный до #51."""
+    state = read_plan_state(c.bucket, c.sub, plan_id)
+    return jresp(state if c.request.args.get("meta") == "1" else state["weeks"], 200)
+
+
+def _plan_stale():
+    # Как proposal_stale у ИИ-тренера: правка опирается на план, которого уже нет.
+    return jresp({"error": "plan_stale"}, 409)
+
+
+def _save_plan_weeks(c, plan_id, body):
+    base_version = body.get("base_version")
+    if base_version is not None and (type(base_version) is not int or base_version < 0):
+        return jresp({"error": "invalid base_version"}, 400)
+    try:
+        result = save_plan_weeks(c.bucket, c.sub, plan_id, body["weeks"],
+                                 body.get("change_reason", ""), c.email,
+                                 base_version=base_version)
+    except PlanStale:
+        return _plan_stale()
+    return jresp(result, 201)
+
+
 def h_plan_weeks_get(c):
     plan_id = c.args[0]
     if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
         return jresp({"error": "plan not found"}, 404)
-    return jresp(read_plan_weeks(c.bucket, c.sub, plan_id), 200)
+    return _plan_weeks_resp(c, plan_id)
 
 
 def h_plan_compliance(c):
@@ -657,16 +685,13 @@ def h_plan_weeks_post(c):
     body = c.request.get_json(silent=True)
     if not body or "weeks" not in body:
         return jresp({"error": "Missing weeks"}, 400)
-    result = save_plan_weeks(c.bucket, c.sub, plan_id, body["weeks"],
-                             body.get("change_reason", ""), c.email)
-    return jresp(result, 201)
+    return _save_plan_weeks(c, plan_id, body)
 
 
 def h_active_plan_weeks_get(c):
     active = get_active_plan(c.bucket, c.sub)
-    if not active:
-        return jresp([], 200)   # планов нет — строится через конструктор
-    return jresp(read_plan_weeks(c.bucket, c.sub, active["id"]), 200)
+    # планов нет — пустые недели, план строится через конструктор
+    return _plan_weeks_resp(c, active["id"] if active else None)
 
 
 def h_active_plan_weeks_post(c):
@@ -676,9 +701,10 @@ def h_active_plan_weeks_post(c):
     active = get_active_plan(c.bucket, c.sub)
     if not active:
         return jresp({"error": "no active plan"}, 400)
-    result = save_plan_weeks(c.bucket, c.sub, active["id"], body["weeks"],
-                             body.get("change_reason", ""), c.email)
-    return jresp(result, 201)
+    if body.get("base_plan_id") not in (None, active["id"]):
+        # Активным успели сделать другой план, а номера версий у планов свои.
+        return _plan_stale()
+    return _save_plan_weeks(c, active["id"], body)
 
 
 def h_runs_get(c):

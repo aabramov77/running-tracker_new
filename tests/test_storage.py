@@ -265,6 +265,49 @@ def test_save_plan_weeks_increments_version(storage_module, fake_bucket):
     assert len(storage_module.read_plan_weeks(fake_bucket, SUB, PID)) == 2
 
 
+def test_read_plan_state_carries_the_version(storage_module, fake_bucket):
+    empty = {"plan_id": PID, "version": 0, "weeks": []}
+    assert storage_module.read_plan_state(fake_bucket, SUB, PID) == empty
+    assert storage_module.read_plan_state(fake_bucket, SUB, None) == {**empty, "plan_id": None}
+
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "first")
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}, {"w": 2}], "second")
+    assert storage_module.read_plan_state(fake_bucket, SUB, PID) == {
+        "plan_id": PID, "version": 2, "weeks": [{"w": 1}, {"w": 2}]}
+
+
+def test_save_plan_weeks_accepts_the_version_it_was_based_on(storage_module, fake_bucket):
+    # 0 — «недель ещё не было»: первая запись тоже идёт со сверкой
+    first = storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "first",
+                                           base_version=0)
+    second = storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1, "sun": "12км"}],
+                                            "second", base_version=first["version"])
+    assert (first["version"], second["version"]) == (1, 2)
+    assert storage_module.read_plan_weeks(fake_bucket, SUB, PID) == [{"w": 1, "sun": "12км"}]
+
+
+@pytest.mark.parametrize("stale", [0, 1, 3])
+def test_save_plan_weeks_rejects_a_stale_version(storage_module, fake_bucket, stale):
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "first")
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1, "sun": "12км"}], "second")
+    before = dict(fake_bucket._store)
+
+    with pytest.raises(storage_module.PlanStale):
+        storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1, "sun": "чужое"}],
+                                       "late", base_version=stale)
+    # ни новой версии, ни тронутого манифеста
+    assert fake_bucket._store == before
+    assert storage_module.read_plan_manifest(fake_bucket, SUB, PID)["current_version"] == 2
+
+
+def test_save_plan_weeks_rejects_a_first_write_over_existing_weeks(storage_module, fake_bucket):
+    """Два устройства открыли пустой план: второе не должно затереть первое."""
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "first", base_version=0)
+    with pytest.raises(storage_module.PlanStale):
+        storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 9}], "second", base_version=0)
+    assert storage_module.read_plan_weeks(fake_bucket, SUB, PID) == [{"w": 1}]
+
+
 # ── plans registry (#25) ──────────────────────────────────────────────────────
 
 def test_create_and_switch_plans(storage_module, fake_bucket):

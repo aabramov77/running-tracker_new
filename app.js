@@ -14,6 +14,10 @@ if (!IS_PROD) {
 }
 
 let PLAN = null;
+// Версия недель в PLAN: { plan_id, version }. Уходит на сервер вместе с правкой,
+// и тот отклоняет запись, если план с тех пор изменился (#51). null — версия
+// неизвестна (бэкенд до #51): запись идёт без сверки.
+let PLAN_BASE = null;
 let planEditMode = false;
 let idToken = localStorage.getItem('g_id_token') || null;
 let currentRole = null;
@@ -171,6 +175,48 @@ function weekStart(i) {
   return labelled ||
     new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 7 * i);
 }
+function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); }
+// Окна строк плана: [[первый день, последний], …] — зеркало week_windows из
+// compliance.py. Обычно это семь дней; короче, если строка сама подписана
+// короче («04.10–04.10») или в эти семь дней уже начинается другая строка.
+// Иначе день принадлежал бы двум строкам сразу.
+//   naive — окна по одним подписям, без обрезки по соседним строкам.
+function weekWindows(naive) {
+  const starts = (PLAN || []).map((_, i) => weekStart(i));
+  return starts.map((s, i) => {
+    let e = addDays(s, 6);
+    const labelled = labelToDate(PLAN[i].end, s);
+    if (labelled && labelled >= s && labelled < e) e = labelled;
+    if (!naive) starts.forEach(o => { if (o > s && o <= e) e = addDays(o, -1); });
+    return [s, e];
+  });
+}
+function ddmm(d) {
+  return `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+// Что в датах недель помешает сопоставить план с фактом: пересекающиеся
+// строки и тренировки в днях, которые в даты своей строки не попадают.
+function planDateWarnings() {
+  if (!PLAN || !PLAN.length || !planIsDated()) return [];
+  const natural = weekWindows(true), wins = weekWindows();
+  const label = Object.fromEntries(PLAN_DAYS);
+  const out = [];
+  natural.forEach(([s, e], i) => {
+    const same = natural.findIndex(([o], j) => j > i && +o === +s);
+    if (same >= 0)
+      out.push(`Недели ${i + 1} и ${same + 1} начинаются в один день (${ddmm(s)}) — пробежки попадут в обе`);
+    const next = natural.findIndex(([o]) => o > s && o <= e);
+    if (next >= 0)
+      out.push(`Недели ${i + 1} и ${next + 1} пересекаются по датам — неделя ${i + 1} считается по ${ddmm(wins[i][1])}`);
+    // Колонка дня → дата: как day_date на бэкенде (getDay: вс = 0, колонки с пн)
+    const outside = PLAN_DAYS.map(([f]) => f).filter((f, k) =>
+      String(PLAN[i][f] || '').trim() &&
+      addDays(s, (k - (s.getDay() + 6) % 7 + 7) % 7) > wins[i][1]);
+    if (outside.length)
+      out.push(`Неделя ${i + 1}: ${outside.map(f => label[f]).join(', ')} — вне дат недели, в план/факт не попадут`);
+  });
+  return out;
+}
 // Привязан ли план к календарю: подписью первой недели или plan_start. Без
 // этого недели отсчитываются от даты по умолчанию — то есть наугад.
 function planIsDated() {
@@ -180,6 +226,14 @@ function planIsDated() {
 function activePlanId() { return ACTIVE_PLAN ? ACTIVE_PLAN.id : null; }
 // Кэш недель — свой у каждого плана, иначе планы затирали бы друг друга
 function planCacheKey() { return ck('running_tracker_plan') + '__' + (activePlanId() || 'none'); }
+/** Недели с сервера и их версия — в память и в кэш, всегда вместе: иначе
+ *  недели из кэша ушли бы на запись без сверки или с чужой версией. */
+function rememberPlan(weeks, base) {
+  PLAN = weeks;
+  PLAN_BASE = base;
+  localStorage.setItem(planCacheKey(), JSON.stringify(weeks));
+  localStorage.setItem(planCacheKey() + '__base', JSON.stringify(base));
+}
 function livePlans() { return PLANS.filter(p => !p.archived); }
 function planLabel(p) {
   return p.race_name || (p.race_date ? `Забег ${p.race_date}` : 'Без названия');
@@ -421,23 +475,24 @@ function setStatus(msg, type = 'ok') {
   el.style.color = type === 'ok' ? 'var(--c-accent)' : type === 'warn' ? 'var(--c-warn)' : 'var(--c-danger)';
 }
 
-/** Недели активного плана с сервера, мимо кэша. */
-async function fetchPlanWeeks() {
-  const res = await fetch(API_URL + 'plan', { headers: authHeaders() });
-  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
 async function loadPlan() {
   const cached = localStorage.getItem(planCacheKey());
-  if (cached) { PLAN = JSON.parse(cached); renderPlan(); }
+  if (cached) {
+    PLAN = JSON.parse(cached);
+    PLAN_BASE = JSON.parse(localStorage.getItem(planCacheKey() + '__base') || 'null');
+    renderPlan();
+  }
   try {
-    const weeks = await fetchPlanWeeks();
+    const res = await fetch(API_URL + 'plan?meta=1', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // Бэкенд до #51 параметра не знает и отдаёт голый массив недель — без версии.
+    const bare = Array.isArray(data);
+    const weeks = bare ? data : (data || {}).weeks;
     if (Array.isArray(weeks)) {
       // [] — новый пользователь без плана (покажем пустое состояние + «Создать план»)
-      PLAN = weeks;
-      localStorage.setItem(planCacheKey(), JSON.stringify(PLAN));
+      rememberPlan(weeks, bare ? null : { plan_id: data.plan_id, version: data.version });
       renderPlan();
       applyProfileToHeader();  // «план N недель» зависит от длины плана
       loadCompliance();        // план/факт — отдельным запросом, не блокирует таблицу
@@ -615,9 +670,9 @@ function getCurrentWeek() {
     // Идём по окнам строк: подписи могут идти не ровно через семь дней,
     // поэтому арифметикой индекс не вычислить.
     let latest = 0;
+    const wins = weekWindows();
     for (let i = 0; i < PLAN.length; i++) {
-      const s = weekStart(i);
-      const e = new Date(s.getFullYear(), s.getMonth(), s.getDate() + 6);
+      const [s, e] = wins[i];
       if (today >= s && today <= e) return Math.min(i, n - 1);
       if (today >= s) latest = i;
     }
@@ -637,9 +692,13 @@ function formatPace(v) {
   const m = Math.floor(v), s = Math.round((v - m) * 60);
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
+// Неделя плана, в чьё окно попадает дата, — по тем же окнам, что и таблица:
+// отсчёт семидневок от plan_start расходился с подписями строк.
 function getWeekLabel(dateStr) {
-  const w = Math.floor((new Date(dateStr) - planStartDate()) / (7 * 24 * 3600 * 1000)) + 1;
-  return (w >= 1 && w <= planWeeks()) ? `Нед ${w}` : '';
+  const d = localDate(dateStr);
+  if (!d || !PLAN || !PLAN.length || !planIsDated()) return '';
+  const i = weekWindows().findIndex(([s, e]) => d >= s && d <= e);
+  return i >= 0 ? `Нед ${i + 1}` : '';
 }
 
 async function saveRun() {
@@ -909,7 +968,8 @@ function planWeekHtml(plan, weeks, cw, idx) {
   // Дни идут по датам, а не по колонкам таблицы: неделя плана вс→сб
   // начинается с воскресенья. Без дат остаётся порядок колонок.
   const fields = PLAN_DAYS.map(([f]) => f);
-  if (week) fields.sort((a, b) => (byField[a]?.date || '').localeCompare(byField[b]?.date || ''));
+  // У строки короче семи дней части колонок нет в её датах — они в конце.
+  if (week) fields.sort((a, b) => (byField[a]?.date || '9').localeCompare(byField[b]?.date || '9'));
 
   const planned = week ? plannedKmLabel(week) : '';
   const km = !week ? '' : past
@@ -981,27 +1041,26 @@ async function saveDayEdit() {
   if (text === edit.was.trim()) { closeDaySheet(); return; }
   const btn = document.getElementById('day-sheet-save');
   btn.disabled = true; btn.textContent = 'Сохранение…';
+  const planId = activePlanId();
   try {
-    // Сервер версию плана при записи не сверяет. Поэтому пишем поверх только
-    // что прочитанных недель, а не локальной копии: правка с другого
-    // устройства или от ИИ-тренера в остальных днях сохранится.
-    const fresh = await fetchPlanWeeks();
-    if (dayEdit !== edit) return;                        // лист закрыли, пока шёл запрос
-    const cell = Array.isArray(fresh) && fresh[edit.idx] ? (fresh[edit.idx][edit.field] || '') : null;
-    if (cell !== edit.was) {
-      // Сам день изменился с момента открытия — молча затирать нельзя.
-      await loadPlan();
-      if (cell === null) { closeDaySheet(); alert('План изменился: этой недели в нём больше нет.'); return; }
-      edit.was = cell;
-      dayNote(`План изменился: сейчас здесь «${cell || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
-      return;
-    }
-    const weeks = fresh.map((w, i) => i === edit.idx ? { ...w, [edit.field]: text } : w);
-    const week = fresh[edit.idx].w ?? edit.idx + 1;
+    // Пишем поверх локальных недель: их версию сервер сверит сам (#51), так что
+    // правка с другого устройства или от ИИ-тренера молча не затрётся.
+    const weeks = PLAN.map((w, i) => i === edit.idx ? { ...w, [edit.field]: text } : w);
+    const week = PLAN[edit.idx].w ?? edit.idx + 1;
     await postPlanWeeks(weeks, `Правка дня: неделя ${week}, ${Object.fromEntries(PLAN_DAYS)[edit.field]}`);
     closeDaySheet();
-    await loadPlan();         // новая версия плана и свежий план/факт
+    await loadPlan();         // свежий план/факт
   } catch (e) {
+    if (e.code === 'plan_stale') {
+      if (dayEdit !== edit) return;                      // лист закрыли, пока шёл запрос
+      // План уже перечитан. Тот же план и неделя на месте — показываем, что
+      // теперь стоит в этом дне; иначе править здесь больше нечего.
+      const row = activePlanId() === planId ? PLAN[edit.idx] : null;
+      if (!row) { closeDaySheet(); alert(e.message); return; }
+      edit.was = row[edit.field] || '';
+      dayNote(`План изменился: сейчас здесь «${edit.was || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
+      return;
+    }
     dayNote('Не удалось сохранить: ' + e.message, true);
   } finally {
     btn.disabled = false; btn.textContent = 'Сохранить';
@@ -1050,12 +1109,12 @@ function renderToday() {
   }
 
   const cw = getCurrentWeek();
-  const start = weekStart(cw);
-  const offset = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) - start) / 86400000);
-  if (offset < 0 || offset > 6) {
-    const title = offset < 0
-      ? `План начнётся ${String(start.getDate()).padStart(2, '0')}.${String(start.getMonth() + 1).padStart(2, '0')}`
-      : 'План завершён';
+  const [start, end] = weekWindows()[cw];
+  const date = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (date < start || date > end) {
+    // После окна строки, но не последней: день попал в разрыв между неделями
+    const title = date < start ? `План начнётся ${ddmm(start)}`
+      : cw === PLAN.length - 1 ? 'План завершён' : 'На сегодня в плане нет недели';
     el.innerHTML = hero(when, title, '', recordBtn + planBtn) + recentHtml;
     return;
   }
@@ -1267,7 +1326,8 @@ function applyImportedPlan(weeks, fileName, warnings, race) {
   document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
   document.getElementById('plan-save-bar').style.display = 'none';  // свой бар
   renderPlan();
-  renderImportBar({ fileName, count: weeks.length, warnings });
+  renderImportBar({ fileName, count: weeks.length,
+                    warnings: [...warnings, ...planDateWarnings()] });
 }
 
 function renderImportBar({ fileName, count, warnings, errors }) {
@@ -1327,7 +1387,17 @@ async function saveImportedPlan() {
     finishImport();
     renderPlan();
     applyProfileToHeader();
-  } catch (e) { importFlash('⚠ Не удалось сохранить: ' + e.message); }
+  } catch (e) {
+    if (e.code === 'plan_stale') {
+      // План уже перечитан: предпросмотр файла закрываем, иначе «Отмена»
+      // вернула бы недели, которых на сервере больше нет.
+      finishImport();
+      renderPlan();
+      alert(e.message + ' Если план всё ещё нужно заменить, загрузите файл ещё раз.');
+      return;
+    }
+    importFlash('⚠ Не удалось сохранить: ' + e.message);
+  }
 }
 
 async function saveImportedAsNewPlan() {
@@ -1429,17 +1499,35 @@ function downloadPlanTemplate() {
   downloadFile('plan-template.csv', '﻿' + planToCSV(sample), 'text/csv');
 }
 
-/** Пишет недели в активный план (бэкенд создаёт новую версию). */
+const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства или правкой ИИ-тренера. ' +
+  'Загружена его свежая версия, ваша правка не сохранена.';
+
+/** Пишет недели в активный план (бэкенд создаёт новую версию).
+ *
+ *  Вместе с неделями уходит версия, поверх которой сделана правка. Если план
+ *  с тех пор изменился (другое устройство, правка ИИ-тренера), сервер отвечает
+ *  409: план перечитывается, а вызывающему уходит ошибка с code 'plan_stale'
+ *  и готовым текстом для пользователя. */
 async function postPlanWeeks(weeks, changeReason) {
+  const base = PLAN_BASE;
   const res = await fetch(API_URL + 'plan', {
     method: 'POST',
     headers: authHeaders({'Content-Type': 'application/json'}),
-    body: JSON.stringify({ weeks, change_reason: changeReason })
+    body: JSON.stringify({
+      weeks, change_reason: changeReason,
+      ...(base ? { base_plan_id: base.plan_id, base_version: base.version } : {}),
+    })
   });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (res.status === 409) {
+    await loadPlans();      // активным могли сделать и другой план
+    await loadPlan();
+    throw Object.assign(new Error(PLAN_STALE_TEXT), { code: 'plan_stale', status: 409 });
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  localStorage.setItem(planCacheKey(), JSON.stringify(weeks));
-  return res.json();
+  const saved = await res.json();
+  rememberPlan(weeks, base ? { ...base, version: saved.version } : null);
+  return saved;
 }
 
 async function savePlanEdits() {
@@ -1454,7 +1542,9 @@ async function savePlanEdits() {
     msg.style.display = 'inline'; msg.textContent = '✓ Сохранено!';
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
   } catch(e) {
-    alert('Ошибка сохранения: ' + e.message);
+    // При plan_stale конструктор остаётся открытым уже со свежими неделями.
+    alert(e.code === 'plan_stale' ? e.message + ' Внесите её заново.'
+                                  : 'Ошибка сохранения: ' + e.message);
   } finally {
     btn.disabled = false; btn.textContent = 'Сохранить изменения';
   }
@@ -1808,10 +1898,9 @@ function closeRunDetail(event) {
 // (#41). Прежняя формула делила миллисекунды на семь суток от plan_start и
 // с подписями недель не совпадала.
 function weekBuckets(runsList, n) {
-  const bounds = Array.from({length: n}, (_, i) => {
-    const s = weekStart(i);
-    return [s, new Date(s.getFullYear(), s.getMonth(), s.getDate() + 6)];
-  });
+  const wins = weekWindows();
+  const bounds = Array.from({length: n}, (_, i) =>
+    wins[i] || [weekStart(i), addDays(weekStart(i), 6)]);
   const km = Array(n).fill(0);
   runsList.forEach(r => {
     const d = localDate(r.date);
