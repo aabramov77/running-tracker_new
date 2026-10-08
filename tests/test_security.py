@@ -257,6 +257,119 @@ def test_plan_card_takes_what_the_form_and_the_import_send(api):
     assert {k: edited[k] for k in card} == {**card, "target_time": "1.4", "race_date": ""}
 
 
+# ── 2. Значение не того типа: профиль, конфиг LLM, тренер, реестр ─────────────
+# До правки список или объект на месте строки ронял хендлер (500), а ложное
+# значение не того типа молча принималось за «не передано».
+
+def _stored(fake_bucket, prefix):
+    return {name: data for name, data in fake_bucket._store.items() if name.startswith(prefix)}
+
+
+@pytest.mark.parametrize("profile", [[1, 2], "вес 70", 5, True, [], ""])
+def test_profile_that_is_not_an_object_is_rejected_and_nothing_is_stored(api, fake_bucket,
+                                                                        profile):
+    _rejected(_post(api, "/profile", {"profile": profile}), "profile")
+    assert not _stored(fake_bucket, "users/u1/athlete/")
+
+
+def test_profile_number_too_large_for_a_float_is_rejected(api, fake_bucket):
+    _rejected(_post(api, "/profile", {"profile": {"weight_kg": 10 ** 400}}), "weight_kg")
+    assert not _stored(fake_bucket, "users/u1/athlete/")
+
+
+@pytest.mark.parametrize("sent,stored", [
+    (5, "profile update"), (["вес"], "profile update"), ({"html": XSS}, "profile update"),
+    ("  вес\nпосле отпуска ", "вес после отпуска"), ("я" * 500, "я" * 200),
+])
+def test_profile_change_reason_is_stored_as_a_short_single_line(api, storage_module,
+                                                                fake_bucket, sent, stored):
+    """Причина — пометка в истории: не строка даёт причину по умолчанию, а не
+    отказ и не 500."""
+    assert _status(_post(api, "/profile", {"profile": {"weight_kg": 70},
+                                           "change_reason": sent})) == 201
+    manifest = storage_module.read_athlete_manifest(fake_bucket, "u1")
+    version = json.loads(fake_bucket.blob(manifest["gcs_object_path"]).download_as_text())
+    assert version["change_reason"] == stored and version["profile"]["weight_kg"] == 70
+
+
+def test_profile_from_the_form_is_stored_as_sent(api):
+    sent = {"sex": "m", "weight_kg": 70.5, "hr_max": 185, "available_days": ["mon", "sat"]}
+    body, code, _ = _post(api, "/profile", {"profile": sent})
+    assert code == 201, body
+    assert {field: json.loads(body)["profile"][field] for field in sent} == sent
+    # плоское тело без обёртки profile принималось и раньше
+    assert _json(_post(api, "/profile", {"weight_kg": 71}))["profile"]["weight_kg"] == 71
+
+
+LLM_CONFIG = {"provider": "openai", "model": "gpt-test", "api_key": "sk-test"}
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("api_key", 5, "Invalid api_key"), ("api_key", ["sk-test"], "Invalid api_key"),
+    ("api_key", {"key": "sk-test"}, "Invalid api_key"), ("api_key", True, "Invalid api_key"),
+    ("api_key", None, "Missing api_key"),
+    ("model", 5, "Invalid model"), ("model", ["gpt-test"], "Invalid model"),
+    ("model", {"id": "gpt-test"}, "Invalid model"), ("model", True, "Invalid model"),
+])
+def test_llm_config_value_of_a_wrong_type_is_rejected_and_nothing_is_stored(
+        api, fake_bucket, field, value, error):
+    body, code, _ = _post(api, "/config/llm", {**LLM_CONFIG, field: value}, **ADMIN)
+    assert (code, json.loads(body)) == (400, {"error": error})
+    assert not _stored(fake_bucket, "config/llm/")
+
+
+def test_llm_config_from_the_form_is_stored_with_the_key_trimmed(api, patched_api, fake_bucket):
+    assert _status(_post(api, "/config/llm", {**LLM_CONFIG, "api_key": "  sk-test\n"},
+                         **ADMIN)) == 201
+    cfg = patched_api.read_llm_config_full(fake_bucket)
+    assert (cfg["provider"], cfg["model"], cfg["api_key"]) == ("openai", "gpt-test", "sk-test")
+
+
+def _coach_picked(api):
+    """u1 выбрал тренером c1."""
+    api(FakeRequest("GET", "/me"), **COACH)
+    assert _status(_post(api, "/admin/users/coach", {"sub": "c1", "is_coach": True}, **ADMIN)) == 200
+    assert _status(_post(api, "/my/coach", {"coach_sub": "c1"})) == 200
+
+
+@pytest.mark.parametrize("coach_sub", [["c1"], {"sub": "c1"}, [], {}, 0, False])
+def test_coach_sub_of_a_wrong_type_is_rejected_and_the_coach_stays(api, coach_sub):
+    """Пустой список, ноль и false раньше читались как отказ от тренера."""
+    _coach_picked(api)
+    body, code, _ = _post(api, "/my/coach", {"coach_sub": coach_sub})
+    assert (code, json.loads(body)) == (400, {"error": "Invalid coach_sub"})
+    assert _json(api(FakeRequest("GET", "/my/coach")))["coach"]["sub"] == "c1"
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+def test_coach_is_still_dropped_by_an_empty_coach_sub(api, empty):
+    _coach_picked(api)
+    assert _status(_post(api, "/my/coach", {"coach_sub": empty})) == 200
+    assert _json(api(FakeRequest("GET", "/my/coach")))["coach"] is None
+
+
+def _registry_traces(fake_bucket, sub):
+    """Запись пользователя в реестре и имена событий о нём."""
+    record = json.loads(fake_bucket._store["users/registry.json"])["users"][sub]
+    return record, sorted(name for name in _stored(fake_bucket, "users/events/")
+                          if f"-{sub}-" in name)
+
+
+@pytest.mark.parametrize("path,extra", [("/admin/users/approve", {}), ("/admin/users/reject", {}),
+                                        ("/admin/users/coach", {"is_coach": True})])
+@pytest.mark.parametrize("sub", [["u2"], {"sub": "u2"}])
+def test_admin_action_on_a_sub_of_a_wrong_type_is_rejected_and_the_registry_stays(
+        api, fake_bucket, path, extra, sub):
+    api(FakeRequest("GET", "/me"), sub="u2", email="u2@example.com", approved=False)
+    before = _registry_traces(fake_bucket, "u2")
+
+    body, code, _ = _post(api, path, {"sub": sub, **extra}, **ADMIN)
+
+    assert (code, json.loads(body)) == (400, {"error": "Invalid sub"})
+    assert _registry_traces(fake_bucket, "u2") == before
+    assert before[0]["status"] == "pending"
+
+
 # ── 2. Предел размера тела ────────────────────────────────────────────────────
 
 def test_oversized_json_is_a_413_and_nothing_is_stored(api, patched_api, fake_bucket):

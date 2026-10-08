@@ -125,6 +125,8 @@ def h_admin_user_status(c):
     target = c.body().get("sub")
     if not target:
         return jresp({"error": "Missing sub"}, 400)
+    if not isinstance(target, str):
+        return jresp({"error": "Invalid sub"}, 400)
     status = "approved" if c.args[0] == "approve" else "rejected"
     rec = set_user_status(c.bucket, target, status, c.sub)
     if not rec:
@@ -137,6 +139,8 @@ def h_admin_user_coach(c):
     target = body.get("sub")
     if not target or not isinstance(body.get("is_coach"), bool):
         return jresp({"error": "Missing sub or is_coach"}, 400)
+    if not isinstance(target, str):
+        return jresp({"error": "Invalid sub"}, 400)
     rec = set_coach_flag(c.bucket, target, body["is_coach"], c.sub)
     if not rec:
         return jresp({"error": "user not found"}, 404)
@@ -161,8 +165,13 @@ def h_my_coach_post(c):
     body = c.body()
     if "coach_sub" not in body:
         return jresp({"error": "Missing coach_sub"}, 400)
+    coach_sub = body["coach_sub"]
+    # Отказ от тренера — это null или пустая строка. Ноль, false и пустой
+    # список отказом не считаются: снять тренера случайным значением нельзя.
+    if coach_sub is not None and not isinstance(coach_sub, str):
+        return jresp({"error": "Invalid coach_sub"}, 400)
     try:
-        set_user_coach(c.bucket, c.sub, body["coach_sub"])
+        set_user_coach(c.bucket, c.sub, coach_sub)
     except CoachLinkError as e:
         return jresp({"error": str(e)}, 400)
     return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
@@ -361,9 +370,14 @@ def h_llm_config_post(c):
     body = c.body()
     provider = body.get("provider")
     model = body.get("model")
-    api_key = body.get("api_key", "").strip()
+    api_key = body.get("api_key")
     if provider not in ("anthropic", "openai", "deepseek"):
         return jresp({"error": "Invalid provider"}, 400)
+    # Модель и ключ уходят провайдеру как есть: в конфиг пишется только текст.
+    for field, value in (("model", model), ("api_key", api_key)):
+        if value is not None and not isinstance(value, str):
+            return jresp({"error": f"Invalid {field}"}, 400)
+    api_key = (api_key or "").strip()
     if not model:
         return jresp({"error": "Missing model"}, 400)
     if not api_key:
@@ -596,12 +610,15 @@ def h_profile_get(c):
 
 def h_profile_post(c):
     body = c.body()
-    profile, errors = clean_athlete_profile(body.get("profile") or body)
+    # Профиль приходит в поле profile либо плоским телом. Что-то кроме объекта
+    # в profile — ошибка, а не повод взять вместо него тело.
+    raw = body.get("profile")
+    profile, errors = clean_athlete_profile(body if raw is None else raw)
     if errors:
-        return jresp({"error": "validation_failed", "fields": errors}, 400)
+        return validation_failed(errors)
     payload = write_athlete_version(
         c.bucket, c.sub, profile,
-        change_reason=(body.get("change_reason") or "").strip(),
+        change_reason=clean_change_reason(body.get("change_reason")),
         created_by=c.email)
     return jresp(profile_response(c.bucket, c.sub, profile,
                                   payload["version"], payload["created_at"]), 201)

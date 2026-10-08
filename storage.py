@@ -320,6 +320,8 @@ def empty_athlete_profile():
 
 def clean_athlete_profile(raw):
     """Валидация и нормализация входных данных. Возвращает (профиль, ошибки)."""
+    if not isinstance(raw, dict):
+        return empty_athlete_profile(), {"profile": "ожидается объект"}
     errors = {}
     profile = {}
     day_codes = [code for code, _ in PLAN_DAYS]
@@ -363,7 +365,7 @@ def clean_athlete_profile(raw):
             continue
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             errors[field] = "ожидается число"
             profile[field] = None
             continue
