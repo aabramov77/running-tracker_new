@@ -313,6 +313,229 @@ def test_ai_coach_answers_are_escaped_before_markup():
     assert "localStorage" not in section
 
 
+# ── Данные с сервера в разметке (#53) ─────────────────────────────────────────
+# Пробежки, старты и план тренеру показывает спортсмен, а записать в них он
+# мог что угодно. Поле, вставленное в разметку как есть, исполняется в сессии
+# того, кто на него смотрит.
+
+def js_templates(src):
+    """Шаблонные литералы: [(свой текст, [свои подстановки], номер строки)].
+
+    Подстановка отдаётся без вложенных шаблонов (на их месте ``; сами они идут
+    отдельными записями), без комментариев, со строками, сведёнными к ''.
+    """
+    found, stack = [], []    # кадр — шаблон {"text", "exprs", "line"} или код {"code", "depth"}
+    recent = ""              # хвост кода: по нему отличаем regex от деления
+    i, n = 0, len(src)
+
+    def emit(piece):
+        nonlocal recent
+        if stack and "code" in stack[-1]:
+            stack[-1]["code"].append(piece)
+        recent = (recent + piece)[-16:]
+
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        top = stack[-1] if stack else None
+
+        if top is not None and "text" in top:               # внутри `...`
+            if ch == "\\":
+                top["text"].append(src[i:i + 2])
+                i += 2
+            elif ch == "`":
+                stack.pop()
+                found.append(("".join(top["text"]), top["exprs"], top["line"]))
+                emit("``")
+                i += 1
+            elif ch == "$" and nxt == "{":
+                stack.append({"code": [], "depth": 0})
+                recent = "{"
+                i += 2
+            else:
+                top["text"].append(ch)
+                i += 1
+            continue
+
+        if ch == "/" and nxt == "/":                        # комментарии
+            j = src.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if ch == "/" and nxt == "*":
+            j = src.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        if ch in "\"'":                                     # строка
+            j = i + 1
+            while j < n and src[j] != ch:
+                j += 2 if src[j] == "\\" else 1
+            emit("''")
+            i = j + 1
+            continue
+        if ch == "`":
+            stack.append({"text": [], "exprs": [], "line": src.count("\n", 0, i) + 1})
+            i += 1
+            continue
+        if ch == "/":                                       # regex-литерал?
+            tail = recent.rstrip()
+            if not tail or tail[-1] in _REGEX_PREV_PUNCT or tail.endswith(_REGEX_PREV_WORDS):
+                j, in_class, closed = i + 1, False, False
+                while j < n and src[j] != "\n":
+                    if src[j] == "\\":
+                        j += 2
+                        continue
+                    if src[j] == "[":
+                        in_class = True
+                    elif src[j] == "]":
+                        in_class = False
+                    elif src[j] == "/" and not in_class:
+                        closed = True
+                        break
+                    j += 1
+                if closed:
+                    j += 1
+                    while j < n and src[j].isalpha():
+                        j += 1
+                    emit("/re/")
+                    i = j
+                    continue
+
+        if top is not None:                                 # код подстановки
+            if ch == "{":
+                top["depth"] += 1
+            elif ch == "}":
+                if top["depth"] == 0:
+                    stack.pop()
+                    stack[-1]["exprs"].append("".join(top["code"]).strip())
+                    recent = "x"
+                    i += 1
+                    continue
+                top["depth"] -= 1
+        emit(ch)
+        i += 1
+
+    assert not stack, "шаблонный литерал не закрыт — сканер сбился"
+    return found
+
+
+# Что считается обезвреженным: экранирование, приведение к числу и функции,
+# которые сами собирают разметку или текст из своих аргументов.
+_SAFE_CALLS = ("escapeHtml", "Number", "km1", "chatTime", "mdLite", "ddmm", "secondsToTime",
+               "plannedKmLabel", "dayFactHtml", "aiRunChipHtml", "aiProposalHtml",
+               "runItemHtml", "kmCell", "dayCell", "inp", "typeSel", "hero")
+# Словари подписей в коде: значение берётся из них, а не из данных.
+_SAFE_MAPS = r"(?:[A-Z][A-Z_0-9]*|label|feelEmoji|typeLabels|statusLabel)"
+_MARKUP = re.compile(r"</?[a-zA-Z]")
+_DATA_FIELD = re.compile(r"(?<![\w.$])[a-z_]\w*(?:\?\.|\.)(?!length\b)[A-Za-z_]\w*(?!\w*\s*\()"
+                         r"|(?<![\w.$])[a-z_]\w*\[")
+
+
+def _drop_calls(expr, names):
+    """Убирает вызовы names(...) целиком, со сбалансированными скобками."""
+    pattern = re.compile(r"(?<![\w.$])(?:%s)\s*\(" % "|".join(names))
+    while True:
+        m = pattern.search(expr)
+        if not m:
+            return expr
+        depth, j = 1, m.end()
+        while j < len(expr) and depth:
+            depth += {"(": 1, ")": -1}.get(expr[j], 0)
+            j += 1
+        expr = expr[:m.start()] + expr[j:]
+
+
+def raw_field_in(expr):
+    """Поле данных, которое подстановка выводит как есть; None — такого нет."""
+    emitted = re.split(r"(?<!\?)\?(?![.?])", expr, maxsplit=1)[-1]   # условие тернарника не выводится
+    emitted = _drop_calls(emitted, _SAFE_CALLS)
+    emitted = re.sub(_SAFE_MAPS + r"\[[^\]]*\]", "", emitted)
+    m = _DATA_FIELD.search(emitted)
+    return m.group(0) if m else None
+
+
+def unescaped_interpolations(js):
+    """Подстановки в шаблонах с разметкой, выводящие поле данных как есть."""
+    return [f"строка {line}: ${{{expr}}}"
+            for text, exprs, line in js_templates(js) if _MARKUP.search(text)
+            for expr in exprs if raw_field_in(expr)]
+
+
+def test_markup_scanner_tells_raw_fields_from_escaped_ones():
+    """Страховка для самой проверки — иначе она молча пропустит что угодно."""
+    def found(js):
+        return [raw_field_in(e) for text, exprs, _ in js_templates(js)
+                if _MARKUP.search(text) for e in exprs]
+
+    # так выглядели дыры до #53
+    assert found("x = `<b>${r.hr?r.hr+' уд/мин':''}</b>`;") == ["r.hr"]
+    assert found("x = `<td>${r.w ?? i+1}</td>`;") == ["r.w"]
+    assert found("x = `<span>${r.date.slice(0,4)}</span>`;") == ["r.date"]
+    assert found("x = `<button onclick=\"deleteRun(${r.id})\">`;") == ["r.id"]
+    assert found("x = `<td>${r[f]}</td>`;") == ["r["]
+    # а так — обезврежено или вовсе не данные
+    for safe in ("`<b>${r.hr?escapeHtml(r.hr)+' уд/мин':''}</b>`",
+                 "`<td>${escapeHtml(r.w ?? i+1)}</td>`",
+                 "`<button onclick=\"deleteRun(${Number(r.id)})\">`",
+                 "`<tr class=\"${r.type==='race'?'race-week':''}\">`",
+                 "`<span class=\"${PLAN_BADGE[r.type]||''}\">${label[d.field]}</span>`",
+                 "`<i>${rows.map(r => `<b>${escapeHtml(r.name)}</b>`).join('')} из ${plan.length}</i>`"):
+        assert found("x = " + safe + ";") in ([None], [None, None], [None, None, None]), safe
+    # вложенный шаблон проверяется сам по себе, а не прячется во внешнем
+    assert found("x = `<i>${list.map(r => `<b>${r.name}</b>`).join('')}</i>`;") == ["r.name", None]
+    # шаблон без разметки (текст для textContent, адрес) не трогаем
+    assert found("x = `HTTP ${res.status}`; y = `${API_URL}plans/${plan.id}/weeks`;") == []
+    # кавычки и скобки внутри regex и строк сканер не сбивают
+    assert found("a = /[\",`]/.test(s) ? '`' : \"${\"; x = `<b>${r.id}</b>`;") == ["r.id"]
+
+
+def test_server_values_are_escaped_before_markup():
+    """Ни одна подстановка в разметке не выводит поле данных как есть.
+
+    Если тест упал на новой строке — оберните значение в escapeHtml (или в
+    Number, если это число). Функцию, которая сама собирает разметку из
+    аргументов, допишите в _SAFE_CALLS, а её шаблоны проверятся отдельно.
+    """
+    leaks = unescaped_interpolations(APP_JS.read_text(encoding="utf-8"))
+    assert not leaks, "поле данных в разметке без экранирования:\n" + "\n".join(leaks)
+
+
+def test_run_and_race_ids_reach_inline_handlers_only_as_numbers():
+    """Внутри onclick escapeHtml не спасает: строка там исполняется как код.
+    Поэтому id пробежки и старта попадает в обработчик только через Number()."""
+    js = APP_JS.read_text(encoding="utf-8")
+    calls = re.findall(r"(?:showRunDetail|showCoachRunDetail|deleteRun|deleteRace|aiReviewRun)"
+                       r"\(\$\{([^}]*)\}\)", js)
+    assert len(calls) >= 7, "обработчики с id найдены не все — проверка устарела"
+    for arg in calls:
+        assert arg == "id" or re.fullmatch(r"Number\((?:r\.id|runId)\)", arg), arg
+    # «id» — локальная переменная строки журнала, уже приведённая к числу
+    assert "const id = Number(r.id);" in _js_section(js, "function runItemHtml(", "\n}\n")
+    assert not re.search(r"\$\{\s*r\.id\s*\}", js)
+
+
+def test_run_card_and_plan_escape_what_the_athlete_typed():
+    """Карточка пробежки собирает строки массивом, мимо шаблона с разметкой —
+    общая проверка её не видит, поэтому поля названы поимённо."""
+    js = APP_JS.read_text(encoding="utf-8")
+    card = _js_section(js, "function openRunDetail(", "\n}\n")
+    assert "escapeHtml(run.hr)" in card and "${run.hr}" not in card
+    assert "feelLabels[run.feel] || escapeHtml(run.feel)" in card
+    row = _js_section(js, "function runItemHtml(", "\n}\n")
+    assert "escapeHtml(r.hr)" in row
+    for body in (_js_section(js, "function planViewRowsHtml(", "\n}\n"),
+                 _js_section(js, "function planWeekHtml(", "\n}\n")):
+        assert "escapeHtml(r.w ??" in body and "${r.w" not in body
+
+
+def test_a_date_that_is_not_a_string_does_not_break_rendering():
+    """У записи, сохранённой до проверки полей, дата может быть числом или
+    null: r.date.slice тогда роняет отрисовку всего списка."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "r.date.slice" not in js and ".date.localeCompare(" not in js
+    for name in ("runItemHtml", "renderRaces"):
+        assert "String(r.date ?? '')" in _js_section(js, f"function {name}(", "\n}\n"), name
+
+
 def test_coach_screen_keeps_out_of_own_data():
     """Экран тренера держит чужие данные в COACH. Запись в свои runs/PLAN или
     в localStorage отправила бы чужие пробежки в кэш и офлайн-синхронизацию."""
