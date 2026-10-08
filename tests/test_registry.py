@@ -3,7 +3,8 @@ legacy migration — against the in-memory fake bucket."""
 import pytest
 
 
-ADMIN_TOKEN = {"sub": "admin-sub", "email": "aabramov77@gmail.com", "name": "Alex"}
+ADMIN_TOKEN = {"sub": "admin-sub", "email": "aabramov77@gmail.com",
+               "email_verified": True, "name": "Alex"}
 USER_TOKEN = {"sub": "u1", "email": "runner@example.com", "name": "Runner"}
 
 
@@ -321,7 +322,8 @@ def test_coach_writes_do_not_clobber_another_instances_change(storage_module, fa
     storage_module.set_user_coach(fake_bucket, "u1", "c1")
     storage_module.set_coach_flag(fake_bucket, "c1", True, "admin-sub")
 
-    stored = json.loads(blob.download_as_text())["users"]
+    # blob помнит поколение своей записи, как настоящий Blob, — читаем заново
+    stored = json.loads(fake_bucket.blob("users/registry.json").download_as_text())["users"]
     assert "u9" in stored
     assert stored["u1"]["coach_sub"] == "c1"
 
@@ -369,7 +371,8 @@ def test_stale_instance_does_not_bring_a_dropped_coach_back(storage_module, fake
     storage_module.resolve_user(fake_bucket, {"sub": "u7", "email": "n@example.com", "name": "N"})
     storage_module.set_user_status(fake_bucket, "u7", "approved", "admin-sub")
 
-    assert json.loads(blob.download_as_text())["users"]["u1"]["coach_sub"] is None
+    stored = json.loads(fake_bucket.blob("users/registry.json").download_as_text())
+    assert stored["users"]["u1"]["coach_sub"] is None
     assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
 
 

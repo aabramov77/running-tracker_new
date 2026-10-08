@@ -7,6 +7,7 @@ config → domain/llm_prompt → storage → api → main.
 import hashlib
 import io
 import json
+import math
 import re
 import secrets as secrets_mod
 import time
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta
 
 import httpx
 from fitparse import FitFile
+from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage as gcs
 
 from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
@@ -23,7 +25,8 @@ from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
 from compliance import (DEFAULT as UNDATED, anchor_source,
                         current_week_idx, plan_compliance,
                         planned_for_date, to_date, week_days, week_window)
-from domain import HR_ZONE_BOUNDS, PLAN_DAYS, TYPE_LABELS, personal_bests
+from domain import (DIST_LABEL_KM, FEEL_LABELS, HR_ZONE_BOUNDS, PLAN_DAYS,
+                    TYPE_LABELS, personal_bests)
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_plan_window,
                         format_run_focus)
@@ -91,6 +94,168 @@ def write_runs(bucket, sub, runs):
         json.dumps(runs, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
+
+
+# ── Проверка входных данных (#53) ─────────────────────────────────────────────
+#
+# Тело запроса — недоверенный JSON: любой тип, любая длина. Функции clean_*
+# устроены как clean_athlete_profile ниже: возвращают (значение, {поле: что не
+# так}). При непустых ошибках хендлер отвечает 400 validation_failed и ничего
+# не пишет. Проверяется только то, что пишется сейчас: чтение к записям,
+# сохранённым раньше, остаётся терпимым.
+
+SHORT_TEXT_MAX = 32          # время, темп, даты и тип недели, даты гонки
+TITLE_MAX = 200              # название старта и гонки, акцент недели
+RUN_NOTES_MAX = 2000
+RUN_DIST_MAX_KM = 1000
+RUN_HR_MIN, RUN_HR_MAX = 30, 250
+MAX_ID = 2 ** 53 - 1         # целые, которые JavaScript хранит без потерь
+PLAN_WEEKS_MAX = 104         # два года по строке на неделю
+PLAN_WEEK_NUMBER_MAX = 999
+PLAN_DAY_TEXT_MAX = 500
+CHANGE_REASON_MAX = 200
+# Формат токена — тот, что выдаёт write_parsed_fit_to_tmp: токен уходит в путь.
+_FIT_TOKEN_RE = re.compile(r"^[0-9]{1,12}-[0-9a-f]{8}$")
+_ISO_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+def _clean_text(value, limit):
+    """(строка, ошибка). None — пустая строка, число приводится к строке."""
+    if value is None:
+        return "", None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return "", "ожидается строка"
+    text = value if isinstance(value, str) else str(value)
+    if len(text) > limit:
+        return "", f"длиннее {limit} символов"
+    return text, None
+
+
+def _clean_number(value, low, high):
+    """Конечное число из [low, high] или None. Строка с числом годится."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and low <= number <= high else None
+
+
+def _clean_id(value):
+    """Целый положительный id или None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 < value <= MAX_ID else None
+
+
+def _clean_date(value):
+    """'ГГГГ-ММ-ДД' существующего дня или None."""
+    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return value
+
+
+def _clean_choice(value, allowed, default=None):
+    """Значение из словаря допустимых; None — default. Иначе None."""
+    if value is None:
+        return default
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def _clean_entity_head(raw, entity, errors):
+    """id и дата — общие для пробежки и старта. id может не прийти: тогда
+    его выдаёт сервер."""
+    if raw.get("id") is None:
+        entity["id"] = None
+    else:
+        entity["id"] = _clean_id(raw["id"])
+        if entity["id"] is None:
+            errors["id"] = "ожидается целое положительное число"
+    entity["date"] = _clean_date(raw.get("date"))
+    if entity["date"] is None:
+        errors["date"] = "ожидается формат ГГГГ-ММ-ДД"
+
+
+def _clean_text_fields(raw, entity, errors, limits, prefix=""):
+    for field, limit in limits.items():
+        entity[field], error = _clean_text(raw.get(field), limit)
+        if error:
+            errors[prefix + field] = error
+
+
+def clean_run(raw, plans_index):
+    """Пробежка из тела запроса → (пробежка, ошибки).
+
+    id, plan_id и fit_token в результате могут быть None: id тогда выдаёт
+    сервер, пробежка уходит в активный план, FIT к ней не приложен. plan_id
+    принимается только из своего реестра планов (plans_index).
+    """
+    run, errors = {}, {}
+    _clean_entity_head(raw, run, errors)
+
+    run["dist"] = _clean_number(raw.get("dist"), 0, RUN_DIST_MAX_KM)
+    if not run["dist"]:
+        errors["dist"] = f"ожидается число больше 0 и не больше {RUN_DIST_MAX_KM}"
+
+    for field, allowed, default in (("type", TYPE_LABELS, "easy"),
+                                    ("feel", FEEL_LABELS, "good")):
+        run[field] = _clean_choice(raw.get(field), allowed, default)
+        if run[field] is None:
+            errors[field] = "допустимо: " + ", ".join(allowed)
+
+    run["hr"] = None
+    if raw.get("hr") not in (None, ""):
+        pulse = _clean_number(raw["hr"], RUN_HR_MIN, RUN_HR_MAX)
+        if pulse is None:
+            errors["hr"] = f"ожидается целое от {RUN_HR_MIN} до {RUN_HR_MAX}"
+        else:
+            run["hr"] = int(round(pulse))
+
+    _clean_text_fields(raw, run, errors, {"time": SHORT_TEXT_MAX, "pace": SHORT_TEXT_MAX,
+                                          "notes": RUN_NOTES_MAX})
+
+    plan_id = raw.get("plan_id")
+    run["plan_id"] = None
+    if plan_id not in (None, ""):
+        if isinstance(plan_id, str) and find_plan(plans_index, plan_id):
+            run["plan_id"] = plan_id
+        else:
+            errors["plan_id"] = "нет такого плана"
+
+    token = raw.get("fit_token")
+    run["fit_token"] = None
+    if token not in (None, ""):
+        if isinstance(token, str) and _FIT_TOKEN_RE.match(token):
+            run["fit_token"] = token
+        else:
+            errors["fit_token"] = "неверный формат"
+    return run, errors
+
+
+def clean_race(raw):
+    """Старт из тела запроса → (старт, ошибки). id может быть None."""
+    race, errors = {}, {}
+    _clean_entity_head(raw, race, errors)
+    _clean_text_fields(raw, race, errors, {"name": TITLE_MAX, "time": SHORT_TEXT_MAX})
+    for field in ("name", "time"):
+        race[field] = race[field].strip()
+        if not race[field]:
+            errors.setdefault(field, "не заполнено")
+    race["dist_label"] = _clean_choice(raw.get("dist_label"), DIST_LABEL_KM)
+    if race["dist_label"] is None:
+        errors["dist_label"] = "допустимо: " + ", ".join(DIST_LABEL_KM)
+    return race, errors
+
+
+def clean_change_reason(value):
+    """Причина правки в одну строку. Это пометка в истории, а не данные:
+    лишнее обрезается, не-строка даёт пустую причину."""
+    return " ".join(value.split())[:CHANGE_REASON_MAX] if isinstance(value, str) else ""
 
 
 # ── Legacy race profile (до #25 здесь жили гонка, цель и старт плана) ─────────
@@ -472,11 +637,11 @@ def parse_fit_file(fit_bytes):
 
 
 def read_run_details(bucket, sub, run_id):
-    """Читает детали пробежки из namespace пользователя.
+    """Читает детали пробежки из namespace пользователя (sub — владелец данных).
     Ленивый fallback: если в per-user namespace деталей нет, но есть legacy
     (глобальные) — копирует их в namespace и возвращает. Вызывающий обязан
     заранее убедиться, что run_id принадлежит этому пользователю (есть в его
-    runs.json) — иначе ленивый fallback мог бы утащить чужие данные.
+    runs.json).
     """
     man_blob = bucket.blob(p_run_manifest(sub, run_id))
     if man_blob.exists():
@@ -484,7 +649,12 @@ def read_run_details(bucket, sub, run_id):
         details_blob = bucket.blob(manifest["gcs_object_path"])
         return json.loads(details_blob.download_as_text()) if details_blob.exists() else None
 
-    # Ленивый перенос legacy (только данные Alexander'а до multi-user)
+    # Ленивый перенос legacy — только владельцу этих данных, то есть админу
+    # (#53). Проверки «run_id есть в runs.json» мало: id пробежки задаёт
+    # клиент, и совпадение с чужим legacy-id отдало бы чужую тренировку.
+    # Тренер админа сюда приходит с sub админа и детали по-прежнему видит.
+    if not _is_admin(bucket, sub):
+        return None
     legacy_man = bucket.blob(legacy_run_manifest(run_id))
     if not legacy_man.exists():
         return None
@@ -700,6 +870,56 @@ def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="a
 # ── Plans registry (#25: несколько планов на пользователя) ────────────────────
 
 PLAN_META_FIELDS = ("race_name", "race_date", "target_time", "plan_start")
+PLAN_META_LIMITS = {"race_name": TITLE_MAX, "race_date": SHORT_TEXT_MAX,
+                    "target_time": SHORT_TEXT_MAX, "plan_start": SHORT_TEXT_MAX}
+PLAN_WEEK_LIMITS = {"start": SHORT_TEXT_MAX, "end": SHORT_TEXT_MAX,
+                    "accent": TITLE_MAX, "type": SHORT_TEXT_MAX,
+                    **{day: PLAN_DAY_TEXT_MAX for day, _ in PLAN_DAYS}}
+
+
+def clean_plan_meta(raw):
+    """Карточка плана из тела запроса → (поля, ошибки). В результате только
+    те поля, что пришли: правка карточки меняет лишь их (#53)."""
+    meta, errors = {}, {}
+    present = {f: limit for f, limit in PLAN_META_LIMITS.items() if f in raw}
+    _clean_text_fields(raw, meta, errors, present)
+    return meta, errors
+
+
+def _clean_week_number(value):
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= PLAN_WEEK_NUMBER_MAX else None
+
+
+def clean_plan_weeks(raw):
+    """Недели плана из тела запроса → (недели, ошибки) (#53).
+
+    В неделе остаются только известные поля, остальное отбрасывается. Чего в
+    запросе не было, то и не появляется: планы до #23 хранятся без вт и чт,
+    и отрисовка это понимает.
+    """
+    if not isinstance(raw, list):
+        return [], {"weeks": "ожидается список недель"}
+    if len(raw) > PLAN_WEEKS_MAX:
+        return [], {"weeks": f"не больше {PLAN_WEEKS_MAX} недель"}
+    weeks, errors = [], {}
+    for i, item in enumerate(raw):
+        where = f"weeks[{i}]"
+        if not isinstance(item, dict):
+            errors[where] = "ожидается объект недели"
+            continue
+        week = {}
+        if item.get("w") is not None:
+            week["w"] = _clean_week_number(item["w"])
+            if week["w"] is None:
+                errors[f"{where}.w"] = f"ожидается целое от 0 до {PLAN_WEEK_NUMBER_MAX}"
+        present = {f: limit for f, limit in PLAN_WEEK_LIMITS.items() if f in item}
+        _clean_text_fields(item, week, errors, present, prefix=where + ".")
+        weeks.append(week)
+    return weeks, errors
 
 
 def _empty_plans_index():
@@ -1311,13 +1531,70 @@ def read_advice_usage(bucket, sub):
     return data
 
 
-def increment_advice_usage(bucket, sub):
-    usage = read_advice_usage(bucket, sub)
-    usage["count"] = usage.get("count", 0) + 1
-    bucket.blob(p_advice_usage(sub)).upload_from_string(
-        json.dumps(usage, ensure_ascii=False), content_type="application/json"
-    )
-    return usage
+# Счётчик — один объект на пользователя, и «прочитал, прибавил, записал» из
+# двух запросов разом теряет одно из прибавлений. Поэтому запись идёт с
+# предусловием: она проходит, только если объект с момента чтения не меняли
+# (if_generation_match). Не прошла — читаем заново и повторяем (#53; та же
+# основа нужна версионным записям, #35).
+USAGE_WRITE_ATTEMPTS = 8
+
+
+class UsageBusy(Exception):
+    """Счётчик не удалось обновить: его всё время меняют параллельные запросы."""
+
+
+def _update_advice_usage(bucket, sub, change):
+    """Меняет сегодняшний счётчик атомарно. change(usage) правит его на месте
+    и возвращает False, если записывать нечего. Возвращает счётчик или None."""
+    path = p_advice_usage(sub)
+    today = datetime.utcnow().date().isoformat()
+    for _ in range(USAGE_WRITE_ATTEMPTS):
+        try:
+            blob = bucket.get_blob(path)            # вместе с номером поколения
+            usage = json.loads(blob.download_as_text()) if blob else {}
+            if usage.get("date") != today:
+                usage = {"date": today, "count": 0}
+            if change(usage) is False:
+                return None
+            bucket.blob(path).upload_from_string(
+                json.dumps(usage, ensure_ascii=False), content_type="application/json",
+                if_generation_match=blob.generation if blob else 0)
+            return usage
+        except (PreconditionFailed, NotFound):
+            continue        # счётчик успели изменить — берём свежий
+    raise UsageBusy()
+
+
+def reserve_advice_usage(bucket, sub, limit):
+    """Занимает одну попытку за сегодня до обращения к модели.
+
+    None — лимит исчерпан. Проверка и прибавление — одна атомарная запись,
+    поэтому одновременные запросы не проходят лимит все разом. UsageBusy —
+    счётчик не поддался: попытка не занята, модель звать нельзя.
+    """
+    def take(usage):
+        if usage.get("count", 0) >= limit:
+            return False
+        usage["count"] = usage.get("count", 0) + 1
+
+    return _update_advice_usage(bucket, sub, take)
+
+
+def release_advice_usage(bucket, sub):
+    """Возвращает занятую попытку: ответа от модели не получили.
+
+    Сбой здесь не поднимается: попытка просто остаётся потраченной — это
+    хуже для пользователя, но не для лимита.
+    """
+    def give_back(usage):
+        if usage.get("count", 0) <= 0:
+            return False                 # сутки сменились — возвращать нечего
+        usage["count"] -= 1
+
+    try:
+        _update_advice_usage(bucket, sub, give_back)
+    except UsageBusy:
+        pass
 
 
 # ── User registry (мульти-пользователь) ──────────────────────────────────────
@@ -1378,13 +1655,19 @@ def append_user_event(bucket, sub, event, actor, details=None):
     )
 
 
+def _is_admin(bucket, sub):
+    """Админ ли пользователь по реестру. Роль выдаётся один раз при
+    регистрации и не меняется, поэтому кэша реестра здесь достаточно."""
+    return (read_registry(bucket).get("users", {}).get(sub) or {}).get("role") == "admin"
+
+
 class RegistrationClosed(Exception):
     """Поднимается, когда лимит pending достигнут — новых не регистрируем."""
 
 
 def resolve_user(bucket, token_info):
     """Находит/создаёт запись пользователя по Google sub. Возвращает запись реестра.
-    Новый sub → pending (или approved+admin если email в ADMIN_EMAILS).
+    Новый sub → pending (или approved+admin, если подтверждённый email в ADMIN_EMAILS).
     Поднимает RegistrationClosed при переполнении pending.
     """
     sub = token_info.get("sub")
@@ -1403,7 +1686,10 @@ def resolve_user(bucket, token_info):
         return users[sub]
 
     now = datetime.utcnow().isoformat() + "Z"
-    is_admin = email in ADMIN_EMAILS
+    # Совпадения адреса мало: админом делает только адрес, который Google
+    # подтвердил (#53). Иначе это обычная заявка, как у всех.
+    verified = token_info.get("email_verified")
+    is_admin = email in ADMIN_EMAILS and (verified is True or verified == "true")
     if not is_admin:
         pending = sum(1 for u in users.values() if u.get("status") == "pending")
         if pending >= MAX_PENDING:

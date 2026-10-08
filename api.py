@@ -5,6 +5,7 @@
 наоборот.
 """
 import json
+import logging
 import re
 from datetime import datetime
 
@@ -13,23 +14,25 @@ from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 
 from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
-                    DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS)
+                    DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS,
+                    MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
-                     LLMTruncated, PlanStale, RegistrationClosed, _fmt_duration,
-                     _fmt_pace,
+                     LLMTruncated, PlanStale, RegistrationClosed, UsageBusy,
+                     _fmt_duration, _fmt_pace,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
                      attach_fit_details_to_run, build_ai_turn,
                      build_plan_compliance, call_llm,
                      chat_unread, mark_chat_read, read_chat,
-                     clean_ai_text, clean_athlete_profile, clean_effort,
-                     clean_proposal,
+                     clean_ai_text, clean_athlete_profile, clean_change_reason,
+                     clean_effort, clean_plan_meta, clean_plan_weeks,
+                     clean_proposal, clean_race, clean_run,
                      cleanup_old_tmp, coach_can_access,
                      compute_athlete_derived, create_ai_thread, create_plan,
                      current_coach, find_own_run, find_plan, get_active_plan,
-                     get_storage_client, increment_advice_usage,
+                     get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
                      mark_proposal_states, mask_key,
                      migrate_legacy_to_user, parse_coach_reply, parse_fit_file,
@@ -39,6 +42,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      read_llm_config_full, read_plan_state, read_plan_weeks,
                      read_plans_index,
                      read_races, read_registry, read_run_details, read_runs,
+                     release_advice_usage, reserve_advice_usage,
                      resolve_user, run_title, save_plan_weeks, set_active_plan,
                      set_coach_flag, set_user_coach, set_user_status,
                      update_plan_meta,
@@ -77,6 +81,11 @@ def jresp(obj, code, extra_headers=None):
     return (json.dumps(obj, ensure_ascii=False, default=str), code, headers)
 
 
+def validation_failed(errors):
+    """Ответ на тело, не прошедшее clean_* из storage: {поле: что не так}."""
+    return jresp({"error": "validation_failed", "fields": errors}, 400)
+
+
 class Ctx:
     """Всё, что нужно хендлеру: запрос, бакет, пользователь и группы из пути."""
 
@@ -90,7 +99,19 @@ class Ctx:
         self.args = args          # группы из регулярного выражения пути
 
     def body(self):
-        return self.request.get_json(silent=True) or {}
+        """JSON-объект из тела; всё остальное (массив, число, не JSON) — {}."""
+        data = self.request.get_json(silent=True)
+        return data if isinstance(data, dict) else {}
+
+    def query_id(self):
+        """(?id= как целое, None) либо (None, готовый ответ 400)."""
+        raw = self.request.args.get("id")
+        if not raw:
+            return None, jresp({"error": "Missing id parameter"}, 400)
+        try:
+            return int(raw), None
+        except (TypeError, ValueError):
+            return None, jresp({"error": "Invalid id parameter"}, 400)
 
 
 # ── Хендлеры ──────────────────────────────────────────────────────────────────
@@ -418,10 +439,14 @@ def h_advise_preview(c):
 # Все маршруты работают только с c.sub: чужой разбор недостижим по построению
 # пути, отдельной проверки доступа здесь нет и быть не должно.
 
+def _ai_limit(c):
+    return ADMIN_DAILY_AI_COACH_LIMIT if c.is_admin else DAILY_AI_COACH_LIMIT
+
+
 def _ai_usage(c):
     """Израсходовано и разрешено сообщений за сутки."""
-    limit = ADMIN_DAILY_AI_COACH_LIMIT if c.is_admin else DAILY_AI_COACH_LIMIT
-    return {"count": read_advice_usage(c.bucket, c.sub).get("count", 0), "limit": limit}
+    return {"count": read_advice_usage(c.bucket, c.sub).get("count", 0),
+            "limit": _ai_limit(c)}
 
 
 def h_ai_threads_get(c):
@@ -477,19 +502,34 @@ def h_ai_message_post(c):
     cfg = read_llm_config_full(c.bucket)
     if not cfg or not cfg.get("api_key"):
         return jresp({"error": "LLM config not set. Обратитесь к администратору."}, 400)
-    usage = _ai_usage(c)
-    if usage["count"] >= usage["limit"]:
-        return jresp({"error": "daily_limit_reached", "limit": usage["limit"]}, 429)
-
-    turn = build_ai_turn(c.bucket, c.sub, thread,
-                         read_ai_messages(c.bucket, c.sub, thread["id"]), run=run)
-    llm_res, failure = _ask_llm(cfg, turn["system"], text, history=turn["history"])
-    if failure:
-        return failure
+    # Попытка занимается до обращения к модели (#53). «Лимит не исчерпан» и
+    # прибавление — одна атомарная запись: при проверке до вызова и прибавлении
+    # после одновременные запросы проходили проверку все разом.
+    limit = _ai_limit(c)
     try:
-        reply, envelope = parse_coach_reply(llm_res["text"])
-    except ValueError as e:
-        return jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+        reserved = reserve_advice_usage(c.bucket, c.sub, limit)
+    except UsageBusy:
+        return jresp({"error": "usage_busy"}, 429)
+    if reserved is None:
+        return jresp({"error": "daily_limit_reached", "limit": limit}, 429)
+    usage = {"count": reserved["count"], "limit": limit}
+
+    # Ответа нет — попытка возвращается: сбой модели пользователю не в счёт.
+    try:
+        turn = build_ai_turn(c.bucket, c.sub, thread,
+                             read_ai_messages(c.bucket, c.sub, thread["id"]), run=run)
+        llm_res, failure = _ask_llm(cfg, turn["system"], text, history=turn["history"])
+        if not failure:
+            try:
+                reply, envelope = parse_coach_reply(llm_res["text"])
+            except ValueError as e:
+                failure = jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+    except Exception:
+        release_advice_usage(c.bucket, c.sub)
+        raise
+    if failure:
+        release_advice_usage(c.bucket, c.sub)
+        return failure
 
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
@@ -519,7 +559,6 @@ def h_ai_message_post(c):
     })
     if proposal:
         answer = {**answer, "proposal_state": "open"}
-    usage["count"] = increment_advice_usage(c.bucket, c.sub)["count"]
     return jresp({"messages": [question, answer], "usage": usage}, 201)
 
 
@@ -573,17 +612,24 @@ def h_races_get(c):
     return jresp(active, 200)
 
 
+def _new_id():
+    return int(datetime.now().timestamp() * 1000)
+
+
 def h_races_post(c):
-    body = c.request.get_json(silent=True)
+    body = c.body()
     if not body:
         return jresp({"error": "Invalid JSON"}, 400)
     for field in ["name", "date", "dist_label", "time"]:
         if field not in body:
             return jresp({"error": f"Missing field: {field}"}, 400)
+    clean, errors = clean_race(body)
+    if errors:
+        return validation_failed(errors)
     race = {
-        "id": body.get("id", int(datetime.now().timestamp() * 1000)),
-        "name": body["name"], "date": body["date"],
-        "dist_label": body["dist_label"], "time": body["time"],
+        "id": clean["id"] or _new_id(),
+        "name": clean["name"], "date": clean["date"],
+        "dist_label": clean["dist_label"], "time": clean["time"],
         "deleted": False,
     }
     all_races = read_races(c.bucket, c.sub)
@@ -594,11 +640,10 @@ def h_races_post(c):
 
 
 def h_races_delete(c):
-    race_id = c.request.args.get("id")
-    if not race_id:
-        return jresp({"error": "Missing id parameter"}, 400)
+    race_id, bad = c.query_id()
+    if bad:
+        return bad
     all_races = read_races(c.bucket, c.sub)
-    race_id = int(race_id)
     target = next((r for r in all_races if r.get("id") == race_id), None)
     if not target:
         return jresp({"error": "Race not found"}, 404)
@@ -614,7 +659,10 @@ def h_plans_get(c):
 
 
 def h_plans_post(c):
-    return jresp(create_plan(c.bucket, c.sub, c.body()), 201)
+    meta, errors = clean_plan_meta(c.body())
+    if errors:
+        return validation_failed(errors)
+    return jresp(create_plan(c.bucket, c.sub, meta), 201)
 
 
 def h_plan_activate(c):
@@ -625,7 +673,10 @@ def h_plan_activate(c):
 
 
 def h_plan_meta(c):
-    plan = update_plan_meta(c.bucket, c.sub, c.args[0], c.body())
+    meta, errors = clean_plan_meta(c.body())
+    if errors:
+        return validation_failed(errors)
+    plan = update_plan_meta(c.bucket, c.sub, c.args[0], meta)
     if not plan:
         return jresp({"error": "plan not found"}, 404)
     return jresp(plan, 200)
@@ -655,9 +706,12 @@ def _save_plan_weeks(c, plan_id, body):
     base_version = body.get("base_version")
     if base_version is not None and (type(base_version) is not int or base_version < 0):
         return jresp({"error": "invalid base_version"}, 400)
+    weeks, errors = clean_plan_weeks(body["weeks"])
+    if errors:
+        return validation_failed(errors)
     try:
-        result = save_plan_weeks(c.bucket, c.sub, plan_id, body["weeks"],
-                                 body.get("change_reason", ""), c.email,
+        result = save_plan_weeks(c.bucket, c.sub, plan_id, weeks,
+                                 clean_change_reason(body.get("change_reason")), c.email,
                                  base_version=base_version)
     except PlanStale:
         return _plan_stale()
@@ -682,8 +736,8 @@ def h_plan_weeks_post(c):
     plan_id = c.args[0]
     if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
         return jresp({"error": "plan not found"}, 404)
-    body = c.request.get_json(silent=True)
-    if not body or "weeks" not in body:
+    body = c.body()
+    if "weeks" not in body:
         return jresp({"error": "Missing weeks"}, 400)
     return _save_plan_weeks(c, plan_id, body)
 
@@ -695,8 +749,8 @@ def h_active_plan_weeks_get(c):
 
 
 def h_active_plan_weeks_post(c):
-    body = c.request.get_json(silent=True)
-    if not body or "weeks" not in body:
+    body = c.body()
+    if "weeks" not in body:
         return jresp({"error": "Missing weeks"}, 400)
     active = get_active_plan(c.bucket, c.sub)
     if not active:
@@ -713,33 +767,39 @@ def h_runs_get(c):
 
 
 def h_runs_post(c):
-    body = c.request.get_json(silent=True)
+    body = c.body()
     if not body:
         return jresp({"error": "Invalid JSON"}, 400)
     for field in ["date", "dist"]:
         if field not in body:
             return jresp({"error": f"Missing field: {field}"}, 400)
+    index = read_plans_index(c.bucket, c.sub)
+    clean, errors = clean_run(body, index)
+    if errors:
+        return validation_failed(errors)
     # Привязка к плану: явный plan_id или активный план (#25)
-    plan_id = body.get("plan_id")
+    plan_id = clean["plan_id"]
     if plan_id is None:
-        active = get_active_plan(c.bucket, c.sub)
+        active = find_plan(index, index.get("active_plan_id"))
         plan_id = active["id"] if active else None
 
     run = {
-        "id": body.get("id", int(datetime.now().timestamp() * 1000)),
-        "date": body["date"], "dist": float(body["dist"]),
-        "type": body.get("type", "easy"), "time": body.get("time", ""),
-        "pace": body.get("pace", ""), "hr": body.get("hr"),
-        "feel": body.get("feel", "good"), "notes": body.get("notes", ""),
+        "id": clean["id"] or _new_id(),
+        "date": clean["date"], "dist": clean["dist"],
+        "type": clean["type"], "time": clean["time"],
+        "pace": clean["pace"], "hr": clean["hr"],
+        "feel": clean["feel"], "notes": clean["notes"],
         "plan_id": plan_id,
         "deleted": False,
     }
-    fit_token = body.get("fit_token")
-    if fit_token:
+    if clean["fit_token"]:
         try:
-            attach_fit_details_to_run(c.bucket, c.sub, run, fit_token)
-        except Exception as e:
-            return jresp({"error": f"Failed to attach FIT details: {str(e)[:300]}"}, 400)
+            attach_fit_details_to_run(c.bucket, c.sub, run, clean["fit_token"])
+        except ValueError:
+            # Токена нет или он просрочен. Прочие сбои — не ошибка запроса:
+            # они уходят в лог и отдаются как internal_error.
+            return jresp({"error": "Failed to attach FIT details: "
+                                   "token expired or invalid"}, 400)
 
     all_runs = read_runs(c.bucket, c.sub)
     all_runs = [r for r in all_runs if r.get("id") != run["id"]]
@@ -749,11 +809,10 @@ def h_runs_post(c):
 
 
 def h_runs_delete(c):
-    run_id = c.request.args.get("id")
-    if not run_id:
-        return jresp({"error": "Missing id parameter"}, 400)
+    run_id, bad = c.query_id()
+    if bad:
+        return bad
     all_runs = read_runs(c.bucket, c.sub)
-    run_id = int(run_id)
     target = next((r for r in all_runs if r.get("id") == run_id), None)
     if not target:
         return jresp({"error": "Run not found"}, 404)
@@ -854,9 +913,33 @@ def match_route(path, method):
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+def _body_limit(path):
+    return MAX_FIT_BODY_BYTES if path == "/runs/parse-fit" else MAX_JSON_BODY_BYTES
+
+
+def _too_large(limit):
+    return jresp({"error": "payload_too_large", "limit_bytes": limit}, 413)
+
+
 def handle_request(request):
     if request.method == "OPTIONS":
         return ("", 204, CORS_HEADERS)
+
+    path = request.path.rstrip("/") or "/"
+
+    # Предел размера тела (#53) — до всего остального: объявленная длина
+    # известна сразу. content_length есть не у всякого запроса, поэтому getattr.
+    limit = _body_limit(path)
+    if (getattr(request, "content_length", None) or 0) > limit:
+        return _too_large(limit)
+    # Тело без объявленной длины (chunked) так не поймать. Тот же предел
+    # отдаём фреймворку: он оборвёт чтение и поднимет ошибку с кодом 413 —
+    # её разбирает except внизу. Там, где атрибут только для чтения, остаётся
+    # проверка выше.
+    try:
+        request.max_content_length = limit
+    except AttributeError:
+        pass
 
     token_info = verify_token(request)
     if not token_info:
@@ -869,8 +952,6 @@ def handle_request(request):
         user = resolve_user(bucket, token_info)
     except RegistrationClosed:
         return jresp({"error": "registration_closed"}, 403)
-
-    path = request.path.rstrip("/") or "/"
 
     # /me вне таблицы намеренно: он обязан отвечать до проверки одобрения —
     # именно из него фронт узнаёт, что заявка ещё на рассмотрении.
@@ -907,4 +988,9 @@ def handle_request(request):
     except NoCoach:
         return jresp({"error": "no_coach"}, 409)
     except Exception as e:
-        return jresp({"error": str(e)}, 500)
+        if getattr(e, "code", None) == 413:     # тело больше max_content_length
+            return _too_large(limit)
+        # Текст исключения клиенту не отдаём (#53): в нём бывают пути объектов
+        # и ответы провайдера. Он уходит в лог вместе с трассировкой.
+        logging.exception("Unhandled error: %s %s", request.method, path)
+        return jresp({"error": "internal_error"}, 500)

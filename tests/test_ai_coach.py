@@ -355,7 +355,7 @@ def test_archived_thread_takes_no_more_messages(api, llm):
 
 def _spend(storage_module, bucket, sub, count):
     for _ in range(count):
-        storage_module.increment_advice_usage(bucket, sub)
+        assert storage_module.reserve_advice_usage(bucket, sub, limit=10 ** 6)
 
 
 def test_usage_counts_each_message_and_is_reported(api, llm):
