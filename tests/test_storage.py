@@ -394,8 +394,8 @@ def test_llm_context_uses_only_active_plan(storage_module, fake_bucket):
 
 def test_advice_usage_counter(storage_module, fake_bucket):
     assert storage_module.read_advice_usage(fake_bucket, SUB)["count"] == 0
-    storage_module.increment_advice_usage(fake_bucket, SUB)
-    storage_module.increment_advice_usage(fake_bucket, SUB)
+    assert storage_module.reserve_advice_usage(fake_bucket, SUB, limit=5)["count"] == 1
+    assert storage_module.reserve_advice_usage(fake_bucket, SUB, limit=5)["count"] == 2
     assert storage_module.read_advice_usage(fake_bucket, SUB)["count"] == 2
     # separate user unaffected
     assert storage_module.read_advice_usage(fake_bucket, SUB2)["count"] == 0
@@ -457,6 +457,9 @@ def test_attach_fails_on_missing_token(storage_module, fake_bucket):
 def test_read_run_details_lazy_legacy_fallback(storage_module, fake_bucket):
     """Admin's migrated run: details live at the legacy global path; first read
     lazily copies them into the user namespace."""
+    # legacy-данные принадлежат админу, и перенос положен только ему (#53)
+    storage_module.resolve_user(fake_bucket, {
+        "sub": SUB, "email": "aabramov77@gmail.com", "email_verified": True})
     fake_bucket.blob("runs/999/v1/activity.fit").upload_from_string(b"FIT")
     fake_bucket.blob("runs/999/v1/details.json").upload_from_string(
         '{"summary": {"avg_cadence": 165}, "laps": [], "samples": {}}')

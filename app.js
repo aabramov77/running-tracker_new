@@ -372,7 +372,7 @@ async function saveRaceMeta() {
       body: JSON.stringify(body),
     });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw await apiError(res);
     if (creating) cancelPlanEdit();
     await loadPlans();
     if (creating) await loadPlan();   // у нового плана недель нет → пустое состояние
@@ -420,6 +420,12 @@ function scopedRuns() {
   return active.filter(r => r.plan_id === pid);
 }
 
+// Всё, что пришло с сервера, — чужой текст: свои данные тренеру показывает
+// спортсмен, а записать в них он мог что угодно (#53). В разметку такое
+// значение попадает только через escapeHtml, а id пробежки или старта в
+// inline-обработчик (onclick) — только числом, через Number(): внутри
+// обработчика escapeHtml не спасает. Исключений «это же число» нет: тип поля
+// сервер гарантирует не для всех записей, что уже лежат в хранилище.
 function escapeHtml(s) {
   if (s == null) return '';
   return String(s)
@@ -428,6 +434,15 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+// Ошибка неудачного ответа API. Отказ в проверке полей (#53) приходит с их
+// перечнем — показываем его, а не голый код ответа.
+async function apiError(res) {
+  const data = await res.json().catch(() => ({}));
+  if (data.error !== 'validation_failed' || !data.fields) return new Error(`HTTP ${res.status}`);
+  const text = Object.entries(data.fields).map(([field, why]) => `${field} — ${why}`).join('; ');
+  return Object.assign(new Error('Проверьте данные: ' + text), { code: 'validation_failed' });
 }
 
 async function apiGet() {
@@ -439,7 +454,7 @@ async function apiGet() {
 async function apiPost(run) {
   const res = await fetch(API_URL, { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(run) });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   return res.json();
 }
 async function apiDelete(id) {
@@ -458,7 +473,7 @@ async function apiGetRaces() {
 async function apiPostRace(race) {
   const res = await fetch(API_URL + 'races', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(race) });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   return res.json();
 }
 async function apiDeleteRace(id) {
@@ -685,7 +700,7 @@ function getCurrentWeek() {
 }
 function parsePace(s) {
   if (!s) return null;
-  const m = s.match(/(\d+):(\d+)/);
+  const m = String(s).match(/(\d+):(\d+)/);
   return m ? parseInt(m[1]) + parseInt(m[2]) / 60 : null;
 }
 function formatPace(v) {
@@ -836,7 +851,7 @@ function renderPlanTable() {
     body.innerHTML = rows.map((r,i) => `
       <tr>
         <td style="white-space:nowrap;font-family:'DM Mono',monospace">
-          ${r.w ?? i+1}
+          ${escapeHtml(r.w ?? i+1)}
           <button class="btn-sm" onclick="deletePlanWeek(${i})" style="color:var(--c-danger);padding:2px 6px;margin-left:4px" title="Удалить неделю">✕</button>
         </td>
         <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
@@ -897,8 +912,8 @@ function planViewRowsHtml(plan, weeks, cw) {
     if (!week) return '<td></td>';
     const planned = plannedKmLabel(week);
     const reasons = [];
-    if (week.unparsed) reasons.push(`интервалы или время (${week.unparsed})`);
-    if (week.approx) reasons.push(`диапазон (${week.approx})`);
+    if (week.unparsed) reasons.push(`интервалы или время (${Number(week.unparsed)})`);
+    if (week.approx) reasons.push(`диапазон (${Number(week.approx)})`);
     const why = reasons.length ? ` — ${reasons.join(', ')}` : '';
     // «Минимум», а не «прогноз»: число ошибается только в одну сторону,
     // и на этой односторонности всё держится.
@@ -912,7 +927,7 @@ function planViewRowsHtml(plan, weeks, cw) {
     const color = week.complete
       ? (over ? 'var(--c-blue)' : 'var(--c-accent)') : 'var(--text-muted)';
     const pct = week.pct === null ? '' :
-      `<div style="font-size:10px;opacity:.6">${week.pct}%</div>`;
+      `<div style="font-size:10px;opacity:.6">${Number(week.pct)}%</div>`;
     return `<td style="font-size:12px;white-space:nowrap">${head}
       <div style="color:${color}">${km1(week.actual_km)}</div>${pct}</td>`;
   };
@@ -927,7 +942,7 @@ function planViewRowsHtml(plan, weeks, cw) {
     (week?.days || []).forEach(d => { byField[d.field] = d; });
     return `
     <tr class="${i===cw?'current-week':''} ${r.type==='race'?'race-week':''}">
-      <td style="font-family:'DM Mono',monospace;font-weight:500">${r.w ?? i+1}</td>
+      <td style="font-family:'DM Mono',monospace;font-weight:500">${escapeHtml(r.w ?? i+1)}</td>
       <td style="white-space:nowrap;font-family:'DM Mono',monospace;font-size:11px">${escapeHtml(r.start ?? '')}<br>${escapeHtml(r.end ?? '')}</td>
       <td><span class="badge ${PLAN_BADGE[r.type]||''}">${PLAN_TYPE_LABEL[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
       ${kmCell(week, past)}
@@ -982,7 +997,7 @@ function planWeekHtml(plan, weeks, cw, idx) {
     // Сегодняшний и будущие дни текущей недели ещё не пропущены
     const pending = day && day.status === 'missed' && day.date >= today;
     return `<div class="pw-day${day && day.date === today ? ' today' : ''}" onclick="openDaySheet(${idx},'${f}')">
-        <div class="pw-dow">${label[f]}<span>${date}</span></div>
+        <div class="pw-dow">${label[f]}<span>${escapeHtml(date)}</span></div>
         <div class="pw-text">${escapeHtml(r[f] || '') || '<span class="pw-rest">—</span>'}</div>
         <div class="pw-fact">${dayFactHtml(day, past && !pending)}</div>
       </div>`;
@@ -991,7 +1006,7 @@ function planWeekHtml(plan, weeks, cw, idx) {
   return `
     <div class="pw-head">
       <button class="btn-sm" onclick="planWeekStep(-1)"${idx === 0 ? ' disabled' : ''} aria-label="Предыдущая неделя">‹</button>
-      <div class="pw-title">Неделя ${r.w ?? idx + 1} <span>из ${plan.length}</span>
+      <div class="pw-title">Неделя ${escapeHtml(r.w ?? idx + 1)} <span>из ${plan.length}</span>
         <div class="pw-dates">${escapeHtml(r.start ?? '')} – ${escapeHtml(r.end ?? '')}</div>
       </div>
       <button class="btn-sm" onclick="planWeekStep(1)"${idx === plan.length - 1 ? ' disabled' : ''} aria-label="Следующая неделя">›</button>
@@ -1082,7 +1097,7 @@ function renderToday() {
         <button class="btn-sm" onclick="showTab('log')">Весь журнал</button>
       </div>
       ${recent.length
-        ? recent.map(r => runItemHtml(r, { onclick: `showRunDetail(${r.id})`, weekLabel: getWeekLabel(r.date) })).join('')
+        ? recent.map(r => runItemHtml(r, { onclick: `showRunDetail(${Number(r.id)})`, weekLabel: getWeekLabel(r.date) })).join('')
         : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>'}
     </div>`;
 
@@ -1133,7 +1148,7 @@ function renderToday() {
   let stripHtml = '';
   if (week) {
     const label = Object.fromEntries(PLAN_DAYS);
-    const dots = week.days.slice().sort((a, b) => a.date.localeCompare(b.date)).map(d => {
+    const dots = week.days.slice().sort((a, b) => String(a.date).localeCompare(String(b.date))).map(d => {
       const did = d.status === 'done' || d.status === 'extra';
       const state = did ? 'done'
         : (d.status === 'missed' && d.date < today) ? 'missed'
@@ -1415,13 +1430,13 @@ async function saveImportedAsNewPlan() {
       }),
     });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw await apiError(res);
     const plan = await res.json();          // новый план сразу становится активным
     const wres = await fetch(`${API_URL}plans/${plan.id}/weeks`, {
       method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ weeks, change_reason: 'import from file' }),
     });
-    if (!wres.ok) throw new Error('HTTP ' + wres.status);
+    if (!wres.ok) throw await apiError(wres);
     finishImport();
     await loadPlans();
     await loadPlan();
@@ -1524,7 +1539,7 @@ async function postPlanWeeks(weeks, changeReason) {
     await loadPlan();
     throw Object.assign(new Error(PLAN_STALE_TEXT), { code: 'plan_stale', status: 409 });
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   const saved = await res.json();
   rememberPlan(weeks, base ? { ...base, version: saved.version } : null);
   return saved;
@@ -1586,7 +1601,7 @@ function renderLog() {
   const planName = {};
   PLANS.forEach(p => { planName[p.id] = planLabel(p); });
   el.innerHTML = activeRuns.map(r => runItemHtml(r, {
-    onclick: `showRunDetail(${r.id})`,
+    onclick: `showRunDetail(${Number(r.id)})`,
     weekLabel: getWeekLabel(r.date),
     planName: runScope === 'all' ? planName[r.plan_id] : '',
     deletable: true,
@@ -1598,21 +1613,24 @@ const RUN_TYPE_LABELS = {easy:'Лёгкий',interval:'Интервалы',tempo
 
 // Строка журнала. Зависит только от аргументов — ею же рисуется журнал
 // спортсмена на экране тренера (#44), там без кнопок удаления и разбора с ИИ.
+// onclick собирает вызывающий: id в нём — только через Number().
 function runItemHtml(r, { onclick, weekLabel = '', planName = '', deletable = false, reviewable = false }) {
   const typeLabels = RUN_TYPE_LABELS;
   const feelEmoji = {great:'😊',good:'🙂',ok:'😐',hard:'😓',bad:'😔'};
   const pace = parsePace(r.pace);
   const pc = pace?(pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off'):'';
+  const id = Number(r.id);
+  const date = String(r.date ?? '');      // у старой записи дата может быть не строкой
   return `<div class="run-item" onclick="${onclick}" style="cursor:pointer">
-      <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${weekLabel}</span></div>
+      <div class="run-date">${escapeHtml(date.slice(5))}<br><span style="opacity:.6">${weekLabel}</span></div>
       <div class="run-info">
         <div class="run-title">${typeLabels[r.type] || escapeHtml(r.type)} — ${escapeHtml(String(r.dist))} км ${feelEmoji[r.feel]||''}</div>
-        <div class="run-meta">${r.pace?`<span class="${pc}">${escapeHtml(r.pace)}/км</span> · `:''}${r.time?escapeHtml(r.time)+' · ':''}${r.hr?r.hr+' уд/мин':''}</div>
+        <div class="run-meta">${r.pace?`<span class="${pc}">${escapeHtml(r.pace)}/км</span> · `:''}${r.time?escapeHtml(r.time)+' · ':''}${r.hr?escapeHtml(r.hr)+' уд/мин':''}</div>
         ${planName?`<div class="run-meta" style="opacity:.65">📋 ${escapeHtml(planName)}</div>`:''}
         ${r.notes?`<div class="run-note">${escapeHtml(r.notes)}</div>`:''}
       </div>
-      ${reviewable?`<button class="btn-sm" title="Разобрать с ИИ-тренером" onclick="event.stopPropagation();aiReviewRun(${r.id})" style="flex-shrink:0">🤖</button>`:''}
-      ${deletable?`<button class="btn-sm" onclick="event.stopPropagation();deleteRun(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>`:''}
+      ${reviewable?`<button class="btn-sm" title="Разобрать с ИИ-тренером" onclick="event.stopPropagation();aiReviewRun(${id})" style="flex-shrink:0">🤖</button>`:''}
+      ${deletable?`<button class="btn-sm" onclick="event.stopPropagation();deleteRun(${id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>`:''}
     </div>`;
 }
 
@@ -1655,6 +1673,7 @@ async function saveRace() {
     document.getElementById('r-name').value = '';
     document.getElementById('r-time').value = '';
   } catch (e) {
+    if (e.code === 'validation_failed') { alert(e.message); return; }
     // Офлайн: сохраняем локально
     races.unshift(race);
     localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
@@ -1700,8 +1719,9 @@ function renderRaces() {
     const pace = calcRacePace(r.dist_label, r.time);
     const badgeClass = DIST_BADGE[r.dist_label] || 'badge-5k';
     const label = DIST_LABEL[r.dist_label] || r.dist_label;
+    const date = String(r.date ?? '');
     return `<div class="run-item">
-      <div class="run-date">${escapeHtml(r.date.slice(5))}<br><span style="opacity:.6">${r.date.slice(0,4)}</span></div>
+      <div class="run-date">${escapeHtml(date.slice(5))}<br><span style="opacity:.6">${escapeHtml(date.slice(0,4))}</span></div>
       <div class="run-info">
         <div class="run-title">${escapeHtml(r.name)}</div>
         <div class="run-meta">
@@ -1709,7 +1729,7 @@ function renderRaces() {
           ${escapeHtml(r.time)}${pace ? ` · ${escapeHtml(pace)}/км` : ''}
         </div>
       </div>
-      <button class="btn-sm" onclick="deleteRace(${r.id})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
+      <button class="btn-sm" onclick="deleteRace(${Number(r.id)})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
     </div>`;
   }).join('');
 }
@@ -1741,8 +1761,8 @@ function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null }) 
     ['Дистанция',    `${escapeHtml(String(run.dist))} км`],
     run.time  ? ['Время',        escapeHtml(run.time)]  : null,
     run.pace  ? ['Темп',         `<span class="${pc}">${escapeHtml(run.pace)}/км</span>`] : null,
-    run.hr    ? ['Пульс',        `${run.hr} уд/мин`]   : null,
-    ['Самочувствие', feelLabels[run.feel] || run.feel],
+    run.hr    ? ['Пульс',        `${escapeHtml(run.hr)} уд/мин`]   : null,
+    ['Самочувствие', feelLabels[run.feel] || escapeHtml(run.feel)],
     run.notes ? ['Заметки',      `<span style="font-style:italic">${escapeHtml(run.notes)}</span>`] : null,
   ].filter(Boolean);
   document.getElementById('rd-body').innerHTML = rows
@@ -1948,13 +1968,13 @@ function renderCharts() {
   const actual = weeks ? weeks.map(w => w.actual_km) : weekBuckets(activeRuns, n);
   const planned = weeks ? weeks.map(w => w.planned_km || null) : null;
   const exact = weeks ? weeks.map(w => w.complete) : null;
-  const sortedRuns = [...activeRuns].sort((a,b) => a.date.localeCompare(b.date));
+  const sortedRuns = [...activeRuns].sort((a,b) => String(a.date).localeCompare(String(b.date)));
 
   if(wChart)wChart.destroy();
   wChart=new Chart(document.getElementById('weekChart').getContext('2d'),
                    weekChartConfig(n, planned, exact, actual));
   if(pChart)pChart.destroy();
-  pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>r.date.slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
+  pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>String(r.date).slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
 }
 
 // ── LLM Settings ──────────────────────────────────────────────────────────────
@@ -1981,7 +2001,7 @@ function updateModelOptions() {
   }
   const sel = document.getElementById('s-model');
   sel.innerHTML = LLM_MODELS[providerSel.value].map(m =>
-    `<option value="${m.id}">${m.label}</option>`).join('');
+    `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join('');
 }
 
 // ── Профиль спортсмена (#32) ──
@@ -2067,7 +2087,7 @@ function renderProfileDerived() {
 
   const zones = PROFILE_DERIVED && PROFILE_DERIVED.hr_zones ? PROFILE_DERIVED.hr_zones : [];
   if (PROFILE_DERIVED && PROFILE_DERIVED.hr_max_estimated) {
-    bits.push(`HRmax: <b>~${PROFILE_DERIVED.hr_max_estimated}</b> <span class="hint">(оценка по возрасту)</span>`);
+    bits.push(`HRmax: <b>~${escapeHtml(PROFILE_DERIVED.hr_max_estimated)}</b> <span class="hint">(оценка по возрасту)</span>`);
   }
 
   if (!bits.length && !zones.length) { el.innerHTML = ''; return; }
@@ -2075,7 +2095,7 @@ function renderProfileDerived() {
   let html = bits.length ? `<div class="derived-row">${bits.join('<span class="derived-sep">·</span>')}</div>` : '';
   if (zones.length) {
     html += '<div class="hr-zones">' + zones.map(z =>
-      `<span class="hr-zone">${escapeHtml(z.name)} <b>${z.from}–${z.to}</b></span>`).join('') + '</div>';
+      `<span class="hr-zone">${escapeHtml(z.name)} <b>${escapeHtml(z.from)}–${escapeHtml(z.to)}</b></span>`).join('') + '</div>';
     html += '<div class="hint" style="margin:6px 0 0">Зоны — ориентир от максимального пульса, не медицинская рекомендация. Обновляются после сохранения.</div>';
   }
   el.innerHTML = html;
@@ -2321,7 +2341,19 @@ async function aiFetch(path, { method = 'GET', body = null } = {}) {
 }
 
 function aiErrorText(e) {
+  if (e.code === 'usage_busy') return 'Слишком много запросов сразу — повторите чуть позже.';
   if (e.status === 429) return `Дневной лимит сообщений исчерпан (${e.limit}). Счётчик сбрасывается раз в сутки.`;
+  if (e.code === 'internal_error') return 'Ошибка на сервере — попробуйте ещё раз.';
+  // Сбой модели сервер называет кодом причины (#53): текст провайдера остаётся
+  // в логе. Настройки модели есть только у админа — ему и подсказка про них.
+  const admin = currentRole === 'admin';
+  if (e.code === 'llm_refused') return 'Модель отклонила этот запрос — попробуйте переформулировать вопрос.';
+  if (e.code === 'llm_truncated') return 'Ответ не поместился в лимит токенов — '
+    + (admin ? 'понизьте глубину рассуждения в настройках.' : 'попробуйте задать вопрос короче.');
+  if (e.code === 'llm_provider_error') return 'Сервис модели ответил ошибкой — попробуйте позже.'
+    + (admin ? ' Причину покажет «Проверить ключ» в настройках.' : '');
+  if (e.code === 'llm_failed') return 'Не удалось связаться с моделью — попробуйте ещё раз.';
+  if (e.code === 'llm_empty_reply') return 'Модель вернула пустой ответ — попробуйте ещё раз.';
   if (e.code === 'message_too_long') return 'Сообщение длиннее 2000 символов';
   if (e.code === 'proposal_stale') return 'План изменился после этого предложения — попросите тренера предложить правки заново';
   if (e.status === 404) return 'Разбор не найден — возможно, он скрыт в другой вкладке';
@@ -2346,7 +2378,7 @@ function mdLite(text) {
 
 // Свои пробежки, от свежих к старым, — их можно разобрать или прикрепить.
 function aiOwnRuns() {
-  return runs.filter(r => !r.deleted).sort((a, b) => b.date.localeCompare(a.date));
+  return runs.filter(r => !r.deleted).sort((a, b) => String(b.date).localeCompare(String(a.date)));
 }
 
 function aiRunLabel(r) {
@@ -2363,8 +2395,9 @@ function aiRunChipHtml(runId, title) {
 // делает кнопка, и только пока предложение относится к текущей версии плана.
 function aiProposalHtml(m) {
   const rows = m.proposal.changes.map(c => {
-    const date = c.date ? `${c.date.slice(8, 10)}.${c.date.slice(5, 7)}` : '';
-    return `<tr><td class="ai-prop-when">Нед ${Number(c.week)} · ${escapeHtml(AI_DAY_LABELS[c.day] || c.day)} ${date}</td>`
+    const iso = String(c.date ?? '');
+    const date = iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}` : '';
+    return `<tr><td class="ai-prop-when">Нед ${Number(c.week)} · ${escapeHtml(AI_DAY_LABELS[c.day] || c.day)} ${escapeHtml(date)}</td>`
       + `<td><span class="ai-prop-old">${escapeHtml(c.old || 'отдых')}</span> → <b>${escapeHtml(c.text || 'отдых')}</b>`
       + (c.reason ? `<div class="ai-prop-why">${escapeHtml(c.reason)}</div>` : '') + '</td></tr>';
   }).join('');
@@ -2405,7 +2438,7 @@ function aiRenderThreads() {
       <div class="run-date">${chatTime(t.last_ts)}</div>
       <div class="run-info">
         <div class="run-title">${escapeHtml(t.title)}</div>
-        <div class="run-meta">сообщений: ${t.messages}</div>
+        <div class="run-meta">сообщений: ${Number(t.messages)}</div>
       </div>
       <button class="btn-sm" title="Скрыть разбор" onclick="event.stopPropagation();aiArchiveThread('${escapeHtml(t.id)}')" style="flex-shrink:0;color:var(--c-danger)">✕</button>
     </div>`).join('');
@@ -2670,7 +2703,7 @@ async function loadUsers() {
   try {
     const res = await fetch(API_URL + 'admin/users', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) { el.innerHTML = `<div class="empty">Ошибка ${res.status}</div>`; return; }
+    if (!res.ok) { el.innerHTML = `<div class="empty">Ошибка ${Number(res.status)}</div>`; return; }
     const data = await res.json();
     renderUsers(data.users || []);
   } catch (e) {
@@ -2841,7 +2874,7 @@ async function loadCoachAthletes() {
     el.innerHTML = COACH.athletes.length
       // В onclick идёт индекс, а не sub: так в разметку не попадает чужая строка.
       ? COACH.athletes.map((a, i) => `<div class="run-item" onclick="openCoachAthlete(${i})" style="cursor:pointer">
-          <div class="run-info"><div class="run-title">${escapeHtml(a.name)} ${a.unread ? `<span class="nav-badge" title="Непрочитанные сообщения">${a.unread}</span>` : ''}</div></div>
+          <div class="run-info"><div class="run-title">${escapeHtml(a.name)} ${a.unread ? `<span class="nav-badge" title="Непрочитанные сообщения">${Number(a.unread)}</span>` : ''}</div></div>
           <span class="btn-sm" style="flex-shrink:0">Открыть →</span>
         </div>`).join('')
       : '<div class="empty">Пока никто не выбрал вас тренером. Спортсмен делает это в своём Профиле.</div>';
@@ -3256,7 +3289,7 @@ function switchCalc(mode, btn) {
 // Парсинг времени в секунды: "54:30" → 3270, "1:04:30" → 3870
 function parseTimeToSeconds(s) {
   if (!s) return null;
-  const parts = s.trim().split(':').map(Number);
+  const parts = String(s).trim().split(':').map(Number);
   if (parts.some(isNaN)) return null;
   if (parts.length === 2) return parts[0] * 60 + parts[1];       // мм:сс
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]; // чч:мм:сс

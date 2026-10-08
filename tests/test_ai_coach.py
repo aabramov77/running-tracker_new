@@ -289,22 +289,25 @@ def test_plain_text_from_the_model_still_becomes_an_answer(api, llm):
 # ── сбои: в разборе не остаётся вопроса без ответа ───────────────────────────
 
 def _failures(api_module):
-    return [(api_module.LLMRefused("нет медицинских рекомендаций"), 422, "отклонила"),
-            (api_module.LLMTruncated("оборвано"), 502, "глубину рассуждения"),
-            (RuntimeError("connection reset"), 502, "connection reset"),
-            ({"text": '{"reply": ""}', "input_tokens": 1, "output_tokens": 1}, 502, "пустой ответ")]
+    """Что случилось с моделью → код ответа и код причины. Текста сбоя в
+    ответе нет (#53): фразу по коду причины подбирает фронтенд."""
+    return [(api_module.LLMRefused("нет медицинских рекомендаций"), 422, "llm_refused"),
+            (api_module.LLMTruncated("оборвано"), 502, "llm_truncated"),
+            (RuntimeError("connection reset"), 502, "llm_failed"),
+            ({"text": '{"reply": ""}', "input_tokens": 1, "output_tokens": 1}, 502,
+             "llm_empty_reply")]
 
 
 @pytest.mark.parametrize("case", range(4))
 def test_failed_turn_writes_nothing_and_costs_nothing(api, llm, patched_api, fake_bucket, case):
-    failure, expected_code, fragment = _failures(patched_api)[case]
+    failure, expected_code, reason = _failures(patched_api)[case]
     thread = _new_thread(api)
     before = _ai_objects(fake_bucket)
     llm["replies"].append(failure)
 
     body, code, _ = _say(api, thread["id"])
 
-    assert code == expected_code and fragment in body
+    assert (code, json.loads(body)) == (expected_code, {"error": reason})
     assert _ai_objects(fake_bucket) == before
     assert patched_api.read_advice_usage(fake_bucket, SUB)["count"] == 0
 
@@ -355,7 +358,7 @@ def test_archived_thread_takes_no_more_messages(api, llm):
 
 def _spend(storage_module, bucket, sub, count):
     for _ in range(count):
-        storage_module.increment_advice_usage(bucket, sub)
+        assert storage_module.reserve_advice_usage(bucket, sub, limit=10 ** 6)
 
 
 def test_usage_counts_each_message_and_is_reported(api, llm):

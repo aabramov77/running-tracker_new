@@ -30,3 +30,8 @@ tests/fixtures/*.fit
 # такой файл и вне этой папки, если он окажется где-то ещё.
 Auth/
 *client_secret*.json
+# Файл учётных данных, который шаг google-github-actions/auth кладёт в корень
+# рабочего каталога. `gcloud run deploy --source=.` берёт исключения отсюда
+# (.gcloudignore в репозитории нет), и без этой строки файл уезжал в архив
+# исходников и в образ Cloud Run.
+gha-creds-*.json
