@@ -417,6 +417,18 @@ def h_llm_config_test(c):
         return jresp({"ok": False, "error": str(e)[:200]}, 200)
 
 
+def _llm_failure(reason, status, cfg, detail, error=False):
+    """Ответ на сбой модели: клиенту — код причины, подробности — в лог (#53).
+
+    Провайдер описывает отказ своими словами, и в них бывают id организации,
+    лимиты и фрагмент ключа. Фразу по коду подбирает фронтенд (aiErrorText);
+    админ видит текст провайдера по кнопке «Проверить ключ».
+    """
+    log = logging.exception if error else logging.warning
+    log("LLM %s (%s/%s): %s", reason, cfg.get("provider"), cfg.get("model"), detail)
+    return jresp({"error": reason}, status)
+
+
 def _ask_llm(cfg, system_prompt, user_prompt, history=None):
     """(ответ LLM, None) либо (None, готовый ответ с ошибкой).
 
@@ -429,15 +441,14 @@ def _ask_llm(cfg, system_prompt, user_prompt, history=None):
                         system_prompt, user_prompt, effort=cfg.get("effort"),
                         history=history), None
     except LLMRefused as e:
-        return None, jresp({"error": f"Модель отклонила запрос: {str(e)[:300]}"}, 422)
-    except LLMTruncated:
-        return None, jresp({"error": "Ответ не поместился в лимит токенов — "
-                                     "понизьте глубину рассуждения в настройках."}, 502)
+        return None, _llm_failure("llm_refused", 422, cfg, e)
+    except LLMTruncated as e:
+        return None, _llm_failure("llm_truncated", 502, cfg, e)
     except httpx.HTTPStatusError as e:
-        return None, jresp({"error": f"Provider {e.response.status_code}: "
-                                     f"{e.response.text[:300]}"}, 502)
+        detail = f"HTTP {e.response.status_code}: {e.response.text[:1000]}"
+        return None, _llm_failure("llm_provider_error", 502, cfg, detail, error=True)
     except Exception as e:
-        return None, jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+        return None, _llm_failure("llm_failed", 502, cfg, e, error=True)
 
 
 def h_advise_preview(c):
@@ -537,7 +548,7 @@ def h_ai_message_post(c):
             try:
                 reply, envelope = parse_coach_reply(llm_res["text"])
             except ValueError as e:
-                failure = jresp({"error": f"LLM call failed: {str(e)[:300]}"}, 502)
+                failure = _llm_failure("llm_empty_reply", 502, cfg, e)
     except Exception:
         release_advice_usage(c.bucket, c.sub)
         raise

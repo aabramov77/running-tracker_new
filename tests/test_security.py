@@ -6,6 +6,7 @@
 import json
 import logging
 
+import httpx
 import pytest
 
 from conftest import FakeRequest, NotFound, PreconditionFailed
@@ -662,6 +663,70 @@ def test_unhandled_error_goes_to_the_log_and_not_to_the_client(api, patched_api,
     assert (code, json.loads(body)) == (500, {"error": "internal_error"})
     assert "sk-live" not in body and "gs://" not in body
     assert secret in caplog.text and "GET /" in caplog.text
+
+
+# ── 5. Тексты ошибок: сбой модели ─────────────────────────────────────────────
+# Провайдер описывает отказ своими словами — с id организации, лимитами и
+# фрагментом ключа. Пользователю уходит только код причины.
+
+PROVIDER_SAID = ("Incorrect API key provided: sk-proj-****9aZ. Organization org-Runtrack42 "
+                 "has exceeded its rate limit of 3 RPM.")
+
+
+def _provider_error(status):
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    response = httpx.Response(status, json={"error": {"message": PROVIDER_SAID}}, request=request)
+    return httpx.HTTPStatusError(f"Client error '{status}'", request=request, response=response)
+
+
+def _model_failures(api_module):
+    """причина → (что случилось с моделью, код ответа)."""
+    return {"llm_refused": (api_module.LLMRefused(PROVIDER_SAID), 422),
+            "llm_truncated": (api_module.LLMTruncated(PROVIDER_SAID), 502),
+            "llm_provider_error": (_provider_error(429), 502),
+            "llm_failed": (RuntimeError(PROVIDER_SAID), 502)}
+
+
+@pytest.mark.parametrize("reason", ["llm_refused", "llm_truncated", "llm_provider_error",
+                                    "llm_failed"])
+def test_model_failure_reaches_the_user_as_a_reason_code_and_the_log_as_text(
+        api, model, patched_api, fake_bucket, caplog, reason):
+    model["fail"], status = _model_failures(patched_api)[reason]
+    thread = _thread(api)
+    stored = _stored(fake_bucket, "users/u1/ai_coach/")
+
+    with caplog.at_level(logging.WARNING):
+        body, code, _ = _say(api, thread)
+
+    assert (code, json.loads(body)) == (status, {"error": reason})
+    assert PROVIDER_SAID in caplog.text and "openai/gpt-test" in caplog.text
+    if reason == "llm_provider_error":
+        assert "429" in caplog.text
+    assert _stored(fake_bucket, "users/u1/ai_coach/") == stored
+    assert _used(patched_api, fake_bucket) == 0
+
+
+def test_empty_model_reply_is_a_reason_code_too(api, model, patched_api, fake_bucket,
+                                                monkeypatch):
+    monkeypatch.setattr(patched_api, "call_llm", lambda *args, **kwargs: {
+        "text": '{"reply": ""}', "input_tokens": 1, "output_tokens": 1})
+    body, code, _ = _say(api, _thread(api))
+    assert (code, json.loads(body)) == (502, {"error": "llm_empty_reply"})
+    assert _used(patched_api, fake_bucket) == 0
+
+
+@pytest.mark.parametrize("reason,prefix", [("llm_refused", "Модель отклонила запрос"),
+                                           ("llm_provider_error", "Provider 429"),
+                                           ("llm_failed", "Incorrect API key")])
+def test_admin_key_check_still_shows_what_the_provider_said(api, model, patched_api, reason,
+                                                            prefix):
+    """«Проверить ключ» — маршрут админа: ему текст провайдера нужен для
+    диагностики. Остальным маршрут закрыт."""
+    model["fail"], _ = _model_failures(patched_api)[reason]
+    answer = _json(_post(api, "/config/llm/test", {}, **ADMIN))
+    assert answer["ok"] is False and answer["error"].startswith(prefix)
+    assert "org-Runtrack42" in answer["error"]
+    assert _status(_post(api, "/config/llm/test", {})) == 403
 
 
 # ── 6. Админ по email — только при подтверждённом адресе ──────────────────────
