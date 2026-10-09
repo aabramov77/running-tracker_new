@@ -310,12 +310,45 @@ ATHLETE_NUM_FIELDS = {
 # Поля, по которым имеет смысл смотреть динамику между версиями
 ATHLETE_HISTORY_FIELDS = ("weight_kg", "hr_max", "hr_threshold", "hr_rest", "vo2max")
 
+# Ручные пульсовые зоны (#56) — нижние границы Z1…Z5 в уд/мин. Коридор тот же,
+# что у пульса покоя снизу и максимального сверху.
+HR_ZONE_START_MIN, HR_ZONE_START_MAX = 30, 230
+
 
 def empty_athlete_profile():
     profile = {f: "" for f in ATHLETE_TEXT_FIELDS}
     profile.update({f: None for f in ATHLETE_NUM_FIELDS})
     profile["available_days"] = []
+    profile["hr_zones_custom"] = None       # None — зоны считаются от HRmax
     return profile
+
+
+def clean_hr_zone_starts(value, hr_max):
+    """Ручные границы зон: (список целых или None, текст ошибки или None).
+
+    Зоны задаются все разом. Смешать ручные границы с расчётными нельзя: при
+    смене максимального пульса расчётные переехали бы через ручные.
+    """
+    if value in (None, "", []):
+        return None, None
+    count = len(HR_ZONE_BOUNDS)
+    if not isinstance(value, list) or len(value) != count:
+        return None, f"ожидается {count} границ — по одной на зону"
+    starts = []
+    for item in value:
+        try:
+            number = float(item)
+        except (TypeError, ValueError, OverflowError):
+            return None, "заполните все границы числами"
+        if not (HR_ZONE_START_MIN <= number <= HR_ZONE_START_MAX):
+            return None, f"допустимо от {HR_ZONE_START_MIN} до {HR_ZONE_START_MAX}"
+        starts.append(int(round(number)))
+    if any(low >= high for low, high in zip(starts, starts[1:])):
+        return None, "границы должны идти по возрастанию"
+    # С оценкой по возрасту не сверяем: зоны правят как раз те, у кого она врёт.
+    if hr_max and starts[-1] >= hr_max:
+        return None, "начало Z5 должно быть ниже максимального пульса"
+    return starts, None
 
 
 def clean_athlete_profile(raw):
@@ -387,6 +420,11 @@ def clean_athlete_profile(raw):
     if profile.get("hr_max") and profile.get("hr_rest") and profile["hr_rest"] >= profile["hr_max"]:
         errors["hr_rest"] = "пульс покоя должен быть ниже максимального"
 
+    profile["hr_zones_custom"], zones_error = clean_hr_zone_starts(
+        raw.get("hr_zones_custom"), profile.get("hr_max"))
+    if zones_error:
+        errors["hr_zones_custom"] = zones_error
+
     return profile, errors
 
 
@@ -402,11 +440,31 @@ def athlete_age(birth_date, today=None):
     return years if 0 <= years <= 100 else None
 
 
+def manual_hr_zones(profile, hr_max):
+    """Зоны по ручным границам из профиля (#56); None — границы не заданы.
+
+    Верх зоны — начало следующей, как и у расчётных. Верх последней — HRmax,
+    если он известен и выше её начала: отдельный «верх Z5» был бы вторым HRmax.
+    """
+    starts = profile.get("hr_zones_custom")
+    if not isinstance(starts, list) or len(starts) != len(HR_ZONE_BOUNDS) \
+            or not all(isinstance(s, int) for s in starts):
+        return None
+    tops = starts[1:] + [hr_max if hr_max and hr_max > starts[-1] else None]
+    return [{"name": name, "from": low, "to": high}
+            for (name, _, _), low, high in zip(HR_ZONE_BOUNDS, starts, tops)]
+
+
 def compute_athlete_derived(profile, today=None):
-    """Возраст, ИМТ, оценка HRmax и пульсовые зоны. Не хранится — считается на лету."""
+    """Возраст, ИМТ, оценка HRmax и пульсовые зоны. Не хранится — считается на лету.
+
+    hr_zones — действующие зоны: ручные, если спортсмен их задал, иначе
+    расчётные. hr_zones_auto — всегда расчётные: с них начинается ручная правка.
+    """
     age = athlete_age(profile.get("birth_date"), today)
     derived = {"age": age, "bmi": None, "hr_max_estimated": None,
-               "hr_max_effective": None, "hr_zones": []}
+               "hr_max_effective": None, "hr_zones": [],
+               "hr_zones_auto": [], "hr_zones_source": "auto"}
 
     height, weight = profile.get("height_cm"), profile.get("weight_kg")
     if height and weight:
@@ -418,12 +476,18 @@ def compute_athlete_derived(profile, today=None):
     effective = profile.get("hr_max") or derived["hr_max_estimated"]
     derived["hr_max_effective"] = effective
     if effective:
-        derived["hr_zones"] = [
+        derived["hr_zones_auto"] = [
             {"name": name,
              "from": int(round(effective * low / 100)),
              "to": int(round(effective * high / 100))}
             for name, low, high in HR_ZONE_BOUNDS
         ]
+    derived["hr_zones"] = derived["hr_zones_auto"]
+
+    manual = manual_hr_zones(profile, effective)
+    if manual:
+        derived["hr_zones"] = manual
+        derived["hr_zones_source"] = "manual"
     return derived
 
 
@@ -2210,7 +2274,8 @@ def ai_focus_run_ids(thread, messages, run_id=None, window=AI_HISTORY_WINDOW):
 def build_run_focus(bucket, sub, run, ctx):
     """Подробные данные одной пробежки для разбора (форматирует llm_prompt)."""
     focus = {"run": run, "laps": [], "hr_drift_pct": None, "half_paces": None,
-             "zones": [], "hr_max": None, "hr_max_estimated": False, "planned": None}
+             "zones": [], "zones_manual": False,
+             "hr_max": None, "hr_max_estimated": False, "planned": None}
 
     details = None
     if run.get("details_available"):
@@ -2224,6 +2289,7 @@ def build_run_focus(bucket, sub, run, ctx):
         focus["hr_drift_pct"] = compute_hr_drift(details)
         focus["half_paces"] = half_paces(details)
         focus["zones"] = hr_zone_minutes(details, derived.get("hr_zones"))
+        focus["zones_manual"] = derived.get("hr_zones_source") == "manual"
         focus["hr_max"] = derived.get("hr_max_effective")
         focus["hr_max_estimated"] = bool(derived.get("hr_max_estimated"))
 

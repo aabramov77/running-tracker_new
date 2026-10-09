@@ -647,6 +647,25 @@ def test_zones_reach_the_prompt_when_the_profile_gives_a_max_hr(api, llm, patche
     assert "Время в пульсовых зонах (макс. пульс 190): " in llm["calls"][0]["system"]
 
 
+def test_manual_zones_decide_the_time_in_zones(api, llm, patched_api, fake_bucket):
+    """#56: сэмплы 100/120/140/160 уд/мин по 20 секунд. От HRmax 190 это
+    Z1–Z4; по ручным границам всё, что ниже 150, — Z1."""
+    run_id = _seed_reviewable_run(api, patched_api, fake_bucket)
+    assert api(FakeRequest("POST", "/profile", {"profile": {
+        "hr_max": 190, "hr_zones_custom": [90, 150, 165, 175, 185]}}))[1] == 201
+    thread = _run_thread(api, run_id)
+    _say(api, thread["id"])
+    system = llm["calls"][0]["system"]
+    assert ("Время в пульсовых зонах (границы заданы спортсменом): "
+            "Z1 восстановление — 1 мин (75%); Z2 аэробная — 0.3 мин (25%)") in system
+    assert "Пульсовые зоны (заданы спортсменом): Z1 90–150, Z2 150–165" in system
+
+
+def test_run_block_does_not_cite_max_hr_for_manual_zones(storage_module):
+    text = _block(storage_module, zones_manual=True)
+    assert "(границы заданы спортсменом)" in text and "макс. пульс 190" not in text
+
+
 def test_run_without_fit_details_is_reviewed_by_its_summary(api, llm):
     api(FakeRequest("POST", "/", json_body={"id": 7, "date": "2026-08-20", "dist": 8.0,
                                             "pace": "5:40"}))

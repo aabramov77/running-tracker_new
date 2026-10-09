@@ -209,6 +209,107 @@ def test_athlete_derived_empty_profile_is_all_none(storage_module):
     assert derived["hr_max_effective"] is None and derived["hr_zones"] == []
 
 
+# ── ручные пульсовые зоны (#56) ───────────────────────────────────────────────
+
+MANUAL_ZONES = [100, 125, 140, 155, 168]      # нижние границы Z1…Z5
+
+
+def test_manual_zone_starts_are_cleaned(storage_module):
+    """Форма шлёт строки; в профиле — целые."""
+    profile, errors = storage_module.clean_athlete_profile(
+        {"hr_max": 178, "hr_zones_custom": ["100", 125.4, 140, 155, "168"]})
+    assert errors == {} and profile["hr_zones_custom"] == MANUAL_ZONES
+
+
+@pytest.mark.parametrize("value", [None, "", []])
+def test_no_manual_zones_means_calculated_ones(storage_module, value):
+    profile, errors = storage_module.clean_athlete_profile({"hr_zones_custom": value})
+    assert errors == {} and profile["hr_zones_custom"] is None
+    assert storage_module.empty_athlete_profile()["hr_zones_custom"] is None
+
+
+@pytest.mark.parametrize("value", [
+    [100, 125, 140, 155],                    # не все зоны
+    [100, 125, 140, 155, 168, 180],          # лишняя
+    [100, 125, 125, 155, 168],               # зона нулевой ширины
+    [100, 140, 125, 155, 168],               # не по возрастанию
+    [20, 125, 140, 155, 168],                # ниже допустимого
+    [100, 125, 140, 155, 240],               # выше допустимого
+    [100, 125, "", 155, 168],                # незаполненное поле формы
+    [100, 125, None, 155, 168], [100, 125, [140], 155, 168], [100, 125, True, 155, 168],
+    [100, 125, float("nan"), 155, 168],
+    "100,125,140,155,168", 150, {"z1": 100}, True,
+])
+def test_bad_manual_zones_are_rejected(storage_module, value):
+    profile, errors = storage_module.clean_athlete_profile({"hr_zones_custom": value})
+    assert list(errors) == ["hr_zones_custom"] and profile["hr_zones_custom"] is None
+
+
+def test_manual_zone_five_must_start_below_the_measured_max(storage_module):
+    _, errors = storage_module.clean_athlete_profile({"hr_max": 168, "hr_zones_custom": MANUAL_ZONES})
+    assert list(errors) == ["hr_zones_custom"]
+    # оценка по возрасту — не измерение: зоны выше неё допустимы
+    _, no_errors = storage_module.clean_athlete_profile(
+        {"birth_date": "1946-08-16", "hr_zones_custom": MANUAL_ZONES})
+    assert no_errors == {}
+
+
+def test_manual_zones_replace_the_calculated_ones(storage_module):
+    from datetime import date
+    today = date(2026, 8, 16)
+    profile, _ = storage_module.clean_athlete_profile({**FILLED_PROFILE, "hr_zones_custom": MANUAL_ZONES})
+    derived = storage_module.compute_athlete_derived(profile, today=today)
+    assert derived["hr_zones_source"] == "manual"
+    assert [(z["from"], z["to"]) for z in derived["hr_zones"]] == [
+        (100, 125), (125, 140), (140, 155), (155, 168), (168, 178)]     # верх Z5 — HRmax
+    assert [z["name"] for z in derived["hr_zones"]] == [name for name, _, _ in domain.HR_ZONE_BOUNDS]
+    # расчётные остаются под рукой — с них начинается ручная правка
+    assert (derived["hr_zones_auto"][0]["from"], derived["hr_zones_auto"][-1]["to"]) == (89, 178)
+
+    auto = storage_module.compute_athlete_derived({**profile, "hr_zones_custom": None}, today=today)
+    assert auto["hr_zones_source"] == "auto" and auto["hr_zones"] == auto["hr_zones_auto"]
+
+
+def test_manual_zone_five_has_no_top_without_a_higher_max(storage_module):
+    from datetime import date
+    bare = {**storage_module.empty_athlete_profile(), "hr_zones_custom": MANUAL_ZONES}
+    derived = storage_module.compute_athlete_derived(bare)
+    assert derived["hr_zones"][-1] == {"name": "Z5 максимальная", "from": 168, "to": None}
+    assert derived["hr_zones_auto"] == []
+    # оценка по возрасту ниже начала Z5 — верхом зоны она быть не может
+    aged = storage_module.compute_athlete_derived({**bare, "birth_date": "1946-08-16"},
+                                                  today=date(2026, 8, 16))
+    assert aged["hr_max_estimated"] == 152 and aged["hr_zones"][-1]["to"] is None
+
+
+@pytest.mark.parametrize("stored", [[100, 125], "100", [100, 125, "140", 155, 168], {"z1": 100}])
+def test_malformed_stored_zones_fall_back_to_calculated(storage_module, stored):
+    """Чтение терпимо к тому, что уже лежит в бакете."""
+    profile = {**storage_module.empty_athlete_profile(), "hr_max": 178, "hr_zones_custom": stored}
+    derived = storage_module.compute_athlete_derived(profile)
+    assert derived["hr_zones_source"] == "auto" and derived["hr_zones"][0]["from"] == 89
+
+
+def test_manual_zones_are_versioned_with_the_profile(storage_module, fake_bucket):
+    import json
+    profile, _ = storage_module.clean_athlete_profile(FILLED_PROFILE)
+    # версия, записанная до #56, поля не содержит вовсе
+    before = {k: v for k, v in profile.items() if k != "hr_zones_custom"}
+    storage_module.write_athlete_version(fake_bucket, SUB, before, "до ручных зон")
+    assert storage_module.read_athlete_profile(fake_bucket, SUB)[0]["hr_zones_custom"] is None
+
+    storage_module.write_athlete_version(
+        fake_bucket, SUB, {**profile, "hr_zones_custom": MANUAL_ZONES}, "зоны по тесту")
+    assert storage_module.read_athlete_profile(fake_bucket, SUB)[0]["hr_zones_custom"] == MANUAL_ZONES
+
+    storage_module.write_athlete_version(fake_bucket, SUB, profile, "вернул авторасчёт")
+    current, version, _ = storage_module.read_athlete_profile(fake_bucket, SUB)
+    assert version == 3 and current["hr_zones_custom"] is None
+    # сброс — новая версия; ручные зоны остались в истории
+    v2 = json.loads(fake_bucket.blob(f"users/{SUB}/athlete/v2/profile.json").download_as_text())
+    assert v2["profile"]["hr_zones_custom"] == MANUAL_ZONES
+
+
 @pytest.mark.parametrize("text,expected", [
     ("44:30", 2670), ("1:47:20", 6440), ("0:59", 59),
     ("", None), ("не время", None), ("44", None), ("1:2:3:4", None),

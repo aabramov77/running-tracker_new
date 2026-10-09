@@ -52,6 +52,12 @@ def format_profile_block(profile, derived, bests):
         hr.append(f"покой {profile['hr_rest']}")
     if hr:
         lines.append("Пульс: " + ", ".join(hr))
+    # Расчётные зоны не печатаем — в промпте они только именами. Ручные (#56)
+    # спортсмен задал сам, и тренировать его надо по ним.
+    if derived.get("hr_zones_source") == "manual":
+        lines.append("Пульсовые зоны (заданы спортсменом): " + ", ".join(
+            z["name"].split()[0] + " " + (f"{z['from']}–{z['to']}" if z.get("to") else f"от {z['from']}")
+            for z in derived.get("hr_zones") or []))
     if profile.get("vo2max"):
         lines.append(f"МПК: {profile['vo2max']:g}")
 
@@ -338,8 +344,9 @@ def format_run_focus(focus):
         lines.append(f"HR-drift: {'+' if drift >= 0 else ''}{drift}% "
                      "(средний пульс второй половины к первой)")
     if focus.get("zones"):
-        basis = f"макс. пульс {focus.get('hr_max')}" + (
-            " — оценка по возрасту, не измерялся" if focus.get("hr_max_estimated") else "")
+        basis = "границы заданы спортсменом" if focus.get("zones_manual") else (
+            f"макс. пульс {focus.get('hr_max')}" + (
+                " — оценка по возрасту, не измерялся" if focus.get("hr_max_estimated") else ""))
         lines.append(f"Время в пульсовых зонах ({basis}): " + "; ".join(
             f"{z['name']} — {z['min']:g} мин ({z['pct']}%)" for z in focus["zones"]))
     if not laps and not focus.get("zones"):
