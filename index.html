@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=27">
+<link rel="stylesheet" href="style.css?v=28">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -412,6 +412,45 @@
         </div>
       </div>
 
+      <div class="profile-section">Пульсовые зоны</div>
+      <div id="pr-zones-auto">
+        <div class="hr-zones" id="pr-zones-chips"></div>
+        <p class="hint zone-hint" id="pr-zones-auto-hint"></p>
+        <button class="btn-sm" onclick="setZonesManual(true)">✎ Настроить вручную</button>
+      </div>
+      <!-- Подписи и число строк — как в domain.HR_ZONE_BOUNDS -->
+      <div id="pr-zones-manual" style="display:none">
+        <div class="zone-editor">
+          <div class="zone-row">
+            <label for="pr-zone-1">Z1 восстановление</label>
+            <span class="zone-from">от <input type="number" id="pr-zone-1" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+            <span class="zone-to" id="pr-zone-1-to"></span>
+          </div>
+          <div class="zone-row">
+            <label for="pr-zone-2">Z2 аэробная</label>
+            <span class="zone-from">от <input type="number" id="pr-zone-2" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+            <span class="zone-to" id="pr-zone-2-to"></span>
+          </div>
+          <div class="zone-row">
+            <label for="pr-zone-3">Z3 темповая</label>
+            <span class="zone-from">от <input type="number" id="pr-zone-3" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+            <span class="zone-to" id="pr-zone-3-to"></span>
+          </div>
+          <div class="zone-row">
+            <label for="pr-zone-4">Z4 ПАНО</label>
+            <span class="zone-from">от <input type="number" id="pr-zone-4" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+            <span class="zone-to" id="pr-zone-4-to"></span>
+          </div>
+          <div class="zone-row">
+            <label for="pr-zone-5">Z5 максимальная</label>
+            <span class="zone-from">от <input type="number" id="pr-zone-5" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+            <span class="zone-to" id="pr-zone-5-to"></span>
+          </div>
+        </div>
+        <p class="hint zone-hint">Начало каждой зоны, уд/мин; верх зоны — начало следующей. Заданные вручную зоны не пересчитываются, когда меняется максимальный пульс.</p>
+        <button class="btn-sm" onclick="setZonesManual(false)">↺ Вернуть авторасчёт</button>
+      </div>
+
       <div class="profile-section">Тренировки</div>
       <div class="form-grid">
         <div class="form-group">
@@ -766,6 +805,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=43"></script>
+<script src="app.js?v=44"></script>
 </body>
 </html>
