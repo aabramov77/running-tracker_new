@@ -2023,12 +2023,18 @@ const PROFILE_FIELD_LABELS = {
   weekly_km_typical: 'Обычный объём', sessions_per_week: 'Тренировок в неделю',
   long_run_day: 'День длительной', available_days: 'Доступные дни',
   injuries: 'Травмы и ограничения', notes: 'Заметки',
+  hr_zones_custom: 'Пульсовые зоны',
 };
 
 const PB_LABELS = {'4.2km':'4,2 км','5km':'5 км','10km':'10 км','HM':'Полумарафон','M':'Марафон'};
 
 // Пульсовые зоны считает бэкенд — формула живёт в одном месте.
 let PROFILE_DERIVED = null;
+
+// Ручные зоны (#56): поле на зону, в нём её начало. Верх зоны — начало
+// следующей. Режим «вручную» уходит на сервер только с «Сохранить».
+const ZONE_INPUT_IDS = ['pr-zone-1', 'pr-zone-2', 'pr-zone-3', 'pr-zone-4', 'pr-zone-5'];
+let PROFILE_ZONES_MANUAL = false;
 
 // POST /profile заменяет профиль целиком, поэтому сохранять можно только то,
 // что мы успешно загрузили: иначе неудачная загрузка + «Сохранить» затрут
@@ -2046,6 +2052,9 @@ function fillProfileForm(profile) {
   });
   const days = profile.available_days || [];
   profileDayBoxes().forEach(cb => { cb.checked = days.includes(cb.value); });
+  const starts = profile.hr_zones_custom;
+  PROFILE_ZONES_MANUAL = Array.isArray(starts) && starts.length === ZONE_INPUT_IDS.length;
+  fillZoneInputs(PROFILE_ZONES_MANUAL ? starts : null);
 }
 
 function collectProfileForm() {
@@ -2054,7 +2063,55 @@ function collectProfileForm() {
     body[field] = document.getElementById(id).value.trim();
   });
   body.available_days = profileDayBoxes().filter(cb => cb.checked).map(cb => cb.value);
+  // null — зоны считает сервер. Поле шлём всегда: POST заменяет профиль целиком.
+  body.hr_zones_custom = PROFILE_ZONES_MANUAL ? zoneInputs().map(input => input.value.trim()) : null;
   return body;
+}
+
+function zoneInputs() {
+  return ZONE_INPUT_IDS.map(id => document.getElementById(id));
+}
+
+function fillZoneInputs(starts) {
+  zoneInputs().forEach((input, i) => {
+    const v = starts ? starts[i] : null;
+    input.value = (v === null || v === undefined) ? '' : v;
+  });
+}
+
+// Верх зоны на лету: начало следующей, у последней — максимальный пульс.
+function updateZoneEditor() {
+  const inputs = zoneInputs();
+  inputs.forEach((input, i) => {
+    const next = inputs[i + 1];
+    document.getElementById(input.id + '-to').textContent =
+      next ? 'до ' + (next.value.trim() || '—') : 'до макс.';
+  });
+}
+
+function setZonesManual(on) {
+  PROFILE_ZONES_MANUAL = on;
+  // Зоны правят, а не вводят заново: пустые поля заполняем расчётными
+  // границами. Уже введённое не трогаем — случайный «Вернуть авторасчёт»
+  // отменяется обратным переключением.
+  const auto = (PROFILE_DERIVED && PROFILE_DERIVED.hr_zones_auto) || [];
+  if (on && auto.length === ZONE_INPUT_IDS.length && zoneInputs().every(input => !input.value.trim())) {
+    fillZoneInputs(auto.map(z => z.from));
+  }
+  renderHrZones();
+}
+
+function renderHrZones() {
+  document.getElementById('pr-zones-auto').style.display = PROFILE_ZONES_MANUAL ? 'none' : '';
+  document.getElementById('pr-zones-manual').style.display = PROFILE_ZONES_MANUAL ? '' : 'none';
+  if (PROFILE_ZONES_MANUAL) { updateZoneEditor(); return; }
+
+  const zones = (PROFILE_DERIVED && PROFILE_DERIVED.hr_zones_auto) || [];
+  document.getElementById('pr-zones-chips').innerHTML = zones.map(z =>
+    `<span class="hr-zone">${escapeHtml(z.name)} <b>${escapeHtml(z.from)}–${escapeHtml(z.to)}</b></span>`).join('');
+  document.getElementById('pr-zones-auto-hint').textContent = zones.length
+    ? 'Рассчитаны от максимального пульса — ориентир, не медицинская рекомендация. Обновляются после сохранения.'
+    : 'Укажите максимальный пульс или дату рождения и сохраните профиль — зоны рассчитаются сами. Или задайте их вручную.';
 }
 
 // Возраст и ИМТ пересчитываем на лету — арифметика в одну строку.
@@ -2085,20 +2142,13 @@ function renderProfileDerived() {
   const bmi = profileBmiLocal();
   if (bmi !== null) bits.push(`ИМТ: <b>${bmi}</b>`);
 
-  const zones = PROFILE_DERIVED && PROFILE_DERIVED.hr_zones ? PROFILE_DERIVED.hr_zones : [];
   if (PROFILE_DERIVED && PROFILE_DERIVED.hr_max_estimated) {
     bits.push(`HRmax: <b>~${escapeHtml(PROFILE_DERIVED.hr_max_estimated)}</b> <span class="hint">(оценка по возрасту)</span>`);
   }
 
-  if (!bits.length && !zones.length) { el.innerHTML = ''; return; }
-
-  let html = bits.length ? `<div class="derived-row">${bits.join('<span class="derived-sep">·</span>')}</div>` : '';
-  if (zones.length) {
-    html += '<div class="hr-zones">' + zones.map(z =>
-      `<span class="hr-zone">${escapeHtml(z.name)} <b>${escapeHtml(z.from)}–${escapeHtml(z.to)}</b></span>`).join('') + '</div>';
-    html += '<div class="hint" style="margin:6px 0 0">Зоны — ориентир от максимального пульса, не медицинская рекомендация. Обновляются после сохранения.</div>';
-  }
-  el.innerHTML = html;
+  // Зоны живут в своей секции формы — renderHrZones.
+  el.innerHTML = bits.length
+    ? `<div class="derived-row">${bits.join('<span class="derived-sep">·</span>')}</div>` : '';
 }
 
 // Живой пересчёт при вводе (вызывается из oninput)
@@ -2122,6 +2172,7 @@ function applyProfileResponse(data) {
   fillProfileForm(data.profile || {});
   PROFILE_DERIVED = data.derived || null;
   renderProfileDerived();
+  renderHrZones();
   renderPersonalBests(data.personal_bests);
   const label = document.getElementById('profile-version');
   label.textContent = data.version

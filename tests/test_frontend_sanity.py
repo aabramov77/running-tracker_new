@@ -313,6 +313,37 @@ def test_ai_coach_answers_are_escaped_before_markup():
     assert "localStorage" not in section
 
 
+# ── Ручные пульсовые зоны (#56) ───────────────────────────────────────────────
+
+def test_zone_editor_rows_match_the_backend_zones():
+    """Редактор зон размечен статически. Подписи и порядок полей обязаны
+    совпадать с domain.HR_ZONE_BOUNDS: границы уходят на сервер списком, и
+    лишняя или переставленная строка молча сдвинула бы их на зону."""
+    import domain
+
+    html = INDEX.read_text(encoding="utf-8")
+    rows = re.findall(r'<label for="(pr-zone-\d+)">([^<]+)</label>', html)
+    assert [name for _, name in rows] == [name for name, _, _ in domain.HR_ZONE_BOUNDS]
+    for input_id, _ in rows:
+        assert f'id="{input_id}"' in html and f'id="{input_id}-to"' in html
+
+    js = APP_JS.read_text(encoding="utf-8")
+    declared = re.search(r"const ZONE_INPUT_IDS = \[(.*?)\];", js, re.S)
+    assert declared, "ZONE_INPUT_IDS не найден"
+    assert re.findall(r"'([\w-]+)'", declared.group(1)) == [input_id for input_id, _ in rows]
+
+
+def test_profile_save_always_says_which_zones_are_in_force():
+    """POST /profile заменяет профиль целиком: сохранение без этого поля
+    молча вернуло бы ручные зоны к расчётным."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "function collectProfileForm(", "\n}\n")
+    assert "body.hr_zones_custom = PROFILE_ZONES_MANUAL ?" in body and ": null;" in body
+    # режим и поля выставляются из загруженного профиля, а не остаются от прошлого
+    fill = _js_section(js, "function fillProfileForm(", "\n}\n")
+    assert "PROFILE_ZONES_MANUAL = " in fill and "fillZoneInputs(" in fill
+
+
 # ── Данные с сервера в разметке (#53) ─────────────────────────────────────────
 # Пробежки, старты и план тренеру показывает спортсмен, а записать в них он
 # мог что угодно. Поле, вставленное в разметку как есть, исполняется в сессии

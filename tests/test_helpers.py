@@ -205,6 +205,26 @@ def test_profile_block_marks_estimated_hr_max(storage_module):
     assert "оценка" not in lines2 and "макс 190" in lines2
 
 
+def test_profile_block_prints_zones_only_when_the_athlete_set_them(storage_module):
+    """#56: расчётные зоны в промпт не идут, ручные — с границами."""
+    profile = {**storage_module.empty_athlete_profile(), "hr_max": 190}
+    calculated = llm_prompt.format_profile_block(
+        profile, storage_module.compute_athlete_derived(profile), [])
+    assert calculated == ["Пульс: макс 190"]
+
+    manual = {**profile, "hr_zones_custom": [100, 125, 140, 155, 168]}
+    lines = llm_prompt.format_profile_block(
+        manual, storage_module.compute_athlete_derived(manual), [])
+    assert lines == ["Пульс: макс 190",
+                     "Пульсовые зоны (заданы спортсменом): "
+                     "Z1 100–125, Z2 125–140, Z3 140–155, Z4 155–168, Z5 168–190"]
+    # без максимального пульса у последней зоны нет верха
+    open_top = {**manual, "hr_max": None}
+    assert llm_prompt.format_profile_block(
+        open_top, storage_module.compute_athlete_derived(open_top), [])[-1].endswith(
+            "Z4 155–168, Z5 от 168")
+
+
 def test_week_days_str_skips_empty():
     # 5-day legacy week (no tue/thu) renders without them, no crash
     legacy = {"mon": "8", "wed": "6x1", "fri": "10", "sat": "4x2", "sun": "14"}

@@ -278,6 +278,31 @@ def test_profile_number_too_large_for_a_float_is_rejected(api, fake_bucket):
     assert not _stored(fake_bucket, "users/u1/athlete/")
 
 
+@pytest.mark.parametrize("zones", [
+    XSS, 5, True, {"z1": 100}, [100, 120], [[100], 120, 140, 160, 170],
+    [100, 120, XSS, 160, 170], [100, 120, {"from": 140}, 160, 170],
+    [100, 120, 10 ** 400, 160, 170],
+])
+def test_profile_zones_of_a_wrong_shape_are_rejected_and_nothing_is_stored(api, fake_bucket,
+                                                                          zones):
+    """#56: границы зон — список, а внутри него могло прийти что угодно."""
+    _rejected(_post(api, "/profile", {"profile": {"hr_zones_custom": zones}}), "hr_zones_custom")
+    assert not _stored(fake_bucket, "users/u1/athlete/")
+
+
+def test_profile_zones_from_the_form_come_back_as_the_zones_in_force(api):
+    sent = {"hr_max": "185", "hr_zones_custom": ["100", "120", "140", "160", "172"]}
+    saved = _json(_post(api, "/profile", {"profile": sent}))
+    assert saved["profile"]["hr_zones_custom"] == [100, 120, 140, 160, 172]
+    assert saved["derived"]["hr_zones_source"] == "manual"
+    assert saved["derived"]["hr_zones"][-1] == {"name": "Z5 максимальная", "from": 172, "to": 185}
+    assert _json(api(FakeRequest("GET", "/profile")))["derived"] == saved["derived"]
+    # пустое поле возвращает расчёт от максимального пульса
+    reset = _json(_post(api, "/profile", {"profile": {"hr_max": "185", "hr_zones_custom": None}}))
+    assert reset["derived"]["hr_zones_source"] == "auto"
+    assert reset["derived"]["hr_zones"] == reset["derived"]["hr_zones_auto"]
+
+
 @pytest.mark.parametrize("sent,stored", [
     (5, "profile update"), (["вес"], "profile update"), ({"html": XSS}, "profile update"),
     ("  вес\nпосле отпуска ", "вес после отпуска"), ("я" * 500, "я" * 200),
