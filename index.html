@@ -106,6 +106,7 @@
           <select id="plan-select" onchange="switchPlan(this.value)" style="max-width:220px"></select>
           <button class="btn-sm" onclick="createNewPlan()">+ Новый план</button>
           <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
+          <button class="btn-sm" id="plan-history-btn" onclick="showOwnPlanHistory()" style="display:none">История</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <label class="btn-sm desktop-only" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
@@ -522,7 +523,7 @@
     <!-- Мой тренер (#44) -->
     <div class="card" style="margin-bottom:12px">
       <div class="card-title">Мой тренер</div>
-      <p class="hint">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается, и менять ваши данные он не может.</p>
+      <p class="hint">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается. Менять тренер может только планы, и только пока вы это разрешаете.</p>
       <div class="form-grid">
         <div class="form-group full">
           <label>Тренер</label>
@@ -531,6 +532,13 @@
           </select>
         </div>
       </div>
+      <!-- #60: разрешение тренеру править планы, по умолчанию включено -->
+      <label class="check-row" id="coach-plan-edit-row" style="display:none">
+        <input type="checkbox" id="coach-plan-edit" checked onchange="saveCoachPlanEdit(this.checked)">
+        <span>Тренер может создавать и менять мои планы
+          <small>О каждой правке тренер сообщает в диалоге, прежние версии плана остаются в истории. Активный план и архив всегда выбираете вы.</small>
+        </span>
+      </label>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn-primary" id="coach-save-btn" onclick="saveMyCoach()" disabled>Сохранить</button>
         <span id="coach-msg" class="save-msg"></span>

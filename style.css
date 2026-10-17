@@ -210,6 +210,13 @@ table.plan tr:hover td { background: var(--bg-metric); }
   background: var(--bg); color: var(--text);
 }
 
+/* Разрешение тренеру править планы и сообщение о правке в диалоге (#60) */
+.check-row { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; font-size: 13px; cursor: pointer; }
+.check-row input { margin-top: 2px; flex-shrink: 0; }
+.check-row small { display: block; margin-top: 2px; font-size: 12px; color: var(--text-muted); }
+.chat-msg.plan-change { border-left: 3px solid var(--c-blue); }
+.chat-msg.plan-change .btn-sm { display: block; margin-top: 6px; }
+
 /* История плана (#60) */
 .history-row { padding: 8px 0; border-bottom: 0.5px solid var(--border); }
 .history-row:last-of-type { border-bottom: none; }

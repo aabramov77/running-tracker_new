@@ -24,6 +24,7 @@ let currentRole = null;
 let currentUser = {};
 let currentIsCoach = false; // #44: назначен ли пользователь тренером
 let myCoach = null;         // #44: выбранный тренер {sub, name} или null
+let myCoachPlanEdit = true; // #60: разрешено ли тренеру править планы
 let PLANS = [];             // все планы пользователя (#25)
 let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
 let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
@@ -255,11 +256,14 @@ function renderPlanSelectors() {
   const list = livePlans();
   const sel = document.getElementById('plan-select');
   if (sel) {
+    // План, который создал тренер (#60), подписан — спортсмен видит, откуда он.
     sel.innerHTML = list.map(p =>
-      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}</option>`
+      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}${p.created_by_role === 'coach' ? ' · от тренера' : ''}</option>`
     ).join('');
     sel.style.display = list.length ? '' : 'none';
   }
+  const historyBtn = document.getElementById('plan-history-btn');
+  if (historyBtn) historyBtn.style.display = activePlanId() ? '' : 'none';
   const runSel = document.getElementById('f-plan');
   if (runSel) {
     const prev = runSel.value;
@@ -1529,7 +1533,7 @@ function downloadPlanTemplate() {
   downloadFile('plan-template.csv', '﻿' + planToCSV(sample), 'text/csv');
 }
 
-const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства или правкой ИИ-тренера. ' +
+const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства, тренером или правкой ИИ-тренера. ' +
   'Загружена его свежая версия, ваша правка не сохранена.';
 
 /** Пишет недели в активный план (бэкенд создаёт новую версию).
@@ -1629,6 +1633,13 @@ function closePlanHistory(event) {
   if (event && event.target !== document.getElementById('plan-history-overlay')) return;
   planHistorySession++;
   document.getElementById('plan-history-overlay').classList.remove('active');
+}
+
+function showOwnPlanHistory() {
+  const id = activePlanId();
+  if (!id) return;
+  showPlanHistory(`${API_URL}plans/${encodeURIComponent(id)}/history`,
+                  `История плана «${planLabel(ACTIVE_PLAN)}»`);
 }
 
 function renderMetrics() {
@@ -2894,6 +2905,72 @@ function renderMyCoach(coaches) {
   select.disabled = empty;
   document.getElementById('coach-save-btn').disabled = empty;
   flashCoachMsg(empty ? 'Тренеров пока нет — их назначает администратор.' : '', true, true);
+  renderCoachPlanEdit();
+}
+
+// Переключатель «тренер может менять мои планы» (#60) — только при выбранном тренере.
+function renderCoachPlanEdit() {
+  document.getElementById('coach-plan-edit-row').style.display = myCoach ? '' : 'none';
+  document.getElementById('coach-plan-edit').checked = myCoachPlanEdit;
+}
+
+async function saveCoachPlanEdit(allow) {
+  const box = document.getElementById('coach-plan-edit');
+  box.disabled = true;
+  try {
+    const res = await fetch(API_URL + 'my/coach/plan-edit', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ allow }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) {
+      // 409 — тренера уже нет (сняли роль или отказались в другой вкладке)
+      flashCoachMsg(res.status === 409 ? '⚠ Тренер больше не назначен' : '⚠ Не удалось сохранить', false);
+      loadMyCoach();
+      return;
+    }
+    myCoachPlanEdit = (await res.json()).can_edit_plans !== false;
+    flashCoachMsg(myCoachPlanEdit ? '✓ Тренер может менять ваши планы'
+                                  : '✓ Тренер больше не может менять ваши планы — только смотреть', true);
+  } catch (e) {
+    flashCoachMsg('⚠ ' + e.message, false);
+  } finally {
+    box.disabled = false;
+    renderCoachPlanEdit();
+  }
+}
+
+// Сообщение тренера о правке плана (#60) в диалоге: «Открыть план».
+// Спортсмену — к своему плану, тренеру — к этому плану на экране спортсмена.
+async function openChangedPlan(key, index) {
+  const m = CHATS[key].messages[index];
+  if (!m || !m.plan_id) return;
+  if (key === 'coach') {
+    if (COACH.plans.some(p => p.id === m.plan_id)) coachPickPlan(m.plan_id);
+    return;
+  }
+  await loadPlans();
+  const plan = livePlans().find(p => p.id === m.plan_id);
+  if (!plan) { alert('Этого плана нет в списке — возможно, он в архиве.'); return; }
+  if (plan.id !== activePlanId()) {
+    // Какой план вести, решает спортсмен: спрашиваем, а не переключаем молча.
+    if (confirm(`Тренер изменил план «${planLabel(plan)}», а активный у вас другой. Сделать его активным?`))
+      await switchPlan(plan.id);
+  } else if (!planEditMode) {
+    await loadPlan();
+    renderAll();
+  }
+  showTab('plan');
+}
+
+// В диалог пришло сообщение о правке: свой план перечитываем. Открытый
+// конструктор не трогаем — его сохранение и так встретит plan_stale (#51).
+async function onCoachChangedPlan() {
+  if (planEditMode) return;
+  await loadPlans();
+  await loadPlan();
+  renderAll();
 }
 
 async function loadMyCoach() {
@@ -2904,7 +2981,9 @@ async function loadMyCoach() {
     ]);
     if (coachesRes.status === 401 || mineRes.status === 401) { handleAuthError(); return; }
     if (!coachesRes.ok || !mineRes.ok) throw new Error('HTTP ' + (coachesRes.ok ? mineRes.status : coachesRes.status));
-    myCoach = (await mineRes.json()).coach || null;
+    const mine = await mineRes.json();
+    myCoach = mine.coach || null;
+    myCoachPlanEdit = mine.can_edit_plans !== false;
     renderMyCoach((await coachesRes.json()).coaches || []);
   } catch (e) {
     flashCoachMsg('⚠ Не удалось загрузить список тренеров', false);
@@ -2937,6 +3016,8 @@ async function saveMyCoach() {
       return;
     }
     myCoach = data.coach || null;
+    myCoachPlanEdit = data.can_edit_plans !== false;   // у нового тренера — снова по умолчанию
+    renderCoachPlanEdit();
     select.value = myCoach ? myCoach.sub : '';
     applyRole(currentRole);      // вкладка «Тренер» появляется и пропадает вместе с тренером
     refreshCoachBadge();
@@ -3590,8 +3671,8 @@ const CHATS = {
 };
 // session растёт при каждом открытии и закрытии: ответ, пришедший в уже
 // другой диалог (сменили спортсмена, ушли со вкладки), отбрасывается.
-Object.values(CHATS).forEach(chat =>
-  Object.assign(chat, { messages: [], hasMore: false, open: false, session: 0 }));
+Object.entries(CHATS).forEach(([key, chat]) =>
+  Object.assign(chat, { key, messages: [], hasMore: false, open: false, session: 0 }));
 
 function chatEl(chat, name) { return document.getElementById(`${chat.prefix}-${name}`); }
 
@@ -3633,12 +3714,24 @@ function chatTime(ts) {
     { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+// Сообщение о правке плана (#60) пишет сервер от имени тренера: оно выделено и
+// ведёт к плану. В обработчик уходит номер сообщения, а не id плана из данных.
+function chatMessageHtml(chat, m, index) {
+  const mine = m.from_role === chat.role ? ' mine' : '';
+  const time = `<span class="chat-time">${chatTime(m.ts)}</span>`;
+  const key = chat.key === 'coach' ? 'coach' : 'my';
+  // Без переносов внутри: у сообщения white-space: pre-wrap, они стали бы пустыми строками.
+  if (m.kind === 'plan_change' && m.plan_id)
+    return `<div class="chat-msg plan-change${mine}">${escapeHtml(m.text)}` +
+      `<button class="btn-sm" onclick="openChangedPlan('${key}',${Number(index)})">Открыть план</button>${time}</div>`;
+  return `<div class="chat-msg${mine}">${escapeHtml(m.text)}${time}</div>`;
+}
+
 function chatRender(chat, scrollToEnd) {
   const log = chatEl(chat, 'log');
   chatEl(chat, 'earlier').style.display = chat.hasMore ? '' : 'none';
   log.innerHTML = chat.messages.length
-    ? chat.messages.map(m =>
-        `<div class="chat-msg${m.from_role === chat.role ? ' mine' : ''}">${escapeHtml(m.text)}<span class="chat-time">${chatTime(m.ts)}</span></div>`).join('')
+    ? chat.messages.map((m, i) => chatMessageHtml(chat, m, i)).join('')
     : '<div class="empty">Сообщений пока нет</div>';
   if (scrollToEnd) log.scrollTop = log.scrollHeight;
 }
@@ -3690,6 +3783,8 @@ async function chatPull(key) {
   // К новому прокручиваем, только если человек и так был внизу или написал сам.
   chatRender(chat, wasAtEnd || fresh.some(m => m.from_role === chat.role));
   if (fresh.some(m => m.from_role !== chat.role)) chatMarkRead(key);
+  // Тренер поменял план (#60) — спортсмен сразу видит свежий.
+  if (key === 'my' && fresh.some(m => m.kind === 'plan_change')) onCoachChangedPlan();
 }
 
 async function chatEarlier(key) {

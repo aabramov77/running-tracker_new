@@ -647,11 +647,38 @@ def test_unsaved_coach_draft_is_not_dropped_silently():
     assert 'onclick="leaveCoachAthlete()"' in html and 'onchange="coachPickPlan(this.value)"' in html
 
 
+def test_athlete_controls_plan_editing_from_the_coach_card():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="coach-plan-edit"' in html and 'onchange="saveCoachPlanEdit(this.checked)"' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "'my/coach/plan-edit'" in _js_section(js, "async function saveCoachPlanEdit(", "\n}\n")
+    assert "mine.can_edit_plans" in _js_section(js, "async function loadMyCoach(", "\n}\n")
+    # у нового тренера разрешение снова по умолчанию — берём его из ответа сервера
+    assert "data.can_edit_plans" in _js_section(js, "async function saveMyCoach(", "\n}\n")
+    assert "тренером" in _js_section(js, "const PLAN_STALE_TEXT", ";\n")
+
+
+def test_plan_change_message_leads_to_the_plan():
+    js = APP_JS.read_text(encoding="utf-8")
+    html_fn = _js_section(js, "function chatMessageHtml(", "\n}\n")
+    assert "'plan_change'" in html_fn and "Number(index)" in html_fn
+    assert "chatMessageHtml(chat, m, i)" in _js_section(js, "function chatRender(", "\n}\n")
+    # переход к плану — код спортсмена, вне экрана тренера с его чужими данными
+    assert "function openChangedPlan(" not in _coach_section(js)
+    opener = _js_section(js, "async function openChangedPlan(", "\n}\n")
+    assert opener.index("confirm(") < opener.index("switchPlan("), "активный план — только с согласия"
+    assert "onCoachChangedPlan()" in _js_section(js, "async function chatPull(", "\n}\n")
+    refresh = _js_section(js, "async function onCoachChangedPlan(", "\n}\n")
+    assert refresh.index("planEditMode") < refresh.index("loadPlan()")
+
+
 def test_plan_history_is_wired():
     html = INDEX.read_text(encoding="utf-8")
     assert 'id="plan-history-overlay"' in html and 'id="plan-history-body"' in html
     js = APP_JS.read_text(encoding="utf-8")
     assert "showPlanHistory(coachUrl(" in _js_section(js, "function coachShowHistory() {", "\n}\n")
+    assert 'onclick="showOwnPlanHistory()"' in html
+    assert "/history`" in _js_section(js, "function showOwnPlanHistory() {", "\n}\n")
     # «Вы» определяется по sub автора, а не по роли: история общая для обеих сторон
     assert "v.author_sub === userSub" in _js_section(js, "function planHistoryAuthor(", "\n}\n")
 
