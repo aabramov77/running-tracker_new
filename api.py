@@ -18,7 +18,7 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
-                     LLMTruncated, PlanStale, RegistrationClosed, UsageBusy,
+                     LLMTruncated, PlansIndexBusy, PlanStale, RegistrationClosed, UsageBusy,
                      _fmt_duration, _fmt_pace,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
@@ -309,9 +309,19 @@ def h_coach_plan_create(c):
     version = 0
     if weeks:
         # План только что создан, поэтому основа — «недель ещё нет».
-        version = save_plan_weeks(c.bucket, athlete, plan["id"], weeks,
-                                  reason or "Тренер: новый план", c.email,
-                                  base_version=0, author=author)["version"]
+        try:
+            version = save_plan_weeks(c.bucket, athlete, plan["id"], weeks,
+                                      reason or "Тренер: новый план", c.email,
+                                      base_version=0, author=author)["version"]
+        except Exception:
+            # Недели не записались — пустой план в списке не оставляем, иначе
+            # повтор запроса дал бы спортсмену два одноимённых плана. Удаление
+            # логическое, как и любое другое (best-effort: сбой уже в логе).
+            try:
+                archive_plan(c.bucket, athlete, plan["id"])
+            except Exception:
+                logging.exception("could not archive half-created plan %s", plan["id"])
+            raise
     notified = _notify_athlete(c, athlete, "create", plan, version or None, reason)
     return jresp({"plan": plan, "version": version, "notified": notified}, 201)
 
@@ -321,11 +331,17 @@ def h_coach_plan_meta(c):
     meta, errors = clean_plan_meta(c.body())
     if errors:
         return validation_failed(errors)
-    if not _coach_writable_plan(c, athlete):
+    current = _coach_writable_plan(c, athlete)
+    if not current:
         return jresp({"error": "plan not found"}, 404)
+    # Форма шлёт все поля разом: «Сохранить» без правок — не повод писать
+    # событие и сообщать спортсмену об изменении, которого нет.
+    if all((current.get(f) or "") == (v or "") for f, v in meta.items()):
+        return jresp({"plan": current, "notified": False, "changed": False}, 200)
     plan = update_plan_meta(c.bucket, athlete, c.args[1], meta,
                             author=plan_author("coach", c.sub))
-    return jresp({"plan": plan, "notified": _notify_athlete(c, athlete, "meta", plan)}, 200)
+    return jresp({"plan": plan, "notified": _notify_athlete(c, athlete, "meta", plan),
+                  "changed": True}, 200)
 
 
 def h_coach_plan_weeks_post(c):
@@ -1147,6 +1163,10 @@ def handle_request(request):
         return jresp({"error": "forbidden"}, 403)
     except EditNotAllowed:
         return jresp({"error": "edit_not_allowed"}, 403)
+    except PlansIndexBusy:
+        # Реестр планов всё время меняют параллельно (#60): повтор поможет,
+        # поэтому это не ошибка сервера.
+        return jresp({"error": "plans_busy"}, 503)
     except RunNotFound:
         return jresp({"error": "run not found"}, 404)
     except NoCoach:

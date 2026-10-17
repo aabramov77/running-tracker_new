@@ -1131,6 +1131,50 @@ def test_coach_edits_the_race_card(api, patched_api, fake_bucket):
     assert own["target_time"] == "1:35"
 
 
+def test_unchanged_race_card_is_not_reported_as_a_change(api, patched_api, fake_bucket):
+    """Форма шлёт все поля: «Сохранить» без правок не пишет событие и не шлёт
+    спортсмену «Тренер изменил карточку»."""
+    plan_id = _coached(api, patched_api, fake_bucket)
+    card = {"race_name": "HM", "race_date": "", "target_time": "", "plan_start": "2026-08-17"}
+    before = _athlete_store(fake_bucket)
+    body, code, _ = api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/meta", card), **COACH)
+    assert code == 200 and json.loads(body)["changed"] is False
+    assert json.loads(body)["notified"] is False
+    assert _athlete_store(fake_bucket) == before
+    assert _chat(api, MY_CHAT)["messages"] == []
+
+
+def test_failed_weeks_write_does_not_leave_an_empty_plan(api, patched_api, fake_bucket,
+                                                         monkeypatch):
+    plan_id = _coached(api, patched_api, fake_bucket)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("GCS недоступен")
+
+    monkeypatch.setattr(patched_api, "save_plan_weeks", broken)
+    body, code, _ = api(FakeRequest("POST", COACH_PLANS,
+                                    {"race_name": "Осень", "weeks": W1}), **COACH)
+    assert code == 500
+    index = json.loads(api(FakeRequest("GET", "/plans"))[0])
+    created = [p for p in index["plans"] if p["id"] != plan_id]
+    # план остался только логически удалённым — повтор не даст двух одноимённых
+    assert len(created) == 1 and created[0]["archived"] is True
+    assert index["active_plan_id"] == plan_id
+    assert _chat(api, MY_CHAT)["messages"] == []
+
+
+def test_plans_index_contention_is_a_retryable_503(api, patched_api, fake_bucket, monkeypatch):
+    _coached(api, patched_api, fake_bucket)
+
+    def busy(*args, **kwargs):
+        raise patched_api.PlansIndexBusy()
+
+    monkeypatch.setattr(patched_api, "create_plan", busy)
+    for who, path in (({}, "/plans"), (COACH, COACH_PLANS)):
+        body, code, _ = api(FakeRequest("POST", path, {"race_name": "X"}), **who)
+        assert (code, json.loads(body)) == (503, {"error": "plans_busy"}), path
+
+
 def test_coach_cannot_edit_unknown_or_archived_plans(api, patched_api, fake_bucket):
     plan_id = _coached(api, patched_api, fake_bucket)
     for tail, body in (("meta", {"target_time": "1:35"}), ("weeks", {"weeks": W2, "base_version": 1})):

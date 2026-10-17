@@ -665,6 +665,36 @@ def test_both_plan_importers_and_race_forms_share_one_code_path():
     assert "fillRaceFields('cp', plan)" in _js_section(js, "function coachOpenRaceForm(", "\n}\n")
 
 
+def test_coach_saves_only_real_changes():
+    """«Сохранить» без правок не пишет версию и не шлёт спортсмену сообщение."""
+    js = APP_JS.read_text(encoding="utf-8")
+    save = _js_section(js, "async function coachSavePlan() {", "\n}\n")
+    assert save.index("coachDirty()") < save.index("coachPost(")
+    assert "res.changed === false" in _js_section(js, "async function coachSaveRace() {", "\n}\n")
+
+
+def test_coach_write_failures_do_not_invite_duplicates_or_false_claims():
+    js = APP_JS.read_text(encoding="utf-8")
+    as_new = _js_section(js, "async function coachSaveAsNewPlan() {", "\n}\n")
+    assert as_new.index("coachStopEdit()") < as_new.index("coachReloadPlans(")
+    stale = _js_section(js, "async function coachStale(", "\n}\n")
+    assert stale.index("!COACH.base") < stale.index("coachStartEdit()")
+    sync = _js_section(js, "function coachSyncCanEdit(", "\n}\n")
+    assert "coachDirty()" in sync, "несохранённую правку не выбрасываем молча"
+
+
+def test_athlete_plan_follows_coach_changes_seen_in_the_chat():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "planChangeUnseen" in _js_section(js, "async function chatOpen(", "\n}\n")
+    assert "planChangeUnseen" in _js_section(js, "async function chatPull(", "\n}\n")
+
+
+def test_flash_messages_share_one_helper():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("function coachFlash(", "function coachRaceFlash(", "async function saveRaceMeta("):
+        assert "flashMsg(" in _js_section(js, name, "\n}\n"), name
+
+
 def test_athlete_controls_plan_editing_from_the_coach_card():
     html = INDEX.read_text(encoding="utf-8")
     assert 'id="coach-plan-edit"' in html and 'onchange="saveCoachPlanEdit(this.checked)"' in html

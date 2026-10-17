@@ -1077,11 +1077,15 @@ def _read_plans_index_raw(bucket, sub):
     return data
 
 
-def write_plans_index(bucket, sub, index):
-    bucket.blob(p_plans_index(sub)).upload_from_string(
-        json.dumps(index, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+def _create_plans_index(bucket, sub, index):
+    """Пишет реестр, только если его ещё нет. None — его успел создать другой
+    запрос (if_generation_match=0)."""
+    try:
+        bucket.blob(p_plans_index(sub)).upload_from_string(
+            json.dumps(index, ensure_ascii=False, indent=2),
+            content_type="application/json", if_generation_match=0)
+    except PreconditionFailed:
+        return None
     return index
 
 
@@ -1239,7 +1243,7 @@ def migrate_single_plan(bucket, sub):
 
     if not old_manifest_blob.exists() and not has_profile:
         # Нечего мигрировать — пустой реестр
-        return write_plans_index(bucket, sub, index)
+        return _create_plans_index(bucket, sub, index) or _read_plans_index_raw(bucket, sub)
 
     plan = {
         "id": _new_plan_id(),
@@ -1249,7 +1253,10 @@ def migrate_single_plan(bucket, sub):
     }
     index["plans"].append(plan)
     index["active_plan_id"] = plan["id"]
-    write_plans_index(bucket, sub, index)
+    if _create_plans_index(bucket, sub, index) is None:
+        # Параллельный запрос (тренер и спортсмен разом, #60) уже перенёс план:
+        # второй перенос с другим id затёр бы первый и перепривязал пробежки.
+        return _read_plans_index_raw(bucket, sub)
 
     # Текущие недели старого плана → v1 нового
     if old_manifest_blob.exists():
@@ -2051,10 +2058,6 @@ def coach_access(bucket, coach_sub, athlete_sub):
     return "edit" if coach_plan_edit_allowed(athlete) else "view"
 
 
-def coach_can_access(bucket, coach_sub, athlete_sub):
-    return coach_access(bucket, coach_sub, athlete_sub) is not None
-
-
 def set_coach_plan_edit(bucket, sub, allow):
     """Спортсмен разрешает или запрещает тренеру править планы (#60).
 
@@ -2078,8 +2081,10 @@ def set_coach_plan_edit(bucket, sub, allow):
 
 
 def my_coach_plan_edit(bucket, sub):
-    """Как стоит переключатель у пользователя — для его карточки «Мой тренер»."""
-    return coach_plan_edit_allowed(read_registry(bucket).get("users", {}).get(sub))
+    """Как стоит переключатель у пользователя — для его карточки «Мой тренер».
+    Реестр мимо кэша: переключатель мог поменяться на соседнем инстансе, и
+    спортсмен увидел бы галочку не там, где она стоит на самом деле."""
+    return coach_plan_edit_allowed(_fresh_registry(bucket).get("users", {}).get(sub))
 
 
 def list_athletes_of(bucket, coach_sub):

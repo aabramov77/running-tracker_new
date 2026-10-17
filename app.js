@@ -360,13 +360,7 @@ function toggleRaceForm(show) {
 
 async function saveRaceMeta() {
   const body = readRaceFields('p');
-  const msg = document.getElementById('race-meta-msg');
-  const flash = (text, ok) => {
-    msg.style.display = 'inline';
-    msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
-    msg.textContent = text;
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2000 : 4000);
-  };
+  const flash = (text, ok) => flashMsg(document.getElementById('race-meta-msg'), text, ok, ok ? 2000 : 4000);
 
   const creating = planFormMode === 'create';
   if (creating && !body.race_name) { flash('⚠ Введите название гонки', false); return; }
@@ -447,6 +441,8 @@ function escapeHtml(s) {
 // перечнем — показываем его, а не голый код ответа.
 async function apiError(res) {
   const data = await res.json().catch(() => ({}));
+  // Реестр планов меняют параллельно (#60) — это не сбой, повтор поможет.
+  if (data.error === 'plans_busy') return new Error('Планы сейчас меняют с другого устройства — попробуйте ещё раз');
   if (data.error !== 'validation_failed' || !data.fields) return new Error(`HTTP ${res.status}`);
   const text = Object.entries(data.fields).map(([field, why]) => `${field} — ${why}`).join('; ');
   return Object.assign(new Error('Проверьте данные: ' + text), { code: 'validation_failed' });
@@ -495,6 +491,16 @@ function setStatus(msg, type = 'ok') {
   if (!el) return;
   el.textContent = msg;
   el.style.color = type === 'ok' ? 'var(--c-accent)' : type === 'warn' ? 'var(--c-warn)' : 'var(--c-danger)';
+}
+
+// Короткая подпись рядом с кнопкой: показывается и через ms прячется сама.
+// Таймер свой у каждого элемента — прежний не спрячет новое сообщение.
+function flashMsg(el, text, ok, ms) {
+  clearTimeout(el._flashTimer);
+  el.style.display = text ? 'inline' : 'none';
+  el.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
+  el.textContent = text;
+  if (text && ms) el._flashTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
 }
 
 async function loadPlan() {
@@ -2975,6 +2981,15 @@ async function openChangedPlan(key, index) {
   showTab('plan');
 }
 
+// Правка тренера, которой нет в загруженных данных: такого плана в списке
+// ещё нет, или у активного версия новее той, что на экране.
+function planChangeUnseen(m) {
+  if (m.kind !== 'plan_change') return false;
+  if (!PLANS.some(p => p.id === m.plan_id)) return true;
+  return m.plan_id === activePlanId() && !!PLAN_BASE && PLAN_BASE.plan_id === m.plan_id
+    && Number(m.plan_version) > PLAN_BASE.version;
+}
+
 // В диалог пришло сообщение о правке: свой план перечитываем. Открытый
 // конструктор не трогаем — его сохранение и так встретит plan_stale (#51).
 async function onCoachChangedPlan() {
@@ -3108,14 +3123,8 @@ function coachEditRevoked() {
                        { editRevoked: true });
 }
 
-let _coachMsgTimerPlan = null;
 function coachFlash(text, ok) {
-  const msg = document.getElementById('coach-plan-msg');
-  clearTimeout(_coachMsgTimerPlan);
-  msg.style.display = text ? 'inline' : 'none';
-  msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
-  msg.textContent = text;
-  if (text) _coachMsgTimerPlan = setTimeout(() => { msg.style.display = 'none'; }, ok ? 5000 : 8000);
+  flashMsg(document.getElementById('coach-plan-msg'), text, ok, ok ? 5000 : 8000);
 }
 
 // Сообщение после записи. Спортсмену о правке пишет сервер — в общий диалог.
@@ -3143,9 +3152,13 @@ function coachSyncCanEdit(athletes) {
   if (!fresh || fresh.can_edit === open.can_edit) return;
   open.can_edit = fresh.can_edit;
   if (!coachCanEdit() && (COACH.editing || COACH.raceForm)) {
-    coachStopEdit();
     coachCloseRaceForm();
-    coachFlash('Спортсмен выключил вам правку своих планов — остался только просмотр.', false);
+    // Набранное молча не выбрасываем: сохранить его уже нельзя, но можно
+    // скопировать или переслать спортсмену в диалоге.
+    const kept = COACH.editing && coachDirty();
+    if (!kept) coachStopEdit();
+    coachFlash('Спортсмен выключил вам правку своих планов — остался только просмотр.' +
+               (kept ? ' Несохранённые правки пока на экране, «Отмена» их уберёт.' : ''), false);
   }
   renderCoachAthlete();
 }
@@ -3231,6 +3244,14 @@ function coachChangeNote() {
 async function coachSavePlan() {
   const plan = coachPlan();
   if (!COACH.editing || !plan || !COACH.base) return;
+  // Без правок не пишем: пустая версия сделала бы устаревшими открытые
+  // правки спортсмена и ИИ, а спортсмен получил бы «Тренер изменил план».
+  if (!coachDirty()) {
+    coachStopEdit();
+    renderCoachAthlete();
+    coachFlash('Изменений нет — сохранять нечего', true);
+    return;
+  }
   const athlete = COACH.athlete, planId = plan.id;
   const btn = document.getElementById('coach-save-btn');
   const label = btn.textContent;
@@ -3257,6 +3278,12 @@ async function coachStale(athlete, planId) {
   const note = document.getElementById('coach-change-note').value;
   await selectCoachPlan(planId);
   if (COACH.athlete !== athlete || COACH.planId !== planId) return;
+  if (!COACH.base) {
+    // Свежий план не загрузился — о «загруженной свежей версии» не говорим.
+    alert('Спортсмен успел изменить план, а загрузить свежую версию не удалось. ' +
+          'Ваша правка не сохранена — обновите экран и внесите её заново.');
+    return;
+  }
   if (!importing) {
     coachStartEdit();
     document.getElementById('coach-change-note').value = note;
@@ -3268,11 +3295,7 @@ async function coachStale(athlete, planId) {
 // ── Новый план и карточка гонки (#60) ──
 
 function coachRaceFlash(text, ok) {
-  const msg = document.getElementById('coach-race-msg');
-  msg.style.display = 'inline';
-  msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
-  msg.textContent = text;
-  setTimeout(() => { if (msg.textContent === text) msg.style.display = 'none'; }, 5000);
+  flashMsg(document.getElementById('coach-race-msg'), text, ok, 5000);
 }
 
 function coachOpenRaceForm(mode) {
@@ -3340,6 +3363,11 @@ async function coachSaveRace() {
     const planId = COACH.planId;
     const res = await coachPost(`plans/${coachEnc(planId)}/meta`, body);
     if (COACH.athlete !== athlete) return;
+    if (res.changed === false) {         // сервер ничего не записал и спортсмену не писал
+      coachCloseRaceForm();
+      coachFlash('Без изменений', true);
+      return;
+    }
     COACH.plans = COACH.plans.map(p => p.id === res.plan.id ? res.plan : p);
     coachCloseRaceForm();
     renderCoachHeader();
@@ -3415,6 +3443,10 @@ async function coachSaveAsNewPlan() {
       weeks: coachDraftWeeks(), change_reason: coachChangeNote(),
     });
     if (COACH.athlete !== athlete) return;
+    // План уже создан: закрываем предпросмотр до перечитывания, иначе при его
+    // сбое повторное «Создать новый план» дало бы второй такой же план.
+    coachStopEdit();
+    renderCoachAthlete();
     await coachReloadPlans(res.plan.id);
     coachSaved(res.notified, coachCreatedText(res.plan.id));
   } catch (e) {
@@ -3612,7 +3644,7 @@ function renderCoachHeader() {
   show('coach-edit-note', COACH.athlete.can_edit === false);
   show('coach-save-bar', COACH.editing);
   show('coach-save-btn', COACH.editing && editable);
-  show('coach-save-new-btn', COACH.editing && !!COACH.importInfo);
+  show('coach-save-new-btn', COACH.editing && !!COACH.importInfo && canEdit);
   document.getElementById('coach-save-btn').textContent =
     COACH.importInfo ? 'Сохранить в этот план' : 'Сохранить изменения';
 }
@@ -3772,6 +3804,9 @@ async function chatOpen(key) {
     chat.hasMore = !!page.has_more;
     chatRender(chat, true);
     chatMarkRead(key);
+    // Правки тренера, сделанные, пока диалог был закрыт (#60): план на экране
+    // мог устареть ещё до открытия диалога.
+    if (key === 'my' && chat.messages.some(planChangeUnseen)) onCoachChangedPlan();
   } catch (e) {
     if (!e.handled && chat.session === session)
       chatEl(chat, 'log').innerHTML = '<div class="empty">Не удалось загрузить диалог</div>';
@@ -3806,8 +3841,10 @@ async function chatPull(key) {
   // К новому прокручиваем, только если человек и так был внизу или написал сам.
   chatRender(chat, wasAtEnd || fresh.some(m => m.from_role === chat.role));
   if (fresh.some(m => m.from_role !== chat.role)) chatMarkRead(key);
-  // Тренер поменял план (#60) — спортсмен сразу видит свежий.
-  if (key === 'my' && fresh.some(m => m.kind === 'plan_change')) onCoachChangedPlan();
+  // Тренер поменял активный план или создал новый (#60) — спортсмен сразу
+  // видит свежий. Правка другого плана на экране ничего не меняет.
+  if (key === 'my' && fresh.some(m => m.kind === 'plan_change'
+      && (m.plan_id === activePlanId() || planChangeUnseen(m)))) onCoachChangedPlan();
 }
 
 async function chatEarlier(key) {
