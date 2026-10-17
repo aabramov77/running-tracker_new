@@ -44,6 +44,9 @@ def p_races(sub):              return f"{upfx(sub)}races.json"
 def p_plans_index(sub):        return f"{upfx(sub)}plans/index.json"
 def p_plan_manifest(sub, pid): return f"{upfx(sub)}plans/{pid}/manifest.json"
 def p_plan_ver(sub, pid, v):   return f"{upfx(sub)}plans/{pid}/v{v}/plan.json"
+# Правка карточки гонки (#60): событие с прежними и новыми значениями
+def p_plan_meta_prefix(sub, pid):     return f"{upfx(sub)}plans/{pid}/meta/"
+def p_plan_meta_event(sub, pid, eid): return f"{p_plan_meta_prefix(sub, pid)}{eid}.json"
 # Одиночный план до #25 — только для ленивой миграции
 def p_singleplan_manifest(sub): return f"{upfx(sub)}plan/manifest.json"
 def p_singleplan_ver(sub, v):   return f"{upfx(sub)}plan/v{v}/plan.json"
@@ -976,10 +979,14 @@ def read_plan_history(bucket, sub, plan_id, limit=PLAN_HISTORY_LIMIT):
     numbers = sorted({int(m.group(1)) for blob in bucket.list_blobs(prefix=prefix)
                       if (m := _PLAN_VER_RE.search(blob.name))}, reverse=True)
     page = numbers[:limit]
-    payloads = _load_json_objects(bucket, [p_plan_ver(sub, plan_id, v) for v in page])
+    # Нечитаемая версия выпадает из истории, а не роняет её целиком.
+    payloads = _load_json_objects(bucket, [p_plan_ver(sub, plan_id, v) for v in page],
+                                  skip_broken=True)
     users = read_registry(bucket).get("users", {})
     versions = []
     for number, payload in zip(page, payloads):
+        if not isinstance(payload, dict):
+            continue
         role = _version_author_role(payload)
         author_sub = (payload.get("author") or {}).get("sub")
         if author_sub is None and role in ("athlete", "ai"):
@@ -1099,63 +1106,121 @@ def get_active_plan(bucket, sub):
     return find_plan(index, index.get("active_plan_id"))
 
 
+# Реестр планов с #60 пишут двое — спортсмен и его тренер, и «прочитал,
+# поправил, записал» из двух запросов разом теряло бы одну из правок. Запись
+# идёт с предусловием, как у счётчика обращений к LLM: объект с момента
+# чтения меняли — читаем заново и повторяем.
+PLANS_INDEX_WRITE_ATTEMPTS = 8
+_PLAN_META_EVENT_RE = re.compile(r"^\d{8}T\d{12}-[a-z]+-[0-9a-f]{8}$")
+
+
+class PlansIndexBusy(Exception):
+    """Реестр планов не удалось обновить: его всё время меняют параллельно."""
+
+
+def _update_plans_index(bucket, sub, change):
+    """change(index) правит реестр на месте и возвращает результат; None —
+    записывать нечего. При повторе change зовётся заново на свежем реестре."""
+    path = p_plans_index(sub)
+    for _ in range(PLANS_INDEX_WRITE_ATTEMPTS):
+        blob = bucket.get_blob(path)                # вместе с номером поколения
+        if blob is None:
+            read_plans_index(bucket, sub)           # ленивая миграция создаст реестр
+            blob = bucket.get_blob(path)
+        try:
+            index = json.loads(blob.download_as_text())
+            index.setdefault("plans", [])
+            index.setdefault("active_plan_id", None)
+            result = change(index)
+            if result is None:
+                return None
+            bucket.blob(path).upload_from_string(
+                json.dumps(index, ensure_ascii=False, indent=2),
+                content_type="application/json", if_generation_match=blob.generation)
+            return result
+        except (PreconditionFailed, NotFound):
+            continue        # реестр успели изменить — берём свежий
+    raise PlansIndexBusy()
+
+
 def create_plan(bucket, sub, meta, make_active=True, author=None):
     """Новый план в реестре. make_active=False — активным он станет, только
     если активного плана нет (так создаёт план тренер, #60)."""
-    index = read_plans_index(bucket, sub)
-    plan = {
-        "id": _new_plan_id(),
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "archived": False,
-        **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
-    }
-    if author:
-        plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
-    index["plans"].append(plan)
-    if make_active or not index.get("active_plan_id"):
-        index["active_plan_id"] = plan["id"]
-    write_plans_index(bucket, sub, index)
-    return plan
+    def add(index):
+        plan = {
+            "id": _new_plan_id(),
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "archived": False,
+            **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
+        }
+        if author:
+            plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
+        index["plans"].append(plan)
+        if make_active or not index.get("active_plan_id"):
+            index["active_plan_id"] = plan["id"]
+        return plan
+
+    return _update_plans_index(bucket, sub, add)
 
 
 def set_active_plan(bucket, sub, plan_id):
-    index = read_plans_index(bucket, sub)
-    plan = find_plan(index, plan_id)
-    if not plan or plan.get("archived"):
-        return None
-    index["active_plan_id"] = plan_id
-    write_plans_index(bucket, sub, index)
-    return plan
+    def activate(index):
+        plan = find_plan(index, plan_id)
+        if not plan or plan.get("archived"):
+            return None
+        index["active_plan_id"] = plan_id
+        return plan
+
+    return _update_plans_index(bucket, sub, activate)
 
 
 def update_plan_meta(bucket, sub, plan_id, meta, author=None):
-    index = read_plans_index(bucket, sub)
-    plan = find_plan(index, plan_id)
-    if not plan:
-        return None
-    for f in PLAN_META_FIELDS:
-        if f in meta:
-            plan[f] = meta.get(f) or ""
-    plan["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    if author:
-        plan["updated_by_role"], plan["updated_by_sub"] = author["role"], author["sub"]
-    write_plans_index(bucket, sub, index)
+    """Правит карточку гонки плана. Реестр перезаписывается, поэтому прежние
+    значения уходят в неизменяемое событие рядом с планом (#60): после правки
+    тренером спортсмен может узнать, что стояло раньше."""
+    before = {}
+
+    def edit(index):
+        plan = find_plan(index, plan_id)
+        if not plan:
+            return None
+        before.clear()
+        before.update({f: plan.get(f, "") for f in PLAN_META_FIELDS})
+        for f in PLAN_META_FIELDS:
+            if f in meta:
+                plan[f] = meta.get(f) or ""
+        plan["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        if author:
+            plan["updated_by_role"], plan["updated_by_sub"] = author["role"], author["sub"]
+        return plan
+
+    plan = _update_plans_index(bucket, sub, edit)
+    if plan:
+        # Время в id строго растёт, как у сообщений чата: порядок событий —
+        # порядок правок, даже если часы инстанса грубее двух правок подряд.
+        ids = _message_ids(bucket, p_plan_meta_prefix(sub, plan_id), _PLAN_META_EVENT_RE)
+        event_id, _ = _next_message_id(ids, (author or {}).get("role") or "owner")
+        event = {"plan_id": plan_id, "ts": plan["updated_at"], "author": author,
+                 "before": before, "after": {f: plan.get(f, "") for f in PLAN_META_FIELDS}}
+        bucket.blob(p_plan_meta_event(sub, plan_id, event_id)).upload_from_string(
+            json.dumps(event, ensure_ascii=False, indent=2), content_type="application/json")
     return plan
 
 
 def archive_plan(bucket, sub, plan_id):
     """Логическое удаление: archived=true. Объекты плана не удаляются."""
-    index = read_plans_index(bucket, sub)
-    plan = find_plan(index, plan_id)
-    if not plan:
-        return None
-    plan["archived"] = True
-    plan["archived_at"] = datetime.utcnow().isoformat() + "Z"
-    if index.get("active_plan_id") == plan_id:
-        remaining = active_plans(index)
-        index["active_plan_id"] = remaining[0]["id"] if remaining else None
-    write_plans_index(bucket, sub, index)
-    return plan
+    def archive(index):
+        plan = find_plan(index, plan_id)
+        if not plan:
+            return None
+        plan["archived"] = True
+        plan["archived_at"] = datetime.utcnow().isoformat() + "Z"
+        if index.get("active_plan_id") == plan_id:
+            remaining = active_plans(index)
+            index["active_plan_id"] = remaining[0]["id"] if remaining else None
+        return plan
+
+    return _update_plans_index(bucket, sub, archive)
 
 
 def migrate_single_plan(bucket, sub):
@@ -2085,10 +2150,16 @@ def _next_message_id(ids, role):
     return f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}", now
 
 
-def _load_json_objects(bucket, paths):
-    """Объект на сообщение — это запрос на сообщение; читаем параллельно."""
+def _load_json_objects(bucket, paths, skip_broken=False):
+    """Объект на сообщение — это запрос на сообщение; читаем параллельно.
+    skip_broken — нечитаемый объект даёт None вместо исключения."""
     def load(path):
-        return json.loads(bucket.blob(path).download_as_text())
+        try:
+            return json.loads(bucket.blob(path).download_as_text())
+        except Exception:
+            if not skip_broken:
+                raise
+            return None
 
     if len(paths) > 1:
         with ThreadPoolExecutor(max_workers=8) as pool:

@@ -647,6 +647,24 @@ def test_unsaved_coach_draft_is_not_dropped_silently():
     assert 'onclick="leaveCoachAthlete()"' in html and 'onchange="coachPickPlan(this.value)"' in html
 
 
+def test_open_athlete_picks_up_a_changed_permission():
+    """Спортсмен включил или выключил правку, пока экран открыт: свежий список
+    спортсменов (счётчик непрочитанных, «Обновить») обновляет и открытого."""
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("async function refreshCoachBadge(", "async function loadCoachAthletes("):
+        assert "coachSyncCanEdit(" in _js_section(js, name, "\n}\n"), name
+
+
+def test_both_plan_importers_and_race_forms_share_one_code_path():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("function importPlanFile(", "function coachImportFile("):
+        body = _js_section(js, name, "\n}\n")
+        assert "readPlanFile(file" in body and "new FileReader" not in body, name
+    for name, prefix in (("async function saveRaceMeta(", "'p'"), ("async function coachSaveRace(", "'cp'")):
+        assert f"readRaceFields({prefix})" in _js_section(js, name, "\n}\n"), name
+    assert "fillRaceFields('cp', plan)" in _js_section(js, "function coachOpenRaceForm(", "\n}\n")
+
+
 def test_athlete_controls_plan_editing_from_the_coach_card():
     html = INDEX.read_text(encoding="utf-8")
     assert 'id="coach-plan-edit"' in html and 'onchange="saveCoachPlanEdit(this.checked)"' in html

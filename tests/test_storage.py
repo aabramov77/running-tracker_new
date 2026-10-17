@@ -505,6 +505,64 @@ def test_plan_meta_edit_records_who_made_it(storage_module, fake_bucket):
     assert (upd["updated_by_role"], upd["updated_by_sub"]) == ("coach", "c1")
 
 
+def test_plan_meta_edit_keeps_the_previous_values(storage_module, fake_bucket):
+    """Карточка гонки живёт в перезаписываемом реестре: прежние значения
+    уходят в неизменяемое событие на каждую правку."""
+    plan = storage_module.create_plan(fake_bucket, SUB, {"race_name": "HM", "plan_start": "2026-09-07"})
+    coach = storage_module.plan_author("coach", "c1")
+    storage_module.update_plan_meta(fake_bucket, SUB, plan["id"], {"plan_start": "2026-09-14"},
+                                    author=coach)
+    storage_module.update_plan_meta(fake_bucket, SUB, plan["id"], {"target_time": "1:35"})
+
+    prefix = f"users/{SUB}/plans/{plan['id']}/meta/"
+    events = [json.loads(b.download_as_text()) for b in fake_bucket.list_blobs(prefix=prefix)]
+    assert [(e["before"]["plan_start"], e["after"]["plan_start"]) for e in events] == [
+        ("2026-09-07", "2026-09-14"), ("2026-09-14", "2026-09-14")]
+    assert events[0]["author"] == coach and events[1]["author"] is None
+    assert (events[1]["before"]["target_time"], events[1]["after"]["target_time"]) == ("", "1:35")
+    # событие — не версия недель: история плана его не видит
+    assert storage_module.read_plan_history(fake_bucket, SUB, plan["id"])["versions"] == []
+
+
+def test_plans_index_write_does_not_lose_a_concurrent_change(storage_module, fake_bucket):
+    """Тренер создаёт план, пока спортсмен переключает активный: запись по
+    устаревшему реестру отклоняется и повторяется поверх свежего."""
+    first = storage_module.create_plan(fake_bucket, SUB, {"race_name": "A"})
+    second = storage_module.create_plan(fake_bucket, SUB, {"race_name": "B"})       # активен
+    raced = []
+
+    def add_with_a_race(index):
+        if not raced:                         # «соседний запрос» успел между чтением и записью
+            raced.append(True)
+            storage_module.set_active_plan(fake_bucket, SUB, first["id"])
+        index["plans"].append({"id": "coach-plan", "archived": False})
+        return index["plans"][-1]
+
+    storage_module._update_plans_index(fake_bucket, SUB, add_with_a_race)
+    index = storage_module.read_plans_index(fake_bucket, SUB)
+    assert [p["id"] for p in index["plans"]] == [first["id"], second["id"], "coach-plan"]
+    assert index["active_plan_id"] == first["id"]           # переключение спортсмена цело
+
+
+def test_plans_index_gives_up_when_it_keeps_changing(storage_module, fake_bucket):
+    plan = storage_module.create_plan(fake_bucket, SUB, {"race_name": "A"})
+
+    def always_raced(index):
+        storage_module.set_active_plan(fake_bucket, SUB, plan["id"])    # каждый раз кто-то пишет
+        return index
+
+    with pytest.raises(storage_module.PlansIndexBusy):
+        storage_module._update_plans_index(fake_bucket, SUB, always_raced)
+
+
+def test_unreadable_version_drops_out_of_the_history(storage_module, fake_bucket):
+    for i in range(3):
+        storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": i}], f"v{i + 1}")
+    fake_bucket.blob(f"users/{SUB}/plans/{PID}/v2/plan.json").upload_from_string("{не json")
+    history = storage_module.read_plan_history(fake_bucket, SUB, PID)
+    assert [v["version"] for v in history["versions"]] == [3, 1]
+
+
 # ── plans registry (#25) ──────────────────────────────────────────────────────
 
 def test_create_and_switch_plans(storage_module, fake_bucket):

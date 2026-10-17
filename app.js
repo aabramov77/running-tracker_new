@@ -276,14 +276,23 @@ function renderPlanSelectors() {
   fillRaceForm();
 }
 
-function fillRaceForm() {
-  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
-  const race = ACTIVE_PLAN || {};
-  set('p-race-name', race.race_name);
-  set('p-race-date', race.race_date);
-  set('p-target-time', race.target_time);
-  set('p-plan-start', race.plan_start);
+// Поля карточки гонки. Форм две — своя (p-*) и у тренера (cp-*, #60), — поля
+// у них одни и те же, отличается только префикс id.
+function fillRaceFields(prefix, race) {
+  const set = (id, v) => { const el = document.getElementById(`${prefix}-${id}`); if (el) el.value = v || ''; };
+  set('race-name', race?.race_name);
+  set('race-date', race?.race_date);
+  set('target-time', race?.target_time);
+  set('plan-start', race?.plan_start);
 }
+
+function readRaceFields(prefix) {
+  const val = id => document.getElementById(`${prefix}-${id}`).value;
+  return { race_name: val('race-name').trim(), race_date: val('race-date'),
+           target_time: val('target-time').trim(), plan_start: val('plan-start') };
+}
+
+function fillRaceForm() { fillRaceFields('p', ACTIVE_PLAN); }
 
 async function loadPlans() {
   try {
@@ -332,8 +341,7 @@ function openPlanForm(mode) {
   document.getElementById('race-archive-btn').style.display =
     mode === 'create' ? 'none' : '';
   if (mode === 'create') {
-    ['p-race-name', 'p-race-date', 'p-target-time', 'p-plan-start']
-      .forEach(id => { document.getElementById(id).value = ''; });
+    fillRaceFields('p', null);
     document.getElementById('p-race-name').focus();
   } else {
     fillRaceForm();
@@ -351,12 +359,7 @@ function toggleRaceForm(show) {
 }
 
 async function saveRaceMeta() {
-  const body = {
-    race_name: document.getElementById('p-race-name').value.trim(),
-    race_date: document.getElementById('p-race-date').value,
-    target_time: document.getElementById('p-target-time').value.trim(),
-    plan_start: document.getElementById('p-plan-start').value,
-  };
+  const body = readRaceFields('p');
   const msg = document.getElementById('race-meta-msg');
   const flash = (text, ok) => {
     msg.style.display = 'inline';
@@ -1332,23 +1335,31 @@ function parsePlanJSON(text) {
   return { weeks, race, warnings };
 }
 
-function importPlanFile(file) {
-  if (!file) return;
-  const input = document.getElementById('plan-import-file');
+/** Читает файл плана (CSV или JSON) и отдаёт разбор в onParsed:
+ *  {weeks, race, warnings} либо {errors}. Общий для загрузки спортсменом
+ *  и тренером (#60). */
+function readPlanFile(file, onParsed) {
   const reader = new FileReader();
   reader.onload = e => {
     const text = (e.target.result || '').replace(/^﻿/, '');   // Excel BOM
     const looksJson = /\.json$/i.test(file.name) || /^\s*[\[{]/.test(text);
-    const res = looksJson ? parsePlanJSON(text) : parsePlanCSV(text);
+    onParsed(looksJson ? parsePlanJSON(text) : parsePlanCSV(text));
+  };
+  reader.onerror = () => onParsed({ errors: ['Не удалось прочитать файл'] });
+  reader.readAsText(file, 'UTF-8');
+}
+
+function importPlanFile(file) {
+  if (!file) return;
+  const input = document.getElementById('plan-import-file');
+  readPlanFile(file, res => {
     if (input) input.value = '';
     if (res.errors && res.errors.length) {
       renderImportBar({ fileName: file.name, errors: res.errors });
       return;
     }
     applyImportedPlan(res.weeks, file.name, res.warnings || [], res.race || null);
-  };
-  reader.onerror = () => renderImportBar({ fileName: file.name, errors: ['Не удалось прочитать файл'] });
-  reader.readAsText(file, 'UTF-8');
+  });
 }
 
 /** Показывает загруженный план в конструкторе, ничего не сохраняя. */
@@ -2968,9 +2979,9 @@ async function openChangedPlan(key, index) {
 // конструктор не трогаем — его сохранение и так встретит plan_stale (#51).
 async function onCoachChangedPlan() {
   if (planEditMode) return;
-  await loadPlans();
-  await loadPlan();
-  renderAll();
+  await loadPlans();          // селекторы, заголовок, метрики
+  await loadPlan();           // таблица, неделя, «Сегодня», план/факт
+  renderLog();                // журнал зависит от активного плана
 }
 
 async function loadMyCoach() {
@@ -3123,6 +3134,21 @@ function coachWriteFailed(e, flash) {
 }
 
 function coachCanEdit() { return !!(COACH.athlete && COACH.athlete.can_edit === true); }
+
+// Разрешение правки могло измениться, пока экран спортсмена открыт: свежий
+// список спортсменов приходит и со счётчиком непрочитанных (#60).
+function coachSyncCanEdit(athletes) {
+  const open = COACH.athlete;
+  const fresh = open && athletes.find(a => a.sub === open.sub);
+  if (!fresh || fresh.can_edit === open.can_edit) return;
+  open.can_edit = fresh.can_edit;
+  if (!coachCanEdit() && (COACH.editing || COACH.raceForm)) {
+    coachStopEdit();
+    coachCloseRaceForm();
+    coachFlash('Спортсмен выключил вам правку своих планов — остался только просмотр.', false);
+  }
+  renderCoachAthlete();
+}
 function coachPlan() { return COACH.plans.find(p => p.id === COACH.planId) || null; }
 function coachEnc(id) { return encodeURIComponent(id); }
 
@@ -3256,11 +3282,7 @@ function coachOpenRaceForm(mode) {
   if (mode === 'create' && !coachConfirmDiscard()) return;
   if (mode === 'create' && COACH.editing) { coachStopEdit(); renderCoachAthlete(); }
   COACH.raceForm = mode;
-  const set = (id, v) => { document.getElementById(id).value = v || ''; };
-  set('cp-race-name', plan?.race_name);
-  set('cp-race-date', plan?.race_date);
-  set('cp-target-time', plan?.target_time);
-  set('cp-plan-start', plan?.plan_start);
+  fillRaceFields('cp', plan);
   document.getElementById('coach-race-title').textContent =
     mode === 'create' ? 'Новый план для спортсмена' : 'Гонка этого плана';
   document.getElementById('coach-race-save').textContent = mode === 'create' ? 'Создать план' : 'Сохранить';
@@ -3300,9 +3322,7 @@ async function coachReloadPlans(selectId) {
 async function coachSaveRace() {
   const mode = COACH.raceForm;
   if (!mode) return;
-  const val = id => document.getElementById(id).value;
-  const body = { race_name: val('cp-race-name').trim(), race_date: val('cp-race-date'),
-                 target_time: val('cp-target-time').trim(), plan_start: val('cp-plan-start') };
+  const body = readRaceFields('cp');
   if (mode === 'create' && !body.race_name) { coachRaceFlash('⚠ Введите название гонки', false); return; }
   const athlete = COACH.athlete;
   const btn = document.getElementById('coach-race-save');
@@ -3369,12 +3389,8 @@ function coachImportFile(file) {
   if (input) input.value = '';
   if (!file || !coachCanEdit() || !coachConfirmDiscard()) return;
   const athlete = COACH.athlete;
-  const reader = new FileReader();
-  reader.onload = e => {
+  readPlanFile(file, res => {
     if (COACH.athlete !== athlete) return;
-    const text = (e.target.result || '').replace(/^﻿/, '');   // Excel BOM
-    const looksJson = /\.json$/i.test(file.name) || /^\s*[\[{]/.test(text);
-    const res = looksJson ? parsePlanJSON(text) : parsePlanCSV(text);
     if (res.errors && res.errors.length) { coachImportBar({ fileName: file.name, errors: res.errors }); return; }
     coachCloseRaceForm();
     COACH.editing = true;
@@ -3382,9 +3398,7 @@ function coachImportFile(file) {
     coachSetDraft(res.weeks);
     renderCoachAthlete();
     coachImportBar({ fileName: file.name, count: res.weeks.length, warnings: res.warnings || [] });
-  };
-  reader.onerror = () => coachImportBar({ fileName: file.name, errors: ['Не удалось прочитать файл'] });
-  reader.readAsText(file, 'UTF-8');
+  });
 }
 
 async function coachSaveAsNewPlan() {
@@ -3425,6 +3439,7 @@ async function loadCoachAthletes() {
     if (res.status === 403) { el.innerHTML = '<div class="empty">Вы не назначены тренером</div>'; return; }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     COACH.athletes = (await res.json()).athletes || [];
+    coachSyncCanEdit(COACH.athletes);
     el.innerHTML = COACH.athletes.length
       // В onclick идёт индекс, а не sub: так в разметку не попадает чужая строка.
       ? COACH.athletes.map((a, i) => `<div class="run-item" onclick="openCoachAthlete(${i})" style="cursor:pointer">
@@ -3452,6 +3467,7 @@ function openCoachTab() {
   if (COACH.athlete) {
     renderCoachAthlete();     // график в скрытой вкладке не имел размера
     chatPull('coach');
+    refreshCoachBadge();      // заодно сверит разрешение правки (#60)
     return;
   }
   if (currentIsCoach) loadCoachAthletes();
@@ -3869,7 +3885,11 @@ async function refreshCoachBadge() {
     }
     if (currentIsCoach) {
       const res = await fetch(API_URL + 'coach/athletes', { headers: authHeaders() });
-      if (res.ok) total += ((await res.json()).athletes || []).reduce((s, a) => s + (a.unread || 0), 0);
+      if (res.ok) {
+        const athletes = (await res.json()).athletes || [];
+        coachSyncCanEdit(athletes);
+        total += athletes.reduce((s, a) => s + (a.unread || 0), 0);
+      }
     }
   } catch (e) { return; }
   show(total);
