@@ -3,6 +3,7 @@
 Multi-user: all data helpers are namespaced by `sub`. The fake (conftest
 FakeBucket) implements only the blob/list_blobs/copy_blob surface we use.
 """
+import json
 import time
 
 import pytest
@@ -407,6 +408,101 @@ def test_save_plan_weeks_rejects_a_first_write_over_existing_weeks(storage_modul
     with pytest.raises(storage_module.PlanStale):
         storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 9}], "second", base_version=0)
     assert storage_module.read_plan_weeks(fake_bucket, SUB, PID) == [{"w": 1}]
+
+
+# ── автор версии и история плана (#60) ────────────────────────────────────────
+
+def test_plan_version_records_its_author(storage_module, fake_bucket):
+    coach = storage_module.plan_author("coach", "c1")
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "правка тренера",
+                                   "c1@example.com", base_version=0, author=coach)
+    manifest = storage_module.read_plan_manifest(fake_bucket, SUB, PID)
+    assert manifest["author"] == {"role": "coach", "sub": "c1"}
+    version = storage_module.read_plan_version(fake_bucket, manifest["gcs_object_path"])
+    assert version["author"] == {"role": "coach", "sub": "c1"}
+    assert version["created_by"] == "c1@example.com"
+
+
+def test_plan_version_without_author_stays_as_before(storage_module, fake_bucket):
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "seed")
+    manifest = storage_module.read_plan_manifest(fake_bucket, SUB, PID)
+    assert "author" not in manifest
+    assert "author" not in storage_module.read_plan_version(fake_bucket, manifest["gcs_object_path"])
+
+
+def _registered(storage_module, fake_bucket, sub, name):
+    storage_module.resolve_user(fake_bucket, {"sub": sub, "email": f"{sub}@example.com",
+                                              "name": name})
+
+
+def test_plan_history_newest_first_with_names_but_no_emails(storage_module, fake_bucket):
+    _registered(storage_module, fake_bucket, SUB, "Аня")
+    _registered(storage_module, fake_bucket, "c1", "Пётр Тренер")
+    save, author = storage_module.save_plan_weeks, storage_module.plan_author
+    save(fake_bucket, SUB, PID, [{"w": 1}], "своя", f"{SUB}@example.com",
+         author=author("athlete", SUB))
+    save(fake_bucket, SUB, PID, [{"w": 2}], "тренер поправил", "c1@example.com",
+         author=author("coach", "c1"))
+    save(fake_bucket, SUB, PID, [{"w": 3}], "ИИ-тренер: легче", f"{SUB}@example.com",
+         author=author("ai", SUB))
+
+    history = storage_module.read_plan_history(fake_bucket, SUB, PID)
+    assert history["has_more"] is False
+    assert [(v["version"], v["author_role"], v["author_sub"], v["author_name"], v["change_reason"])
+            for v in history["versions"]] == [
+        (3, "ai", SUB, "Аня", "ИИ-тренер: легче"),
+        (2, "coach", "c1", "Пётр Тренер", "тренер поправил"),
+        (1, "athlete", SUB, "Аня", "своя"),
+    ]
+    assert all(v["created_at"].endswith("Z") for v in history["versions"])
+    assert "@" not in json.dumps(history, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("created_by,reason,role", [
+    ("auto-migrate", "migrated from single plan (#25)", "migration"),
+    ("runner@example.com", "ИИ-тренер: сдвинул интервалы", "ai"),
+    ("runner@example.com", "manual edit", "athlete"),
+])
+def test_history_guesses_the_author_of_versions_written_before_60(storage_module, fake_bucket,
+                                                                  created_by, reason, role):
+    storage_module.write_plan_version(fake_bucket, SUB, PID, 1, [{"w": 1}], reason, created_by)
+    (version,) = storage_module.read_plan_history(fake_bucket, SUB, PID)["versions"]
+    assert version["author_role"] == role
+    assert version["author_sub"] == (None if role == "migration" else SUB)
+
+
+def test_plan_history_is_bounded_and_says_so(storage_module, fake_bucket):
+    for i in range(5):
+        storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": i}], f"v{i + 1}")
+    history = storage_module.read_plan_history(fake_bucket, SUB, PID, limit=3)
+    assert [v["version"] for v in history["versions"]] == [5, 4, 3]
+    assert history["has_more"] is True
+
+
+def test_plan_history_ignores_other_plans_and_stray_objects(storage_module, fake_bucket):
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], "мой")
+    storage_module.save_plan_weeks(fake_bucket, SUB, f"{PID}0", [{"w": 1}], "соседний")
+    fake_bucket.blob(f"users/{SUB}/plans/{PID}/v2/notes.txt").upload_from_string("x")
+    history = storage_module.read_plan_history(fake_bucket, SUB, PID)
+    assert [(v["version"], v["change_reason"]) for v in history["versions"]] == [(1, "мой")]
+    assert storage_module.read_plan_history(fake_bucket, SUB, "nope")["versions"] == []
+
+
+def test_coach_plan_is_marked_and_does_not_take_over(storage_module, fake_bucket):
+    mine = storage_module.create_plan(fake_bucket, SUB, {"race_name": "Мой"})
+    theirs = storage_module.create_plan(fake_bucket, SUB, {"race_name": "От тренера"},
+                                        make_active=False,
+                                        author=storage_module.plan_author("coach", "c1"))
+    assert (theirs["created_by_role"], theirs["created_by_sub"]) == ("coach", "c1")
+    assert "created_by_role" not in mine
+    assert storage_module.get_active_plan(fake_bucket, SUB)["id"] == mine["id"]
+
+
+def test_plan_meta_edit_records_who_made_it(storage_module, fake_bucket):
+    plan = storage_module.create_plan(fake_bucket, SUB, {"race_name": "HM"})
+    upd = storage_module.update_plan_meta(fake_bucket, SUB, plan["id"], {"target_time": "1:35"},
+                                          author=storage_module.plan_author("coach", "c1"))
+    assert (upd["updated_by_role"], upd["updated_by_sub"]) == ("coach", "c1")
 
 
 # ── plans registry (#25) ──────────────────────────────────────────────────────

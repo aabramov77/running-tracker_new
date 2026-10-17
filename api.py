@@ -29,23 +29,24 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
                      clean_effort, clean_plan_meta, clean_plan_weeks,
                      clean_proposal, clean_race, clean_run,
-                     cleanup_old_tmp, coach_can_access,
+                     cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      compute_athlete_derived, create_ai_thread, create_plan,
                      current_coach, find_own_run, find_plan, get_active_plan,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
                      mark_proposal_states, mask_key,
-                     migrate_legacy_to_user, parse_coach_reply, parse_fit_file,
+                     migrate_legacy_to_user, my_coach_plan_edit, notify_plan_change,
+                     parse_coach_reply, parse_fit_file, plan_author,
                      read_advice_usage, read_ai_messages,
                      read_ai_thread, read_athlete_history,
                      read_athlete_profile,
-                     read_llm_config_full, read_plan_state, read_plan_weeks,
+                     read_llm_config_full, read_plan_history, read_plan_state,
                      read_plans_index,
                      read_races, read_registry, read_run_details, read_runs,
                      release_advice_usage, reserve_advice_usage,
                      resolve_user, run_title, save_plan_weeks, set_active_plan,
-                     set_coach_flag, set_user_coach, set_user_status,
-                     update_plan_meta,
+                     set_coach_flag, set_coach_plan_edit, set_user_coach,
+                     set_user_status, update_plan_meta,
                      write_athlete_version, write_llm_config_version,
                      write_parsed_fit_to_tmp, write_races, write_runs)
 
@@ -158,7 +159,8 @@ def h_coaches(c):
 def h_my_coach_get(c):
     coach = current_coach(c.bucket, c.sub)
     unread = chat_unread(c.bucket, c.sub, coach["sub"], "athlete") if coach else 0
-    return jresp({"coach": coach, "unread": unread}, 200)
+    return jresp({"coach": coach, "unread": unread,
+                  "can_edit_plans": my_coach_plan_edit(c.bucket, c.sub)}, 200)
 
 
 def h_my_coach_post(c):
@@ -171,29 +173,52 @@ def h_my_coach_post(c):
     if coach_sub is not None and not isinstance(coach_sub, str):
         return jresp({"error": "Invalid coach_sub"}, 400)
     try:
-        set_user_coach(c.bucket, c.sub, coach_sub)
+        rec = set_user_coach(c.bucket, c.sub, coach_sub)
     except CoachLinkError as e:
         return jresp({"error": str(e)}, 400)
-    return jresp({"coach": current_coach(c.bucket, c.sub)}, 200)
+    return jresp({"coach": current_coach(c.bucket, c.sub),
+                  "can_edit_plans": coach_plan_edit_allowed(rec)}, 200)
+
+
+def h_my_coach_plan_edit(c):
+    """Переключатель «тренер может менять мои планы» (#60)."""
+    allow = c.body().get("allow")
+    if not isinstance(allow, bool):
+        return jresp({"error": "Missing or invalid allow"}, 400)
+    try:
+        rec = set_coach_plan_edit(c.bucket, c.sub, allow)
+    except CoachLinkError:
+        raise NoCoach()
+    return jresp({"can_edit_plans": coach_plan_edit_allowed(rec)}, 200)
 
 
 # ── Тренер (#44): просмотр данных спортсмена ──────────────────────────────────
-# Только чтение. Профиль спортсмена сюда не входит намеренно: тренеру открыты
-# планы, выполнение и журнал — но не вес, пульс и травмы.
+# Профиль спортсмена сюда не входит намеренно: тренеру открыты планы,
+# выполнение и журнал — но не вес, пульс и травмы. Править тренер может только
+# планы, и только пока спортсмен это разрешает (#60).
 
 class Forbidden(Exception):
     """Нет права на чужие данные → 403 (см. handle_request)."""
 
 
-def _coached_athlete(c):
+class EditNotAllowed(Exception):
+    """Спортсмен выключил тренеру правку планов → 403 edit_not_allowed (#60)."""
+
+
+def _coached_athlete(c, edit=False):
     """sub спортсмена из пути — если текущий пользователь его тренер.
 
     Ответ одинаков для чужого спортсмена и для несуществующего sub, поэтому
-    перебором идентификаторов ничего не узнать.
+    перебором идентификаторов ничего не узнать. edit=True — нужна ещё и
+    правка планов. Отдельный код у этого отказа ничего не раскрывает: его
+    получает только тот, кому спортсмен и так открыл свои данные.
     """
     athlete = c.args[0]
-    if not coach_can_access(c.bucket, c.sub, athlete):
+    access = coach_access(c.bucket, c.sub, athlete)
+    if access is None:
         raise Forbidden()
+    if edit and access != "edit":
+        raise EditNotAllowed()
     return athlete
 
 
@@ -214,7 +239,14 @@ def h_coach_plan_weeks(c):
     athlete, plan_id = _coached_athlete(c), c.args[1]
     if not find_plan(read_plans_index(c.bucket, athlete), plan_id):
         return jresp({"error": "plan not found"}, 404)
-    return jresp(read_plan_weeks(c.bucket, athlete, plan_id), 200)
+    return _plan_weeks_resp(c, plan_id, athlete)
+
+
+def h_coach_plan_history(c):
+    athlete, plan_id = _coached_athlete(c), c.args[1]
+    if not find_plan(read_plans_index(c.bucket, athlete), plan_id):
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(read_plan_history(c.bucket, athlete, plan_id), 200)
 
 
 def h_coach_plan_compliance(c):
@@ -233,6 +265,88 @@ def h_coach_run_details(c):
     # Скрытую спортсменом пробежку тренер не видит ни в журнале, ни по id.
     return _run_details_response(c.bucket, _coached_athlete(c), int(c.args[1]),
                                  include_deleted=False)
+
+
+# ── Тренер (#60): правка планов спортсмена ────────────────────────────────────
+# Пишется то же, что пишет сам спортсмен: реестр планов и версии недель. Плюс
+# автор в каждой записи и сообщение спортсмену в общий чат. Активный план и
+# архив остаются за спортсменом — таких маршрутов у тренера нет.
+
+def _coach_writable_plan(c, athlete):
+    """План спортсмена из пути, если его можно править: архивный — нельзя."""
+    plan = find_plan(read_plans_index(c.bucket, athlete), c.args[1])
+    return plan if plan and not plan.get("archived") else None
+
+
+def _notify_athlete(c, athlete, change, plan, version=None, comment=""):
+    """Сообщение спортсмену о правке. План к этому моменту уже записан, поэтому
+    сбой чата правку не отменяет: он уходит в лог, а клиент узнаёт о нём из
+    notified=false."""
+    try:
+        notify_plan_change(c.bucket, athlete, c.sub, change, plan, version, comment)
+        return True
+    except Exception:
+        logging.exception("plan change notification failed: athlete=%s plan=%s",
+                          athlete, plan.get("id"))
+        return False
+
+
+def h_coach_plan_create(c):
+    athlete = _coached_athlete(c, edit=True)
+    body = c.body()
+    meta, errors = clean_plan_meta(body)
+    weeks = []
+    if body.get("weeks") is not None:
+        weeks, week_errors = clean_plan_weeks(body["weeks"])
+        errors.update(week_errors)
+    if errors:
+        return validation_failed(errors)
+    author = plan_author("coach", c.sub)
+    # Активным план тренера становится, только если активного нет: какой план
+    # сейчас ведёт спортсмен, решает он сам.
+    plan = create_plan(c.bucket, athlete, meta, make_active=False, author=author)
+    reason = clean_change_reason(body.get("change_reason"))
+    version = 0
+    if weeks:
+        # План только что создан, поэтому основа — «недель ещё нет».
+        version = save_plan_weeks(c.bucket, athlete, plan["id"], weeks,
+                                  reason or "Тренер: новый план", c.email,
+                                  base_version=0, author=author)["version"]
+    notified = _notify_athlete(c, athlete, "create", plan, version or None, reason)
+    return jresp({"plan": plan, "version": version, "notified": notified}, 201)
+
+
+def h_coach_plan_meta(c):
+    athlete = _coached_athlete(c, edit=True)
+    meta, errors = clean_plan_meta(c.body())
+    if errors:
+        return validation_failed(errors)
+    if not _coach_writable_plan(c, athlete):
+        return jresp({"error": "plan not found"}, 404)
+    plan = update_plan_meta(c.bucket, athlete, c.args[1], meta,
+                            author=plan_author("coach", c.sub))
+    return jresp({"plan": plan, "notified": _notify_athlete(c, athlete, "meta", plan)}, 200)
+
+
+def h_coach_plan_weeks_post(c):
+    athlete = _coached_athlete(c, edit=True)
+    plan = _coach_writable_plan(c, athlete)
+    if not plan:
+        return jresp({"error": "plan not found"}, 404)
+    body = c.body()
+    if "weeks" not in body:
+        return jresp({"error": "Missing weeks"}, 400)
+    # Старого клиента, который пишет без сверки, у этого маршрута нет: правка
+    # тренера всегда опирается на версию, которую он видел (#51).
+    if body.get("base_version") is None:
+        return jresp({"error": "Missing base_version"}, 400)
+    result, error = _save_plan_weeks(c, athlete, plan["id"], body,
+                                     plan_author("coach", c.sub))
+    if error:
+        return error
+    reason = clean_change_reason(body.get("change_reason"))
+    result["notified"] = _notify_athlete(c, athlete, "weeks", plan, result["version"], reason)
+    return jresp(result, 201)
 
 
 # ── Тренер (#44): чат ─────────────────────────────────────────────────────────
@@ -690,7 +804,8 @@ def h_plans_post(c):
     meta, errors = clean_plan_meta(c.body())
     if errors:
         return validation_failed(errors)
-    return jresp(create_plan(c.bucket, c.sub, meta), 201)
+    return jresp(create_plan(c.bucket, c.sub, meta,
+                             author=plan_author("athlete", c.sub)), 201)
 
 
 def h_plan_activate(c):
@@ -704,7 +819,8 @@ def h_plan_meta(c):
     meta, errors = clean_plan_meta(c.body())
     if errors:
         return validation_failed(errors)
-    plan = update_plan_meta(c.bucket, c.sub, c.args[0], meta)
+    plan = update_plan_meta(c.bucket, c.sub, c.args[0], meta,
+                            author=plan_author("athlete", c.sub))
     if not plan:
         return jresp({"error": "plan not found"}, 404)
     return jresp(plan, 200)
@@ -717,11 +833,11 @@ def h_plan_archive(c):
     return jresp({"ok": True, "plan": plan}, 200)
 
 
-def _plan_weeks_resp(c, plan_id):
-    """Недели плана. С ?meta=1 — вместе с plan_id и версией, которую клиент
-    вернёт в base_version; без параметра — голый массив, как его ждёт
-    фронтенд, загруженный до #51."""
-    state = read_plan_state(c.bucket, c.sub, plan_id)
+def _plan_weeks_resp(c, plan_id, sub=None):
+    """Недели плана (своего или, для тренера, спортсмена sub). С ?meta=1 —
+    вместе с plan_id и версией, которую клиент вернёт в base_version; без
+    параметра — голый массив, как его ждёт фронтенд, загруженный до #51."""
+    state = read_plan_state(c.bucket, sub or c.sub, plan_id)
     return jresp(state if c.request.args.get("meta") == "1" else state["weeks"], 200)
 
 
@@ -730,20 +846,25 @@ def _plan_stale():
     return jresp({"error": "plan_stale"}, 409)
 
 
-def _save_plan_weeks(c, plan_id, body):
+def _save_plan_weeks(c, sub, plan_id, body, author):
+    """Новая версия недель плана sub → (результат, None) или (None, ответ с ошибкой)."""
     base_version = body.get("base_version")
     if base_version is not None and (type(base_version) is not int or base_version < 0):
-        return jresp({"error": "invalid base_version"}, 400)
+        return None, jresp({"error": "invalid base_version"}, 400)
     weeks, errors = clean_plan_weeks(body["weeks"])
     if errors:
-        return validation_failed(errors)
+        return None, validation_failed(errors)
     try:
-        result = save_plan_weeks(c.bucket, c.sub, plan_id, weeks,
-                                 clean_change_reason(body.get("change_reason")), c.email,
-                                 base_version=base_version)
+        return save_plan_weeks(c.bucket, sub, plan_id, weeks,
+                               clean_change_reason(body.get("change_reason")), c.email,
+                               base_version=base_version, author=author), None
     except PlanStale:
-        return _plan_stale()
-    return jresp(result, 201)
+        return None, _plan_stale()
+
+
+def _save_own_plan_weeks(c, plan_id, body):
+    result, error = _save_plan_weeks(c, c.sub, plan_id, body, plan_author("athlete", c.sub))
+    return error or jresp(result, 201)
 
 
 def h_plan_weeks_get(c):
@@ -751,6 +872,13 @@ def h_plan_weeks_get(c):
     if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
         return jresp({"error": "plan not found"}, 404)
     return _plan_weeks_resp(c, plan_id)
+
+
+def h_plan_history(c):
+    plan_id = c.args[0]
+    if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(read_plan_history(c.bucket, c.sub, plan_id), 200)
 
 
 def h_plan_compliance(c):
@@ -767,7 +895,7 @@ def h_plan_weeks_post(c):
     body = c.body()
     if "weeks" not in body:
         return jresp({"error": "Missing weeks"}, 400)
-    return _save_plan_weeks(c, plan_id, body)
+    return _save_own_plan_weeks(c, plan_id, body)
 
 
 def h_active_plan_weeks_get(c):
@@ -786,7 +914,7 @@ def h_active_plan_weeks_post(c):
     if body.get("base_plan_id") not in (None, active["id"]):
         # Активным успели сделать другой план, а номера версий у планов свои.
         return _plan_stale()
-    return _save_plan_weeks(c, active["id"], body)
+    return _save_own_plan_weeks(c, active["id"], body)
 
 
 def h_runs_get(c):
@@ -869,10 +997,15 @@ ROUTES = [
     ("GET",    r"^/my/coach/chat$",              h_my_chat_get,          False),
     ("POST",   r"^/my/coach/chat$",              h_my_chat_post,         False),
     ("POST",   r"^/my/coach/chat/read$",         h_my_chat_read,         False),
+    ("POST",   r"^/my/coach/plan-edit$",         h_my_coach_plan_edit,   False),
 
     ("GET",    r"^/coach/athletes$",                                    h_coach_athletes,        False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans$",                     h_coach_plans,           False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/plans$",                     h_coach_plan_create,     False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/meta$",       h_coach_plan_meta,       False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",      h_coach_plan_weeks,      False),
+    ("POST",   r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",      h_coach_plan_weeks_post, False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/history$",    h_coach_plan_history,    False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
@@ -911,6 +1044,7 @@ ROUTES = [
     ("POST",   r"^/plans/([\w-]+)/archive$",     h_plan_archive,         False),
     ("GET",    r"^/plans/([\w-]+)/weeks$",       h_plan_weeks_get,       False),
     ("POST",   r"^/plans/([\w-]+)/weeks$",       h_plan_weeks_post,      False),
+    ("GET",    r"^/plans/([\w-]+)/history$",     h_plan_history,         False),
     ("GET",    r"^/plans/([\w-]+)/compliance$",  h_plan_compliance,      False),
 
     ("GET",    r"^/plan$",                       h_active_plan_weeks_get,  False),
@@ -1011,6 +1145,8 @@ def handle_request(request):
         return handler(Ctx(request, bucket, user, match.groups()))
     except Forbidden:
         return jresp({"error": "forbidden"}, 403)
+    except EditNotAllowed:
+        return jresp({"error": "edit_not_allowed"}, 403)
     except RunNotFound:
         return jresp({"error": "run not found"}, 404)
     except NoCoach:

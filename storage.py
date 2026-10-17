@@ -872,7 +872,10 @@ def read_plan_weeks(bucket, sub, plan_id):
     return read_plan_state(bucket, sub, plan_id)["weeks"]
 
 
-def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api"):
+def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api",
+                       author=None):
+    """author — {role, sub}: кто правил план (#60). created_by — почта для
+    аудита, author — для истории, которую видят спортсмен и тренер."""
     object_path = p_plan_ver(sub, plan_id, version)
     now = datetime.utcnow().isoformat() + "Z"
 
@@ -885,6 +888,8 @@ def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, crea
         "supersedes_version": version - 1 if version > 1 else None,
         "weeks": weeks,
     }
+    if author:
+        payload["author"] = author
     payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
     checksum = hashlib.sha256(payload_str.encode()).hexdigest()
 
@@ -902,6 +907,8 @@ def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, crea
         "change_reason": payload["change_reason"],
         "checksum": checksum,
     }
+    if author:
+        manifest["author"] = author
     bucket.blob(p_plan_manifest(sub, plan_id)).upload_from_string(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         content_type="application/json"
@@ -914,7 +921,7 @@ class PlanStale(Exception):
 
 
 def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="api",
-                    base_version=None):
+                    base_version=None, author=None):
     """Пишет следующую версию недель плана.
 
     base_version — версия, поверх которой сделана правка (0 — недель ещё не
@@ -930,7 +937,62 @@ def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="a
     if base_version is not None and base_version != current:
         raise PlanStale("plan_stale")
     return write_plan_version(bucket, sub, plan_id, current + 1, weeks,
-                              change_reason, created_by)
+                              change_reason, created_by, author=author)
+
+
+# ── История версий плана (#60) ────────────────────────────────────────────────
+# План теперь правят трое: спортсмен, тренер и ИИ-тренер. История отвечает,
+# кто, когда и почему, — по объектам версий, которые и так не перезаписываются.
+
+PLAN_AUTHOR_ROLES = ("athlete", "coach", "ai")
+PLAN_HISTORY_LIMIT = 50
+_PLAN_VER_RE = re.compile(r"/v(\d+)/plan\.json$")
+
+
+def plan_author(role, sub):
+    return {"role": role, "sub": sub}
+
+
+def _version_author_role(payload):
+    """Роль автора версии. До #60 автора не писали — выводим из того, что было:
+    перенос одиночного плана, причина правки ИИ-тренера, иначе сам спортсмен."""
+    role = (payload.get("author") or {}).get("role")
+    if role in PLAN_AUTHOR_ROLES:
+        return role
+    if payload.get("created_by") == "auto-migrate":
+        return "migration"
+    if str(payload.get("change_reason") or "").startswith("ИИ-тренер:"):
+        return "ai"
+    return "athlete"
+
+
+def read_plan_history(bucket, sub, plan_id, limit=PLAN_HISTORY_LIMIT):
+    """Версии недель плана от новых к старым: номер, время, причина и автор.
+
+    Автор — роль, sub и имя из реестра. Почта в историю не попадает, как и в
+    карточку тренера: историю видит и вторая сторона пары.
+    """
+    prefix = f"{upfx(sub)}plans/{plan_id}/v"
+    numbers = sorted({int(m.group(1)) for blob in bucket.list_blobs(prefix=prefix)
+                      if (m := _PLAN_VER_RE.search(blob.name))}, reverse=True)
+    page = numbers[:limit]
+    payloads = _load_json_objects(bucket, [p_plan_ver(sub, plan_id, v) for v in page])
+    users = read_registry(bucket).get("users", {})
+    versions = []
+    for number, payload in zip(page, payloads):
+        role = _version_author_role(payload)
+        author_sub = (payload.get("author") or {}).get("sub")
+        if author_sub is None and role in ("athlete", "ai"):
+            author_sub = sub              # до #60 план писал только его владелец
+        versions.append({
+            "version": number,
+            "created_at": payload.get("created_at"),
+            "change_reason": payload.get("change_reason") or "",
+            "author_role": role,
+            "author_sub": author_sub,
+            "author_name": (users.get(author_sub) or {}).get("name") or "",
+        })
+    return {"plan_id": plan_id, "versions": versions, "has_more": len(numbers) > len(page)}
 
 
 # ── Plans registry (#25: несколько планов на пользователя) ────────────────────
@@ -1037,7 +1099,9 @@ def get_active_plan(bucket, sub):
     return find_plan(index, index.get("active_plan_id"))
 
 
-def create_plan(bucket, sub, meta, make_active=True):
+def create_plan(bucket, sub, meta, make_active=True, author=None):
+    """Новый план в реестре. make_active=False — активным он станет, только
+    если активного плана нет (так создаёт план тренер, #60)."""
     index = read_plans_index(bucket, sub)
     plan = {
         "id": _new_plan_id(),
@@ -1045,6 +1109,8 @@ def create_plan(bucket, sub, meta, make_active=True):
         "archived": False,
         **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
     }
+    if author:
+        plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
     index["plans"].append(plan)
     if make_active or not index.get("active_plan_id"):
         index["active_plan_id"] = plan["id"]
@@ -1062,7 +1128,7 @@ def set_active_plan(bucket, sub, plan_id):
     return plan
 
 
-def update_plan_meta(bucket, sub, plan_id, meta):
+def update_plan_meta(bucket, sub, plan_id, meta, author=None):
     index = read_plans_index(bucket, sub)
     plan = find_plan(index, plan_id)
     if not plan:
@@ -1071,6 +1137,8 @@ def update_plan_meta(bucket, sub, plan_id, meta):
         if f in meta:
             plan[f] = meta.get(f) or ""
     plan["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    if author:
+        plan["updated_by_role"], plan["updated_by_sub"] = author["role"], author["sub"]
     write_plans_index(bucket, sub, index)
     return plan
 
@@ -1859,6 +1927,9 @@ def set_user_coach(bucket, sub, coach_sub):
         return rec
 
     rec["coach_sub"] = coach_sub
+    # Разрешение править планы давалось прежнему тренеру. Новому действует
+    # значение по умолчанию (#60).
+    rec.pop("coach_plan_edit", None)
     rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
     write_registry(bucket, registry)
     append_user_event(bucket, sub, "coach_select" if coach_sub else "coach_clear", sub,
@@ -1894,23 +1965,65 @@ def _is_coached_by(athlete, coach_sub):
                 and athlete.get("coach_sub") == coach_sub)
 
 
-def coach_can_access(bucket, coach_sub, athlete_sub):
-    """Единственная проверка права тренера на данные спортсмена.
+def coach_plan_edit_allowed(rec):
+    """Разрешил ли спортсмен своему тренеру править планы (#60). Поля нет —
+    разрешил: по умолчанию переключатель включён."""
+    return (rec or {}).get("coach_plan_edit") is not False
 
-    Реестр читается мимо кэша: спортсмен, снявший тренера, закрывает доступ
-    сразу, а не через REGISTRY_TTL_SEC на соседнем инстансе.
+
+def coach_access(bucket, coach_sub, athlete_sub):
+    """Единственная проверка права тренера на данные спортсмена:
+    None — права нет, "view" — только просмотр, "edit" — и правка планов.
+
+    Реестр читается мимо кэша: спортсмен, снявший тренера или выключивший
+    правку, закрывает доступ сразу, а не через REGISTRY_TTL_SEC на соседнем
+    инстансе.
     """
     users = _fresh_registry(bucket).get("users", {})
-    return (_is_active_coach(users.get(coach_sub))
-            and _is_coached_by(users.get(athlete_sub), coach_sub))
+    athlete = users.get(athlete_sub)
+    if not (_is_active_coach(users.get(coach_sub)) and _is_coached_by(athlete, coach_sub)):
+        return None
+    return "edit" if coach_plan_edit_allowed(athlete) else "view"
+
+
+def coach_can_access(bucket, coach_sub, athlete_sub):
+    return coach_access(bucket, coach_sub, athlete_sub) is not None
+
+
+def set_coach_plan_edit(bucket, sub, allow):
+    """Спортсмен разрешает или запрещает тренеру править планы (#60).
+
+    Разрешение — часть связи с тренером, поэтому без действующего тренера
+    ставить нечего: CoachLinkError("no_coach").
+    """
+    registry = _fresh_registry(bucket)
+    users = registry.get("users", {})
+    rec = users.get(sub)
+    if rec is None or not _is_active_coach(users.get(rec.get("coach_sub"))):
+        raise CoachLinkError("no_coach")
+    allow = bool(allow)
+    if coach_plan_edit_allowed(rec) == allow:
+        return rec
+    rec["coach_plan_edit"] = allow
+    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    write_registry(bucket, registry)
+    append_user_event(bucket, sub, "coach_plan_edit_allow" if allow else "coach_plan_edit_deny",
+                      sub, {"coach_sub": rec["coach_sub"]})
+    return rec
+
+
+def my_coach_plan_edit(bucket, sub):
+    """Как стоит переключатель у пользователя — для его карточки «Мой тренер»."""
+    return coach_plan_edit_allowed(read_registry(bucket).get("users", {}).get(sub))
 
 
 def list_athletes_of(bucket, coach_sub):
-    """Спортсмены тренера: [{sub, name}]. None — пользователь не тренер."""
+    """Спортсмены тренера: [{sub, name, can_edit}]. None — пользователь не тренер."""
     users = _fresh_registry(bucket).get("users", {})
     if not _is_active_coach(users.get(coach_sub)):
         return None
-    athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен"}
+    athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен",
+                 "can_edit": coach_plan_edit_allowed(u)}
                 for u in users.values() if _is_coached_by(u, coach_sub)]
     return sorted(athletes, key=lambda a: a["name"].lower())
 
@@ -1987,21 +2100,54 @@ def _chat_ids(bucket, athlete, coach):
     return _message_ids(bucket, p_chat_prefix(athlete, coach), _CHAT_ID_RE)
 
 
-def append_chat_message(bucket, athlete, coach, from_sub, role, text):
-    """Пишет сообщение новым объектом и возвращает его."""
+def append_chat_message(bucket, athlete, coach, from_sub, role, text, extra=None):
+    """Пишет сообщение новым объектом и возвращает его.
+
+    extra — служебные поля сообщения, которое пишет сервер (уведомление о
+    правке плана, #60). Основные поля ими не перекрыть.
+    """
     text = text.strip() if isinstance(text, str) else ""
     if not text:
         raise ChatError("empty_message")
     if len(text) > CHAT_TEXT_MAX:
         raise ChatError("message_too_long")
     msg_id, now = _next_message_id(_chat_ids(bucket, athlete, coach), role)
-    message = {"id": msg_id, "ts": now.isoformat() + "Z",
+    message = {**(extra or {}), "id": msg_id, "ts": now.isoformat() + "Z",
                "from_sub": from_sub, "from_role": role, "text": text}
     bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
         json.dumps(message, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
     return message
+
+
+# Что изменил тренер → начало сообщения спортсмену (#60).
+PLAN_CHANGE_TEXT = {"create": "Тренер создал план",
+                    "weeks": "Тренер изменил план",
+                    "meta": "Тренер изменил карточку гонки плана"}
+
+
+def plan_label(plan):
+    """Название плана так же, как его показывает фронтенд (planLabel)."""
+    return (plan.get("race_name")
+            or (f"Забег {plan['race_date']}" if plan.get("race_date") else "Без названия"))
+
+
+def notify_plan_change(bucket, athlete, coach, change, plan, version=None, comment=""):
+    """Сообщение в чат пары о том, что тренер поменял план спортсмена.
+
+    Обычное сообщение от роли тренера: бейдж непрочитанных у спортсмена уже
+    умеет его показать. kind и plan_id нужны фронтенду, чтобы выделить его
+    и открыть план.
+    """
+    text = f"{PLAN_CHANGE_TEXT[change]} «{plan_label(plan)}»"
+    if comment:
+        text += f": {comment}"
+    extra = {"kind": "plan_change", "change": change, "plan_id": plan["id"]}
+    if version is not None:
+        extra["plan_version"] = version
+    return append_chat_message(bucket, athlete, coach, coach, "coach",
+                               text[:CHAT_TEXT_MAX], extra)
 
 
 def read_chat(bucket, athlete, coach, after=None, before=None, limit=CHAT_PAGE):
@@ -2504,7 +2650,7 @@ def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=No
     try:
         saved = save_plan_weeks(bucket, sub, plan_id, weeks,
                                 f"ИИ-тренер: {proposal['summary']}", applied_by,
-                                base_version=version)
+                                base_version=version, author=plan_author("ai", sub))
     except PlanStale:
         # План переписали между сверкой выше и записью.
         raise AICoachError("proposal_stale")
