@@ -816,6 +816,17 @@ def test_reply_format_offers_proposals_only_with_a_plan_window(storage_module):
     assert "proposal" not in without and "JSON" in without
 
 
+def test_instructions_carry_the_coaching_rules_with_either_format(storage_module):
+    """Правила тренера не зависят от того, открыт ли план для правок."""
+    import llm_prompt
+    for with_proposals in (True, False):
+        text = llm_prompt.coach_chat_instructions(with_proposals)
+        for rule in ("по одному показателю", "не компенсируй дополнительной нагрузкой",
+                     "не переспрашивай", "только если спортсмен сам о них написал",
+                     "**Вывод**", "Раздел, которому нечего сказать, пропускай"):
+            assert rule in text, rule
+
+
 def test_data_block_orders_context_plan_window_and_chosen_runs(storage_module):
     import llm_prompt
     data = llm_prompt.coach_chat_data("КОНТЕКСТ", ["БЛОК-1", "БЛОК-2"], "ОКНО ПЛАНА")
