@@ -677,7 +677,8 @@ def test_coach_lists_only_own_athletes_without_emails(api, patched_api, fake_buc
     _register(api, "u2")                                  # без тренера
     body, code, _ = api(FakeRequest("GET", "/coach/athletes"), **COACH)
     assert code == 200
-    assert json.loads(body) == {"athletes": [{"sub": "u1", "name": "Runner", "unread": 0}]}
+    assert json.loads(body) == {"athletes": [{"sub": "u1", "name": "Runner", "can_edit": True,
+                                              "unread": 0}]}
 
 
 def test_regular_user_is_not_a_coach(api, patched_api, fake_bucket):
@@ -743,20 +744,38 @@ def test_revocation_on_another_instance_is_immediate(api, patched_api, fake_buck
     _assert_all_forbidden(api, plan_id, COACH)
 
 
-def test_athlete_data_is_read_only_for_the_coach(api, patched_api, fake_bucket):
+def test_coach_cannot_write_runs_or_delete_anything(api, patched_api, fake_bucket):
+    """С #60 тренер правит планы — и только их: журнал, выполнение и детали
+    пробежек по-прежнему только для чтения, удалять нельзя ничего."""
     plan_id = _coached(api, patched_api, fake_bucket)
     before = dict(fake_bucket._store)
     for path in _athlete_paths(plan_id):
-        for method in ("POST", "DELETE"):
+        writable = path.endswith("/plans") or path.endswith("/weeks")
+        methods = ("DELETE",) if writable else ("POST", "DELETE")
+        for method in methods:
             assert _status(api(FakeRequest(method, path, {"weeks": []}), **COACH)) == 405, path
     assert {k: v for k, v in fake_bucket._store.items() if k.startswith("users/u1/")} == \
            {k: v for k, v in before.items() if k.startswith("users/u1/")}
 
 
-def test_coach_routes_can_only_read_except_chat(api_module):
+# Всё, что тренер может записать в данные спортсмена. Новый маршрут записи под
+# /coach/athletes должен попасть сюда осознанно — вместе с тестами доступа.
+COACH_WRITE_ROUTES = {
+    r"^/coach/athletes/([\w-]+)/plans$",
+    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/meta$",
+    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",
+    r"^/coach/athletes/([\w-]+)/chat$",
+    r"^/coach/athletes/([\w-]+)/chat/read$",
+}
+
+
+def test_coach_writes_only_plans_and_chat(api_module):
+    writes = {pattern for method, pattern, _, _ in routes(api_module)
+              if pattern.startswith("^/coach/athletes") and method != "GET"}
+    assert writes == COACH_WRITE_ROUTES
     for method, pattern, _, _ in routes(api_module):
-        if pattern.startswith("^/coach/athletes") and "/chat" not in pattern:
-            assert method == "GET", f"{method} {pattern}"
+        if pattern.startswith("^/coach/athletes"):
+            assert method in ("GET", "POST"), f"{method} {pattern}"
 
 
 @pytest.mark.parametrize("tail", ["profile", "profile/history", "races", "advise",
@@ -839,7 +858,7 @@ def test_unread_reaches_both_sides_and_clears_on_read(api, patched_api, fake_buc
     last = _send(api, MY_CHAT, "вопрос")
 
     athletes = _chat(api, "/coach/athletes", **COACH)["athletes"]
-    assert athletes == [{"sub": "u1", "name": "Runner", "unread": 1}]
+    assert athletes == [{"sub": "u1", "name": "Runner", "can_edit": True, "unread": 1}]
     assert _chat(api, "/my/coach")["unread"] == 0          # своё — не непрочитанное
 
     body, code, _ = api(FakeRequest("POST", COACH_CHAT + "/read", {"last_id": last["id"]}), **COACH)
@@ -941,3 +960,403 @@ def test_chat_ends_when_the_coach_is_revoked(api, patched_api, fake_bucket):
     api(FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": False}), **ADMIN)
     assert _status(api(FakeRequest("POST", MY_CHAT, {"text": "алло"}))) == 409
     assert _status(api(FakeRequest("GET", COACH_CHAT), **COACH)) == 403
+
+
+# ── Тренер (#60): правка планов спортсмена ───────────────────────────────────
+# Первое место, где один пользователь пишет в данные другого. Как и в #44,
+# проверяется прежде всего, что все остальные не могут.
+
+COACH_PLANS = "/coach/athletes/u1/plans"
+EDIT_FORBIDDEN = json.dumps({"error": "edit_not_allowed"})
+PLAN_EDIT = "/my/coach/plan-edit"
+
+
+def _coach_writes(plan_id, athlete="u1"):
+    """Каждый маршрут записи тренера с телом, которое прошло бы проверку."""
+    base = f"/coach/athletes/{athlete}/plans"
+    return [(base, {"race_name": "Осенний марафон", "weeks": W1}),
+            (f"{base}/{plan_id}/meta", {"target_time": "1:35"}),
+            (f"{base}/{plan_id}/weeks", {"weeks": W2, "base_version": 1})]
+
+
+def _athlete_store(fake_bucket, athlete="u1"):
+    return {k: v for k, v in fake_bucket._store.items() if k.startswith(f"users/{athlete}/")}
+
+
+def _assert_writes_refused(api, fake_bucket, plan_id, who, expected=FORBIDDEN, athlete="u1"):
+    before = _athlete_store(fake_bucket, athlete)
+    for path, body in _coach_writes(plan_id, athlete):
+        got, code, _ = api(FakeRequest("POST", path, body), **who)
+        assert (code, got) == (403, expected), path
+    assert _athlete_store(fake_bucket, athlete) == before
+
+
+def _stored_json(fake_bucket, path):
+    return json.loads(fake_bucket._store[path])
+
+
+def _manifest(fake_bucket, plan_id, athlete="u1"):
+    return _stored_json(fake_bucket, f"users/{athlete}/plans/{plan_id}/manifest.json")
+
+
+def _index(fake_bucket, athlete="u1"):
+    return _stored_json(fake_bucket, f"users/{athlete}/plans/index.json")
+
+
+@pytest.mark.parametrize("method,path,handler_name", [
+    ("POST", "/coach/athletes/u-1/plans",                  "h_coach_plan_create"),
+    ("POST", "/coach/athletes/u-1/plans/abc-1/meta",       "h_coach_plan_meta"),
+    ("POST", "/coach/athletes/u-1/plans/abc-1/weeks",      "h_coach_plan_weeks_post"),
+    ("GET",  "/coach/athletes/u-1/plans/abc-1/history",    "h_coach_plan_history"),
+    ("GET",  "/plans/abc-1/history",                       "h_plan_history"),
+    ("POST", "/my/coach/plan-edit",                        "h_my_coach_plan_edit"),
+])
+def test_coach_plan_paths_resolve(api_module, method, path, handler_name):
+    route, _, allow = api_module.match_route(path, method)
+    assert allow is None and route[2].__name__ == handler_name
+
+
+def test_coach_edits_the_weeks_of_an_athletes_plan(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    seen = _chat(api, f"{COACH_PLANS}/{plan_id}/weeks", {"meta": "1"}, **COACH)
+    assert (seen["plan_id"], seen["version"]) == (plan_id, 1)
+
+    body, code, _ = api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/weeks",
+                                    {"weeks": W2, "base_version": 1,
+                                     "change_reason": "Длительную сократил"}), **COACH)
+    assert code == 201
+    assert json.loads(body)["version"] == 2 and json.loads(body)["notified"] is True
+
+    # спортсмен видит ровно то, что записал тренер
+    own = _plan_meta(api, f"/plans/{plan_id}/weeks")
+    assert own == {"plan_id": plan_id, "version": 2, "weeks": W2}
+    manifest = _manifest(fake_bucket, plan_id)
+    assert manifest["author"] == {"role": "coach", "sub": "c1"}
+    assert manifest["created_by"] == "c1@example.com"
+    assert manifest["change_reason"] == "Длительную сократил"
+    version = _stored_json(fake_bucket, manifest["gcs_object_path"])
+    assert version["author"] == {"role": "coach", "sub": "c1"}
+    assert version["supersedes_version"] == 1
+    # прежняя версия цела
+    assert _versions(fake_bucket, plan_id) == [1, 2]
+
+
+def test_coach_write_needs_the_version_it_was_based_on(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    path = f"{COACH_PLANS}/{plan_id}/weeks"
+    for body in ({"weeks": W2}, {"weeks": W2, "base_version": None}):
+        got, code, _ = api(FakeRequest("POST", path, body), **COACH)
+        assert code == 400 and "base_version" in got
+    for bad in ("1", 1.5, True, -1):
+        got, code, _ = api(FakeRequest("POST", path, {"weeks": W2, "base_version": bad}), **COACH)
+        assert code == 400 and "base_version" in got
+    assert _status(api(FakeRequest("POST", path, {"base_version": 1}), **COACH)) == 400
+    assert _versions(fake_bucket, plan_id) == [1]
+
+
+def test_coach_and_athlete_do_not_overwrite_each_other(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    # спортсмен сохранил свою правку, пока у тренера был открыт редактор
+    assert _status(api(FakeRequest("POST", f"/plans/{plan_id}/weeks",
+                                   {"weeks": W3, "base_version": 1}))) == 201
+    before = _plan_objects(fake_bucket, plan_id)
+
+    body, code, _ = api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/weeks",
+                                    {"weeks": W2, "base_version": 1}), **COACH)
+    assert code == 409 and json.loads(body) == {"error": "plan_stale"}
+    assert _plan_objects(fake_bucket, plan_id) == before
+    assert _manifest(fake_bucket, plan_id)["author"] == {"role": "athlete", "sub": "u1"}
+
+    # и наоборот: правка тренера делает устаревшим открытый конструктор спортсмена
+    assert _status(api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/weeks",
+                                   {"weeks": W2, "base_version": 2}), **COACH)) == 201
+    body, code, _ = api(FakeRequest("POST", "/plan", {"weeks": W1, "base_plan_id": plan_id,
+                                                     "base_version": 2}))
+    assert code == 409 and _plan_meta(api)["weeks"] == W2
+
+
+def test_coach_creates_a_plan_without_taking_over_the_active_one(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("POST", COACH_PLANS,
+                                    {"race_name": "Осенний марафон", "race_date": "2026-11-01",
+                                     "weeks": W1, "change_reason": "План на осень"}), **COACH)
+    assert code == 201
+    created = json.loads(body)
+    new_id = created["plan"]["id"]
+    assert created["version"] == 1 and created["notified"] is True
+    assert created["plan"]["created_by_role"] == "coach"
+    assert created["plan"]["created_by_sub"] == "c1"
+
+    index = json.loads(api(FakeRequest("GET", "/plans"))[0])
+    assert index["active_plan_id"] == plan_id                 # какой план вести — решает спортсмен
+    assert [p["id"] for p in index["plans"]] == [plan_id, new_id]
+    assert _plan_meta(api, f"/plans/{new_id}/weeks") == {"plan_id": new_id, "version": 1,
+                                                          "weeks": W1}
+    assert _manifest(fake_bucket, new_id)["author"] == {"role": "coach", "sub": "c1"}
+    assert _manifest(fake_bucket, new_id)["change_reason"] == "План на осень"
+
+
+def test_coach_plan_becomes_active_when_the_athlete_has_none(api, patched_api, fake_bucket):
+    _make_coach(api)
+    assert _status(api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))) == 200
+    body, code, _ = api(FakeRequest("POST", COACH_PLANS, {"race_name": "Первый старт"}), **COACH)
+    assert code == 201 and json.loads(body)["version"] == 0      # недель не прислали
+    plan_id = json.loads(body)["plan"]["id"]
+    assert json.loads(api(FakeRequest("GET", "/plans"))[0])["active_plan_id"] == plan_id
+    assert not _plan_objects(fake_bucket, plan_id)               # версий недель нет
+
+
+def test_coach_plan_card_is_validated(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    before = _athlete_store(fake_bucket)
+    for path, body, field in [(COACH_PLANS, {"race_name": ["x"]}, "race_name"),
+                              (COACH_PLANS, {"race_name": "A", "weeks": "строка"}, "weeks"),
+                              (f"{COACH_PLANS}/{plan_id}/meta", {"plan_start": True}, "plan_start"),
+                              (f"{COACH_PLANS}/{plan_id}/weeks",
+                               {"weeks": [{"w": True}], "base_version": 1}, "weeks[0].w")]:
+        got, code, _ = api(FakeRequest("POST", path, body), **COACH)
+        assert code == 400 and field in json.loads(got)["fields"], path
+    assert _athlete_store(fake_bucket) == before
+
+
+def test_coach_edits_the_race_card(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/meta",
+                                    {"target_time": "1:35"}), **COACH)
+    assert code == 200
+    plan = json.loads(body)["plan"]
+    assert (plan["race_name"], plan["target_time"]) == ("HM", "1:35")   # меняется только пришедшее
+    assert (plan["updated_by_role"], plan["updated_by_sub"]) == ("coach", "c1")
+    own = json.loads(api(FakeRequest("GET", "/plans"))[0])["plans"][0]
+    assert own["target_time"] == "1:35"
+
+
+def test_unchanged_race_card_is_not_reported_as_a_change(api, patched_api, fake_bucket):
+    """Форма шлёт все поля: «Сохранить» без правок не пишет событие и не шлёт
+    спортсмену «Тренер изменил карточку»."""
+    plan_id = _coached(api, patched_api, fake_bucket)
+    card = {"race_name": "HM", "race_date": "", "target_time": "", "plan_start": "2026-08-17"}
+    before = _athlete_store(fake_bucket)
+    body, code, _ = api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/meta", card), **COACH)
+    assert code == 200 and json.loads(body)["changed"] is False
+    assert json.loads(body)["notified"] is False
+    assert _athlete_store(fake_bucket) == before
+    assert _chat(api, MY_CHAT)["messages"] == []
+
+
+def test_failed_weeks_write_does_not_leave_an_empty_plan(api, patched_api, fake_bucket,
+                                                         monkeypatch):
+    plan_id = _coached(api, patched_api, fake_bucket)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("GCS недоступен")
+
+    monkeypatch.setattr(patched_api, "save_plan_weeks", broken)
+    body, code, _ = api(FakeRequest("POST", COACH_PLANS,
+                                    {"race_name": "Осень", "weeks": W1}), **COACH)
+    assert code == 500
+    index = json.loads(api(FakeRequest("GET", "/plans"))[0])
+    created = [p for p in index["plans"] if p["id"] != plan_id]
+    # план остался только логически удалённым — повтор не даст двух одноимённых
+    assert len(created) == 1 and created[0]["archived"] is True
+    assert index["active_plan_id"] == plan_id
+    assert _chat(api, MY_CHAT)["messages"] == []
+
+
+def test_plans_index_contention_is_a_retryable_503(api, patched_api, fake_bucket, monkeypatch):
+    _coached(api, patched_api, fake_bucket)
+
+    def busy(*args, **kwargs):
+        raise patched_api.PlansIndexBusy()
+
+    monkeypatch.setattr(patched_api, "create_plan", busy)
+    for who, path in (({}, "/plans"), (COACH, COACH_PLANS)):
+        body, code, _ = api(FakeRequest("POST", path, {"race_name": "X"}), **who)
+        assert (code, json.loads(body)) == (503, {"error": "plans_busy"}), path
+
+
+def test_coach_cannot_edit_unknown_or_archived_plans(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    for tail, body in (("meta", {"target_time": "1:35"}), ("weeks", {"weeks": W2, "base_version": 1})):
+        path = f"{COACH_PLANS}/no-such-plan/{tail}"
+        assert _status(api(FakeRequest("POST", path, body), **COACH)) == 404
+
+    assert _status(api(FakeRequest("POST", f"/plans/{plan_id}/archive"))) == 200
+    before = _athlete_store(fake_bucket)
+    for tail, body in (("meta", {"target_time": "1:35"}), ("weeks", {"weeks": W2, "base_version": 1})):
+        path = f"{COACH_PLANS}/{plan_id}/{tail}"
+        assert _status(api(FakeRequest("POST", path, body), **COACH)) == 404
+    assert _athlete_store(fake_bucket) == before
+
+
+def test_coach_has_no_say_in_the_active_plan_or_the_archive(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    for path in (f"{COACH_PLANS}/active", f"{COACH_PLANS}/{plan_id}/archive"):
+        assert _status(api(FakeRequest("POST", path, {"plan_id": plan_id}), **COACH)) == 404
+
+
+def test_nobody_else_writes_into_the_athletes_plans(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _make_coach(api, "c2")
+    _register(api, "u2")
+    for who in ({"sub": "c2", "email": "c2@example.com"},     # чужой тренер
+                {"sub": "u2", "email": "u2@example.com"},     # не тренер
+                ADMIN):                                        # у админа чёрного хода нет
+        _assert_writes_refused(api, fake_bucket, plan_id, who)
+
+
+def test_coach_cannot_write_to_users_who_did_not_choose_them(api, patched_api, fake_bucket):
+    """Чужой спортсмен, человек без тренера и несуществующий sub отвечают
+    одинаково — и на запись тоже."""
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _register(api, "u2")
+    for sub in ("u2", "ghost", "admin-sub", "c1"):
+        _assert_writes_refused(api, fake_bucket, plan_id, COACH, athlete=sub)
+
+
+def test_write_access_ends_with_the_link(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", "/my/coach", {"coach_sub": None}))
+    _assert_writes_refused(api, fake_bucket, plan_id, COACH)
+
+    api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))
+    api(FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": False}), **ADMIN)
+    _assert_writes_refused(api, fake_bucket, plan_id, COACH)
+
+
+def test_athlete_switches_plan_editing_off_and_on(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    assert _chat(api, "/my/coach")["can_edit_plans"] is True          # по умолчанию включено
+
+    body, code, _ = api(FakeRequest("POST", PLAN_EDIT, {"allow": False}))
+    assert code == 200 and json.loads(body) == {"can_edit_plans": False}
+    assert _chat(api, "/my/coach")["can_edit_plans"] is False
+    assert _chat(api, "/coach/athletes", **COACH)["athletes"][0]["can_edit"] is False
+
+    _assert_writes_refused(api, fake_bucket, plan_id, COACH, expected=EDIT_FORBIDDEN)
+    # смотреть тренер по-прежнему может
+    for path in _athlete_paths(plan_id) + [f"{COACH_PLANS}/{plan_id}/history"]:
+        assert _status(api(FakeRequest("GET", path), **COACH)) in (200, 404), path
+    assert _status(api(FakeRequest("GET", f"{COACH_PLANS}/{plan_id}/weeks"), **COACH)) == 200
+
+    assert json.loads(api(FakeRequest("POST", PLAN_EDIT, {"allow": True}))[0]) == \
+           {"can_edit_plans": True}
+    assert _status(api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/meta",
+                                   {"target_time": "1:35"}), **COACH)) == 200
+
+
+@pytest.mark.parametrize("payload", [{}, {"allow": "no"}, {"allow": 0}, {"allow": None}])
+def test_plan_edit_switch_payload_is_validated(api, patched_api, fake_bucket, payload):
+    _coached(api, patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", PLAN_EDIT, payload))) == 400
+    assert _chat(api, "/my/coach")["can_edit_plans"] is True
+
+
+def test_plan_edit_switch_needs_a_coach(api):
+    body, code, _ = api(FakeRequest("POST", PLAN_EDIT, {"allow": False}))
+    assert code == 409 and json.loads(body) == {"error": "no_coach"}
+
+
+def test_new_coach_starts_with_the_default(api, patched_api, fake_bucket):
+    """Разрешение давалось конкретному тренеру: новому — снова по умолчанию."""
+    plan_id = _coached(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", PLAN_EDIT, {"allow": False}))
+    _make_coach(api, "c2")
+    body, _, _ = api(FakeRequest("POST", "/my/coach", {"coach_sub": "c2"}))
+    assert json.loads(body)["can_edit_plans"] is True
+    assert _status(api(FakeRequest("POST", f"/coach/athletes/u1/plans/{plan_id}/meta",
+                                   {"target_time": "1:35"}),
+                       sub="c2", email="c2@example.com")) == 200
+
+
+def test_switching_off_on_another_instance_is_immediate(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    assert _chat(api, "/coach/athletes", **COACH)["athletes"][0]["can_edit"] is True
+
+    blob = fake_bucket.blob("users/registry.json")
+    remote = json.loads(blob.download_as_text())
+    remote["users"]["u1"]["coach_plan_edit"] = False
+    blob.upload_from_string(json.dumps(remote))           # «соседний инстанс»
+
+    _assert_writes_refused(api, fake_bucket, plan_id, COACH, expected=EDIT_FORBIDDEN)
+
+
+def test_athlete_hears_about_every_coach_change_in_the_chat(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/weeks",
+                    {"weeks": W2, "base_version": 1, "change_reason": "Меньше объёма"}), **COACH)
+    api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/meta", {"target_time": "1:35"}), **COACH)
+    created = json.loads(api(FakeRequest("POST", COACH_PLANS, {"race_name": "Осень"}), **COACH)[0])
+
+    messages = _chat(api, MY_CHAT)["messages"]
+    assert [(m["from_role"], m["text"]) for m in messages] == [
+        ("coach", "Тренер изменил план «HM»: Меньше объёма"),
+        ("coach", "Тренер изменил карточку гонки плана «HM»"),
+        ("coach", "Тренер создал план «Осень»"),
+    ]
+    assert [(m["kind"], m["change"], m["plan_id"]) for m in messages] == [
+        ("plan_change", "weeks", plan_id), ("plan_change", "meta", plan_id),
+        ("plan_change", "create", created["plan"]["id"])]
+    assert messages[0]["plan_version"] == 2 and "plan_version" not in messages[1]
+    assert _chat(api, "/my/coach")["unread"] == 3
+    assert _chat(api, "/coach/athletes", **COACH)["athletes"][0]["unread"] == 0
+
+
+def test_chat_failure_does_not_undo_the_change(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _coached(api, patched_api, fake_bucket)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("GCS недоступен")
+
+    monkeypatch.setattr(patched_api, "notify_plan_change", broken)
+    body, code, _ = api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/weeks",
+                                    {"weeks": W2, "base_version": 1}), **COACH)
+    assert code == 201 and json.loads(body)["notified"] is False
+    assert _plan_meta(api)["weeks"] == W2
+
+
+def test_plan_history_shows_who_changed_what(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", f"/plans/{plan_id}/weeks",
+                    {"weeks": W2, "base_version": 1, "change_reason": "manual edit"}))
+    api(FakeRequest("POST", f"{COACH_PLANS}/{plan_id}/weeks",
+                    {"weeks": W3, "base_version": 2, "change_reason": "Сдвинул длительную"}),
+        **COACH)
+
+    body, code, _ = api(FakeRequest("GET", f"/plans/{plan_id}/history"))
+    assert code == 200
+    history = json.loads(body)
+    assert history["plan_id"] == plan_id and history["has_more"] is False
+    assert [(v["version"], v["author_role"], v["author_sub"], v["change_reason"])
+            for v in history["versions"]] == [
+        (3, "coach", "c1", "Сдвинул длительную"),
+        (2, "athlete", "u1", "manual edit"),
+        (1, "athlete", "u1", "seed"),            # до #60 автора не писали
+    ]
+    assert "@" not in body                         # почты авторов история не раскрывает
+    # тренер видит ту же историю
+    coach_body, coach_code, _ = api(FakeRequest("GET", f"{COACH_PLANS}/{plan_id}/history"),
+                                    **COACH)
+    assert (coach_code, coach_body) == (200, body)
+
+
+def test_plan_history_of_an_unknown_plan_is_404(api, patched_api, fake_bucket):
+    _coached(api, patched_api, fake_bucket)
+    assert _status(api(FakeRequest("GET", "/plans/no-such-plan/history"))) == 404
+    assert _status(api(FakeRequest("GET", f"{COACH_PLANS}/no-such-plan/history"), **COACH)) == 404
+
+
+def test_plan_history_is_closed_to_outsiders(api, patched_api, fake_bucket):
+    plan_id = _coached(api, patched_api, fake_bucket)
+    _make_coach(api, "c2")
+    body, code, _ = api(FakeRequest("GET", f"{COACH_PLANS}/{plan_id}/history"),
+                        sub="c2", email="c2@example.com")
+    assert (code, body) == (403, FORBIDDEN)
+
+
+def test_own_writes_are_signed_by_the_athlete(api, patched_api, fake_bucket):
+    plan_id = _new_plan(api, patched_api, fake_bucket)
+    api(FakeRequest("POST", "/plan", {"weeks": W2, "base_version": 1}))
+    assert _manifest(fake_bucket, plan_id)["author"] == {"role": "athlete", "sub": "u1"}
+    created = json.loads(api(FakeRequest("POST", "/plans", {"race_name": "Свой"}))[0])
+    assert (created["created_by_role"], created["created_by_sub"]) == ("athlete", "u1")

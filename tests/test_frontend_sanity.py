@@ -577,6 +577,169 @@ def test_coach_screen_keeps_out_of_own_data():
     assert "localStorage" not in section
     for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races"):
         assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"
+    # и чужой план не уходит в свои функции записи (#60)
+    for own_write in ("postPlanWeeks", "savePlanEdits", "rememberPlan", "loadPlan()"):
+        assert own_write not in section, own_write
+
+
+# ── Тренер правит план спортсмена (#60) ──────────────────────────────────────
+
+def _coach_section(js):
+    return _js_section(js, "const COACH = {", "function renderAll()")
+
+
+def test_coach_and_athlete_edit_plans_with_one_constructor():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "planEditRowsHtml(PLAN || []" in _js_section(js, "function renderPlanTable() {", "\n}\n")
+    assert "planEditRowsHtml(COACH.draft" in _js_section(js, "function renderCoachPlanTable() {",
+                                                        "\n}\n")
+    assert "collectPlanEditsFrom(" in _js_section(js, "function collectPlanEdits() {", "\n}\n")
+    assert "collectPlanEditsFrom(body, COACH.draft)" in _js_section(js, "function coachCollect() {",
+                                                                   "\n}\n")
+
+
+def test_coach_generated_handlers_exist():
+    """Кнопки экрана тренера и конструктора рисует app.js — проверка
+    inline-обработчиков из index.html их не видит."""
+    js = APP_JS.read_text(encoding="utf-8")
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    called = set()
+    for handler in re.findall(r'onclick="([^"]*)"', _coach_section(js)):
+        handler = re.sub(r"\$\{[^}]*\}", "", handler)
+        called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
+    assert {"coachStartEdit", "coachNewPlan", "openCoachAthlete"} <= called
+    assert not (called - defined), sorted(called - defined)
+    # конструктор получает обработчики по имени
+    passed = set(re.findall(r"on(?:Delete|Add): '(\w+)'", js))
+    assert {"deletePlanWeek", "addPlanWeek", "coachDeleteWeek", "coachAddWeek"} == passed
+    assert passed <= defined
+
+
+def test_coach_writes_carry_the_version_and_tell_refusals_apart():
+    js = APP_JS.read_text(encoding="utf-8")
+    post = _js_section(js, "async function coachPost(", "\n}\n")
+    for piece in ("'edit_not_allowed'", "coachEditRevoked()", "coachAccessLost()",
+                  "res.status === 409", "code: 'plan_stale'"):
+        assert piece in post, piece
+    save = _js_section(js, "async function coachSavePlan() {", "\n}\n")
+    assert "base_version: COACH.base.version" in save
+    assert save.index("e.code === 'plan_stale'") < save.index("coachStale(")
+    assert "weeks?meta=1" in _js_section(js, "async function selectCoachPlan(", "\n}\n")
+    # после отказа правка недель продолжается поверх свежего плана
+    stale = _js_section(js, "async function coachStale(", "\n}\n")
+    assert stale.index("await selectCoachPlan(") < stale.index("coachStartEdit()")
+
+
+def test_coach_does_not_pick_the_active_plan_or_archive():
+    """Какой план вести и что убрать в архив, решает спортсмен: экран тренера
+    таких запросов не шлёт."""
+    section = _coach_section(APP_JS.read_text(encoding="utf-8"))
+    assert "plans/active" not in section and "/archive" not in section
+
+
+def test_unsaved_coach_draft_is_not_dropped_silently():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("function coachPickPlan(", "function leaveCoachAthlete(",
+                 "function coachOpenRaceForm(", "function coachImportFile(",
+                 "function coachToggleEdit("):
+        assert "coachConfirmDiscard()" in _js_section(js, name, "\n}\n"), name
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'onclick="leaveCoachAthlete()"' in html and 'onchange="coachPickPlan(this.value)"' in html
+
+
+def test_open_athlete_picks_up_a_changed_permission():
+    """Спортсмен включил или выключил правку, пока экран открыт: свежий список
+    спортсменов (счётчик непрочитанных, «Обновить») обновляет и открытого."""
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("async function refreshCoachBadge(", "async function loadCoachAthletes("):
+        assert "coachSyncCanEdit(" in _js_section(js, name, "\n}\n"), name
+
+
+def test_both_plan_importers_and_race_forms_share_one_code_path():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("function importPlanFile(", "function coachImportFile("):
+        body = _js_section(js, name, "\n}\n")
+        assert "readPlanFile(file" in body and "new FileReader" not in body, name
+    for name, prefix in (("async function saveRaceMeta(", "'p'"), ("async function coachSaveRace(", "'cp'")):
+        assert f"readRaceFields({prefix})" in _js_section(js, name, "\n}\n"), name
+    assert "fillRaceFields('cp', plan)" in _js_section(js, "function coachOpenRaceForm(", "\n}\n")
+
+
+def test_coach_saves_only_real_changes():
+    """«Сохранить» без правок не пишет версию и не шлёт спортсмену сообщение."""
+    js = APP_JS.read_text(encoding="utf-8")
+    save = _js_section(js, "async function coachSavePlan() {", "\n}\n")
+    assert save.index("coachDirty()") < save.index("coachPost(")
+    assert "res.changed === false" in _js_section(js, "async function coachSaveRace() {", "\n}\n")
+
+
+def test_coach_write_failures_do_not_invite_duplicates_or_false_claims():
+    js = APP_JS.read_text(encoding="utf-8")
+    as_new = _js_section(js, "async function coachSaveAsNewPlan() {", "\n}\n")
+    assert as_new.index("coachStopEdit()") < as_new.index("coachAfterCreate(")
+    # сбой перечитывания после создания не выдаётся за сбой создания
+    after = _js_section(js, "async function coachAfterCreate(", "\n}\n")
+    assert "План создан" in after and "coachReloadPlans(" in after
+    assert "coachAfterCreate(res)" in _js_section(js, "async function coachSaveRace() {", "\n}\n")
+    revoked = _js_section(js, "function coachEditRevoked() {", "\n}\n")
+    assert "coachDirty()" in revoked, "отказ при сохранении не выбрасывает набранное"
+    save = _js_section(js, "async function coachSavePlan() {", "\n}\n")
+    assert "coach-change-note" in save[:save.index("coachStopEdit()")], "комментарий без правок не стираем"
+    for name in ("async function switchPlan(", "async function archiveCurrentPlan("):
+        assert "throw await apiError(res)" in _js_section(js, name, "\n}\n"), name
+    assert "'my/coach?fresh=1'" in _js_section(js, "async function loadMyCoach(", "\n}\n")
+    stale = _js_section(js, "async function coachStale(", "\n}\n")
+    assert stale.index("!COACH.base") < stale.index("coachStartEdit()")
+    sync = _js_section(js, "function coachSyncCanEdit(", "\n}\n")
+    assert "coachDirty()" in sync, "несохранённую правку не выбрасываем молча"
+
+
+def test_athlete_plan_follows_coach_changes_seen_in_the_chat():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "planChangeUnseen" in _js_section(js, "async function chatOpen(", "\n}\n")
+    assert "planChangeUnseen" in _js_section(js, "async function chatPull(", "\n}\n")
+
+
+def test_flash_messages_share_one_helper():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("function coachFlash(", "function coachRaceFlash(", "async function saveRaceMeta("):
+        assert "flashMsg(" in _js_section(js, name, "\n}\n"), name
+
+
+def test_athlete_controls_plan_editing_from_the_coach_card():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="coach-plan-edit"' in html and 'onchange="saveCoachPlanEdit(this.checked)"' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "'my/coach/plan-edit'" in _js_section(js, "async function saveCoachPlanEdit(", "\n}\n")
+    assert "mine.can_edit_plans" in _js_section(js, "async function loadMyCoach(", "\n}\n")
+    # у нового тренера разрешение снова по умолчанию — берём его из ответа сервера
+    assert "data.can_edit_plans" in _js_section(js, "async function saveMyCoach(", "\n}\n")
+    assert "тренером" in _js_section(js, "const PLAN_STALE_TEXT", ";\n")
+
+
+def test_plan_change_message_leads_to_the_plan():
+    js = APP_JS.read_text(encoding="utf-8")
+    html_fn = _js_section(js, "function chatMessageHtml(", "\n}\n")
+    assert "'plan_change'" in html_fn and "Number(index)" in html_fn
+    assert "chatMessageHtml(chat, m, i)" in _js_section(js, "function chatRender(", "\n}\n")
+    # переход к плану — код спортсмена, вне экрана тренера с его чужими данными
+    assert "function openChangedPlan(" not in _coach_section(js)
+    opener = _js_section(js, "async function openChangedPlan(", "\n}\n")
+    assert opener.index("confirm(") < opener.index("switchPlan("), "активный план — только с согласия"
+    assert "onCoachChangedPlan()" in _js_section(js, "async function chatPull(", "\n}\n")
+    refresh = _js_section(js, "async function onCoachChangedPlan(", "\n}\n")
+    assert refresh.index("planEditMode") < refresh.index("loadPlan()")
+
+
+def test_plan_history_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="plan-history-overlay"' in html and 'id="plan-history-body"' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "showPlanHistory(coachUrl(" in _js_section(js, "function coachShowHistory() {", "\n}\n")
+    assert 'onclick="showOwnPlanHistory()"' in html
+    assert "/history`" in _js_section(js, "function showOwnPlanHistory() {", "\n}\n")
+    # «Вы» определяется по sub автора, а не по роли: история общая для обеих сторон
+    assert "v.author_sub === userSub" in _js_section(js, "function planHistoryAuthor(", "\n}\n")
 
 
 # ── Мобильная раскладка (#48) ─────────────────────────────────────────────────

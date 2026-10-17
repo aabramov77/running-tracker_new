@@ -1012,6 +1012,28 @@ def test_apply_writes_a_new_plan_version_and_keeps_the_old_one(api, llm, patched
     version = json.loads(fake_bucket._store[manifest["gcs_object_path"]])
     assert version["supersedes_version"] == 1
     assert fake_bucket._store[old_path] == old_object           # прежняя версия цела
+    # в истории плана правка подписана ИИ-тренером (#60)
+    assert manifest["author"] == version["author"] == {"role": "ai", "sub": SUB}
+
+
+def test_coach_edit_makes_an_open_proposal_stale(api, llm, patched_api, fake_bucket):
+    """Тренер (#60) правит план через ту же сверку версии: предложение ИИ,
+    сделанное до его правки, применить уже нельзя."""
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    coach = {"sub": "c1", "email": "c1@example.com"}
+    api(FakeRequest("GET", "/me"), **coach)
+    api(FakeRequest("POST", "/admin/users/coach", {"sub": "c1", "is_coach": True}),
+        sub="admin-sub", email="aabramov77@gmail.com")
+    assert api(FakeRequest("POST", "/my/coach", {"coach_sub": "c1"}))[1] == 200
+    weeks = _plan_state(patched_api, fake_bucket, plan_id)[1]
+    body, code, _ = api(FakeRequest("POST", f"/coach/athletes/{SUB}/plans/{plan_id}/weeks",
+                                    {"weeks": weeks, "base_version": 1}), **coach)
+    assert code == 201, body
+
+    body, code, _ = _apply(api, thread, answer["id"])
+    assert code == 409 and json.loads(body) == {"error": "proposal_stale"}
+    assert _plan_state(patched_api, fake_bucket, plan_id)[0]["author"]["role"] == "coach"
 
 
 def test_applied_proposal_is_reported_and_cannot_be_applied_twice(api, llm, patched_api, fake_bucket):

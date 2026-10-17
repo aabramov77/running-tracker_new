@@ -24,6 +24,7 @@ let currentRole = null;
 let currentUser = {};
 let currentIsCoach = false; // #44: назначен ли пользователь тренером
 let myCoach = null;         // #44: выбранный тренер {sub, name} или null
+let myCoachPlanEdit = true; // #60: разрешено ли тренеру править планы
 let PLANS = [];             // все планы пользователя (#25)
 let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
 let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
@@ -255,11 +256,14 @@ function renderPlanSelectors() {
   const list = livePlans();
   const sel = document.getElementById('plan-select');
   if (sel) {
+    // План, который создал тренер (#60), подписан — спортсмен видит, откуда он.
     sel.innerHTML = list.map(p =>
-      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}</option>`
+      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}${p.created_by_role === 'coach' ? ' · от тренера' : ''}</option>`
     ).join('');
     sel.style.display = list.length ? '' : 'none';
   }
+  const historyBtn = document.getElementById('plan-history-btn');
+  if (historyBtn) historyBtn.style.display = activePlanId() ? '' : 'none';
   const runSel = document.getElementById('f-plan');
   if (runSel) {
     const prev = runSel.value;
@@ -272,14 +276,23 @@ function renderPlanSelectors() {
   fillRaceForm();
 }
 
-function fillRaceForm() {
-  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
-  const race = ACTIVE_PLAN || {};
-  set('p-race-name', race.race_name);
-  set('p-race-date', race.race_date);
-  set('p-target-time', race.target_time);
-  set('p-plan-start', race.plan_start);
+// Поля карточки гонки. Форм две — своя (p-*) и у тренера (cp-*, #60), — поля
+// у них одни и те же, отличается только префикс id.
+function fillRaceFields(prefix, race) {
+  const set = (id, v) => { const el = document.getElementById(`${prefix}-${id}`); if (el) el.value = v || ''; };
+  set('race-name', race?.race_name);
+  set('race-date', race?.race_date);
+  set('target-time', race?.target_time);
+  set('plan-start', race?.plan_start);
 }
+
+function readRaceFields(prefix) {
+  const val = id => document.getElementById(`${prefix}-${id}`).value;
+  return { race_name: val('race-name').trim(), race_date: val('race-date'),
+           target_time: val('target-time').trim(), plan_start: val('plan-start') };
+}
+
+function fillRaceForm() { fillRaceFields('p', ACTIVE_PLAN); }
 
 async function loadPlans() {
   try {
@@ -304,7 +317,7 @@ async function switchPlan(planId) {
       body: JSON.stringify({ plan_id: planId }),
     });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw await apiError(res);     // в том числе plans_busy (#60)
     cancelPlanEdit();
     COMPLIANCE = null;      // факт прежнего плана к новому не относится
     await loadPlans();
@@ -328,8 +341,7 @@ function openPlanForm(mode) {
   document.getElementById('race-archive-btn').style.display =
     mode === 'create' ? 'none' : '';
   if (mode === 'create') {
-    ['p-race-name', 'p-race-date', 'p-target-time', 'p-plan-start']
-      .forEach(id => { document.getElementById(id).value = ''; });
+    fillRaceFields('p', null);
     document.getElementById('p-race-name').focus();
   } else {
     fillRaceForm();
@@ -347,19 +359,8 @@ function toggleRaceForm(show) {
 }
 
 async function saveRaceMeta() {
-  const body = {
-    race_name: document.getElementById('p-race-name').value.trim(),
-    race_date: document.getElementById('p-race-date').value,
-    target_time: document.getElementById('p-target-time').value.trim(),
-    plan_start: document.getElementById('p-plan-start').value,
-  };
-  const msg = document.getElementById('race-meta-msg');
-  const flash = (text, ok) => {
-    msg.style.display = 'inline';
-    msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
-    msg.textContent = text;
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2000 : 4000);
-  };
+  const body = readRaceFields('p');
+  const flash = (text, ok) => flashMsg(document.getElementById('race-meta-msg'), text, ok, ok ? 2000 : 4000);
 
   const creating = planFormMode === 'create';
   if (creating && !body.race_name) { flash('⚠ Введите название гонки', false); return; }
@@ -393,7 +394,7 @@ async function archiveCurrentPlan() {
       method: 'POST', headers: authHeaders(),
     });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw await apiError(res);     // в том числе plans_busy (#60)
     cancelPlanEdit();
     toggleRaceForm(false);
     await loadPlans();
@@ -440,6 +441,8 @@ function escapeHtml(s) {
 // перечнем — показываем его, а не голый код ответа.
 async function apiError(res) {
   const data = await res.json().catch(() => ({}));
+  // Реестр планов меняют параллельно (#60) — это не сбой, повтор поможет.
+  if (data.error === 'plans_busy') return new Error('Планы сейчас меняют с другого устройства — попробуйте ещё раз');
   if (data.error !== 'validation_failed' || !data.fields) return new Error(`HTTP ${res.status}`);
   const text = Object.entries(data.fields).map(([field, why]) => `${field} — ${why}`).join('; ');
   return Object.assign(new Error('Проверьте данные: ' + text), { code: 'validation_failed' });
@@ -488,6 +491,16 @@ function setStatus(msg, type = 'ok') {
   if (!el) return;
   el.textContent = msg;
   el.style.color = type === 'ok' ? 'var(--c-accent)' : type === 'warn' ? 'var(--c-warn)' : 'var(--c-danger)';
+}
+
+// Короткая подпись рядом с кнопкой: показывается и через ms прячется сама.
+// Таймер свой у каждого элемента — прежний не спрячет новое сообщение.
+function flashMsg(el, text, ok, ms) {
+  clearTimeout(el._flashTimer);
+  el.style.display = text ? 'inline' : 'none';
+  el.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
+  el.textContent = text;
+  if (text && ms) el._flashTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
 }
 
 async function loadPlan() {
@@ -841,27 +854,7 @@ function renderPlanTable() {
 
   // ── Режим конструктора (может быть 0 строк) ──
   if (planEditMode) {
-    const rows = (PLAN || []);
-    const inp = (i, field, val) =>
-      `<input data-week="${i}" data-field="${field}" value="${escapeHtml(val ?? '')}" style="width:100%;box-sizing:border-box">`;
-    const typeSel = (i, val) =>
-      `<select data-week="${i}" data-field="type" style="width:100%;box-sizing:border-box">${
-        PLAN_TYPES.map(([v,l]) => `<option value="${v}"${val===v?' selected':''}>${l}</option>`).join('')}</select>`;
-    const dayCell = (i, field, val) => `<td class="editable" style="font-size:12px">${inp(i, field, val)}</td>`;
-    body.innerHTML = rows.map((r,i) => `
-      <tr>
-        <td style="white-space:nowrap;font-family:'DM Mono',monospace">
-          ${escapeHtml(r.w ?? i+1)}
-          <button class="btn-sm" onclick="deletePlanWeek(${i})" style="color:var(--c-danger);padding:2px 6px;margin-left:4px" title="Удалить неделю">✕</button>
-        </td>
-        <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
-        <td class="editable" style="min-width:96px">${inp(i,'accent',r.accent)}${typeSel(i,r.type)}</td>
-        <td></td>
-        ${PLAN_DAYS.map(([f]) => dayCell(i, f, r[f])).join('')}
-      </tr>`).join('') +
-      `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:10px">
-        <button class="btn-sm" onclick="addPlanWeek()">+ Неделя</button>
-      </td></tr>`;
+    body.innerHTML = planEditRowsHtml(PLAN || [], { onDelete: 'deletePlanWeek', onAdd: 'addPlanWeek' });
     return;
   }
 
@@ -877,6 +870,45 @@ function renderPlanTable() {
   // ── Обычный просмотр ──
   renderComplianceNote();
   body.innerHTML = planViewRowsHtml(PLAN, compliantWeeks(), getCurrentWeek());
+}
+
+// Строки конструктора плана. Как и planViewRowsHtml, зависит только от
+// аргументов: тем же кодом план спортсмена правит тренер (#60).
+//   weeks — недели; onDelete, onAdd — имена обработчиков «✕» и «+ Неделя».
+function planEditRowsHtml(weeks, { onDelete, onAdd }) {
+  const inp = (i, field, val) =>
+    `<input data-week="${i}" data-field="${field}" value="${escapeHtml(val ?? '')}" style="width:100%;box-sizing:border-box">`;
+  const typeSel = (i, val) =>
+    `<select data-week="${i}" data-field="type" style="width:100%;box-sizing:border-box">${
+      PLAN_TYPES.map(([v,l]) => `<option value="${v}"${val===v?' selected':''}>${l}</option>`).join('')}</select>`;
+  const dayCell = (i, field, val) => `<td class="editable" style="font-size:12px">${inp(i, field, val)}</td>`;
+  return weeks.map((r,i) => `
+    <tr>
+      <td style="white-space:nowrap;font-family:'DM Mono',monospace">
+        ${escapeHtml(r.w ?? i+1)}
+        <button class="btn-sm" onclick="${onDelete}(${i})" style="color:var(--c-danger);padding:2px 6px;margin-left:4px" title="Удалить неделю">✕</button>
+      </td>
+      <td class="editable" style="min-width:64px">${inp(i,'start',r.start)}${inp(i,'end',r.end)}</td>
+      <td class="editable" style="min-width:96px">${inp(i,'accent',r.accent)}${typeSel(i,r.type)}</td>
+      <td></td>
+      ${PLAN_DAYS.map(([f]) => dayCell(i, f, r[f])).join('')}
+    </tr>`).join('') +
+    `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:10px">
+      <button class="btn-sm" onclick="${onAdd}()">+ Неделя</button>
+    </td></tr>`;
+}
+
+// Поля конструктора внутри root — обратно в недели.
+function collectPlanEditsFrom(root, weeks) {
+  root.querySelectorAll('[data-week][data-field]').forEach(el => {
+    const i = +el.dataset.week;
+    if (weeks[i]) weeks[i][el.dataset.field] = el.value;
+  });
+}
+
+function newPlanWeek(n) {
+  return { w: n, start:'', end:'', accent:'', type:'dev',
+           mon:'', tue:'', wed:'', thu:'', fri:'', sat:'', sun:'' };
 }
 
 // Общее для таблицы плана и мобильного списка дней (#48).
@@ -1191,17 +1223,13 @@ function cancelPlanEdit() {
 
 // Считывает все поля строк (даты/акцент/тип/дни) обратно в PLAN
 function collectPlanEdits() {
-  document.querySelectorAll('#plan-body [data-week][data-field]').forEach(el => {
-    const i = +el.dataset.week;
-    if (PLAN[i]) PLAN[i][el.dataset.field] = el.value;
-  });
+  collectPlanEditsFrom(document.getElementById('plan-body'), PLAN);
 }
 
 function addPlanWeek() {
   collectPlanEdits();
   if (!Array.isArray(PLAN)) PLAN = [];
-  PLAN.push({ w: PLAN.length + 1, start:'', end:'', accent:'', type:'dev',
-              mon:'', tue:'', wed:'', thu:'', fri:'', sat:'', sun:'' });
+  PLAN.push(newPlanWeek(PLAN.length + 1));
   renderPlan();
 }
 
@@ -1313,23 +1341,31 @@ function parsePlanJSON(text) {
   return { weeks, race, warnings };
 }
 
-function importPlanFile(file) {
-  if (!file) return;
-  const input = document.getElementById('plan-import-file');
+/** Читает файл плана (CSV или JSON) и отдаёт разбор в onParsed:
+ *  {weeks, race, warnings} либо {errors}. Общий для загрузки спортсменом
+ *  и тренером (#60). */
+function readPlanFile(file, onParsed) {
   const reader = new FileReader();
   reader.onload = e => {
     const text = (e.target.result || '').replace(/^﻿/, '');   // Excel BOM
     const looksJson = /\.json$/i.test(file.name) || /^\s*[\[{]/.test(text);
-    const res = looksJson ? parsePlanJSON(text) : parsePlanCSV(text);
+    onParsed(looksJson ? parsePlanJSON(text) : parsePlanCSV(text));
+  };
+  reader.onerror = () => onParsed({ errors: ['Не удалось прочитать файл'] });
+  reader.readAsText(file, 'UTF-8');
+}
+
+function importPlanFile(file) {
+  if (!file) return;
+  const input = document.getElementById('plan-import-file');
+  readPlanFile(file, res => {
     if (input) input.value = '';
     if (res.errors && res.errors.length) {
       renderImportBar({ fileName: file.name, errors: res.errors });
       return;
     }
     applyImportedPlan(res.weeks, file.name, res.warnings || [], res.race || null);
-  };
-  reader.onerror = () => renderImportBar({ fileName: file.name, errors: ['Не удалось прочитать файл'] });
-  reader.readAsText(file, 'UTF-8');
+  });
 }
 
 /** Показывает загруженный план в конструкторе, ничего не сохраняя. */
@@ -1514,7 +1550,7 @@ function downloadPlanTemplate() {
   downloadFile('plan-template.csv', '﻿' + planToCSV(sample), 'text/csv');
 }
 
-const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства или правкой ИИ-тренера. ' +
+const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства, тренером или правкой ИИ-тренера. ' +
   'Загружена его свежая версия, ваша правка не сохранена.';
 
 /** Пишет недели в активный план (бэкенд создаёт новую версию).
@@ -1563,6 +1599,64 @@ async function savePlanEdits() {
   } finally {
     btn.disabled = false; btn.textContent = 'Сохранить изменения';
   }
+}
+
+// ── История плана (#60): кто, когда и почему менял недели ──
+// Общая для спортсмена и тренера: отличается только адрес. «Вы» — по sub
+// автора, поэтому одна и та же история читается правильно с обеих сторон.
+const PLAN_AUTHOR_LABEL = { ai: 'ИИ-тренер', migration: 'Перенос плана' };
+let planHistorySession = 0;
+
+function planHistoryAuthor(v) {
+  if (v.author_role === 'coach')
+    return v.author_sub === userSub ? 'Вы (тренер)' : `Тренер ${v.author_name || ''}`.trim();
+  if (v.author_role === 'athlete')
+    return v.author_sub === userSub ? 'Вы' : (v.author_name || 'Спортсмен');
+  return PLAN_AUTHOR_LABEL[v.author_role] || '—';
+}
+
+function planHistoryHtml(data) {
+  const versions = (data && data.versions) || [];
+  if (!versions.length) return '<div class="empty">Недели плана ещё не сохраняли</div>';
+  return versions.map(v => `<div class="history-row">
+      <div class="history-head">
+        <span class="history-who history-${escapeHtml(v.author_role)}">${escapeHtml(planHistoryAuthor(v))}</span>
+        <span class="chat-time">${chatTime(v.created_at)} · версия ${Number(v.version)}</span>
+      </div>
+      ${v.change_reason ? `<div class="history-why">${escapeHtml(v.change_reason)}</div>` : ''}
+    </div>`).join('') +
+    (data.has_more ? '<p class="hint" style="margin:10px 0 0">Показаны последние правки.</p>' : '');
+}
+
+async function showPlanHistory(url, title) {
+  const session = ++planHistorySession;
+  const body = document.getElementById('plan-history-body');
+  document.getElementById('plan-history-title').textContent = title;
+  body.innerHTML = '<div class="empty">Загрузка…</div>';
+  document.getElementById('plan-history-overlay').classList.add('active');
+  try {
+    const res = await fetch(url, { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (session === planHistorySession) body.innerHTML = planHistoryHtml(data);
+  } catch (e) {
+    if (session === planHistorySession)
+      body.innerHTML = `<div class="empty">Не удалось загрузить историю: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function closePlanHistory(event) {
+  if (event && event.target !== document.getElementById('plan-history-overlay')) return;
+  planHistorySession++;
+  document.getElementById('plan-history-overlay').classList.remove('active');
+}
+
+function showOwnPlanHistory() {
+  const id = activePlanId();
+  if (!id) return;
+  showPlanHistory(`${API_URL}plans/${encodeURIComponent(id)}/history`,
+                  `История плана «${planLabel(ACTIVE_PLAN)}»`);
 }
 
 function renderMetrics() {
@@ -2828,17 +2922,95 @@ function renderMyCoach(coaches) {
   select.disabled = empty;
   document.getElementById('coach-save-btn').disabled = empty;
   flashCoachMsg(empty ? 'Тренеров пока нет — их назначает администратор.' : '', true, true);
+  renderCoachPlanEdit();
+}
+
+// Переключатель «тренер может менять мои планы» (#60) — только при выбранном тренере.
+function renderCoachPlanEdit() {
+  document.getElementById('coach-plan-edit-row').style.display = myCoach ? '' : 'none';
+  document.getElementById('coach-plan-edit').checked = myCoachPlanEdit;
+}
+
+async function saveCoachPlanEdit(allow) {
+  const box = document.getElementById('coach-plan-edit');
+  box.disabled = true;
+  try {
+    const res = await fetch(API_URL + 'my/coach/plan-edit', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ allow }),
+    });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) {
+      // 409 — тренера уже нет (сняли роль или отказались в другой вкладке)
+      flashCoachMsg(res.status === 409 ? '⚠ Тренер больше не назначен' : '⚠ Не удалось сохранить', false);
+      loadMyCoach();
+      return;
+    }
+    myCoachPlanEdit = (await res.json()).can_edit_plans !== false;
+    flashCoachMsg(myCoachPlanEdit ? '✓ Тренер может менять ваши планы'
+                                  : '✓ Тренер больше не может менять ваши планы — только смотреть', true);
+  } catch (e) {
+    flashCoachMsg('⚠ ' + e.message, false);
+  } finally {
+    box.disabled = false;
+    renderCoachPlanEdit();
+  }
+}
+
+// Сообщение тренера о правке плана (#60) в диалоге: «Открыть план».
+// Спортсмену — к своему плану, тренеру — к этому плану на экране спортсмена.
+async function openChangedPlan(key, index) {
+  const m = CHATS[key].messages[index];
+  if (!m || !m.plan_id) return;
+  if (key === 'coach') {
+    if (COACH.plans.some(p => p.id === m.plan_id)) coachPickPlan(m.plan_id);
+    return;
+  }
+  await loadPlans();
+  const plan = livePlans().find(p => p.id === m.plan_id);
+  if (!plan) { alert('Этого плана нет в списке — возможно, он в архиве.'); return; }
+  if (plan.id !== activePlanId()) {
+    // Какой план вести, решает спортсмен: спрашиваем, а не переключаем молча.
+    if (confirm(`Тренер изменил план «${planLabel(plan)}», а активный у вас другой. Сделать его активным?`))
+      await switchPlan(plan.id);
+  } else if (!planEditMode) {
+    await loadPlan();
+    renderAll();
+  }
+  showTab('plan');
+}
+
+// Правка тренера, которой нет в загруженных данных: такого плана в списке
+// ещё нет, или у активного версия новее той, что на экране.
+function planChangeUnseen(m) {
+  if (m.kind !== 'plan_change') return false;
+  if (!PLANS.some(p => p.id === m.plan_id)) return true;
+  return m.plan_id === activePlanId() && !!PLAN_BASE && PLAN_BASE.plan_id === m.plan_id
+    && Number(m.plan_version) > PLAN_BASE.version;
+}
+
+// В диалог пришло сообщение о правке: свой план перечитываем. Открытый
+// конструктор не трогаем — его сохранение и так встретит plan_stale (#51).
+async function onCoachChangedPlan() {
+  if (planEditMode) return;
+  await loadPlans();          // селекторы, заголовок, метрики
+  await loadPlan();           // таблица, неделя, «Сегодня», план/факт
+  renderLog();                // журнал зависит от активного плана
 }
 
 async function loadMyCoach() {
   try {
     const [coachesRes, mineRes] = await Promise.all([
       fetch(API_URL + 'coaches', { headers: authHeaders() }),
-      fetch(API_URL + 'my/coach', { headers: authHeaders() }),
+      // fresh=1: переключатель правки — мимо кэша реестра на сервере (#60)
+      fetch(API_URL + 'my/coach?fresh=1', { headers: authHeaders() }),
     ]);
     if (coachesRes.status === 401 || mineRes.status === 401) { handleAuthError(); return; }
     if (!coachesRes.ok || !mineRes.ok) throw new Error('HTTP ' + (coachesRes.ok ? mineRes.status : coachesRes.status));
-    myCoach = (await mineRes.json()).coach || null;
+    const mine = await mineRes.json();
+    myCoach = mine.coach || null;
+    myCoachPlanEdit = mine.can_edit_plans !== false;
     renderMyCoach((await coachesRes.json()).coaches || []);
   } catch (e) {
     flashCoachMsg('⚠ Не удалось загрузить список тренеров', false);
@@ -2871,6 +3043,8 @@ async function saveMyCoach() {
       return;
     }
     myCoach = data.coach || null;
+    myCoachPlanEdit = data.can_edit_plans !== false;   // у нового тренера — снова по умолчанию
+    renderCoachPlanEdit();
     select.value = myCoach ? myCoach.sub : '';
     applyRole(currentRole);      // вкладка «Тренер» появляется и пропадает вместе с тренером
     refreshCoachBadge();
@@ -2880,12 +3054,17 @@ async function saveMyCoach() {
   }
 }
 
-// ── Тренер (#44): спортсмены и их данные, только просмотр ──
+// ── Тренер (#44): спортсмены и их данные; правка планов — #60 ──
 // Всё состояние экрана живёт здесь. Свои runs / PLAN / COMPLIANCE и
 // localStorage не трогаем: чужие пробежки не должны попасть ни в кэш, ни в
-// офлайн-синхронизацию.
-const COACH = { athletes: [], athlete: null, plans: [], planId: null,
-                weeks: [], compliance: null, runs: [], runScope: 'plan', error: '' };
+// офлайн-синхронизацию, а чужой план — в свой конструктор.
+const COACH = { athletes: [], athlete: null, plans: [], activePlanId: null, planId: null,
+                weeks: [], base: null, compliance: null, runs: [], runScope: 'plan', error: '',
+                // Правка плана (#60): черновик недель, загруженный файл, форма гонки.
+                // draftToken меняется, когда черновик подменяют целиком (см. coachCollect).
+                // draftClean — черновик сразу после открытия редактора, для coachDirty.
+                editing: false, draft: null, draftToken: 0, draftClean: null, importInfo: null,
+                raceForm: null };
 let coachChart = null;
 
 function coachUrl(tail) {
@@ -2913,6 +3092,396 @@ function coachAccessLost() {
   return err;
 }
 
+const COACH_STALE_TEXT = 'Спортсмен успел изменить план, пока вы его правили. ' +
+  'Загружена свежая версия, ваша правка не сохранена.';
+
+// Запись в план спортсмена (#60). Отказы разные: спортсмен снял тренера
+// (403 forbidden, как и при чтении), выключил правку (403 edit_not_allowed)
+// или успел изменить план сам (409).
+async function coachPost(tail, body) {
+  const res = await fetch(coachUrl(tail), {
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (res.status === 403) {
+    const data = await res.json().catch(() => ({}));
+    throw data.error === 'edit_not_allowed' ? coachEditRevoked() : coachAccessLost();
+  }
+  if (res.status === 409) throw Object.assign(new Error(COACH_STALE_TEXT), { code: 'plan_stale' });
+  if (!res.ok) throw await apiError(res);
+  return res.json();
+}
+
+function coachEditRevoked() {
+  let kept = false;
+  if (COACH.athlete) {
+    COACH.athlete.can_edit = false;
+    coachCloseRaceForm();
+    // Как и при сверке разрешения (coachSyncCanEdit): набранное не выбрасываем.
+    kept = COACH.editing && coachDirty();
+    if (!kept) coachStopEdit();
+    renderCoachAthlete();
+  }
+  return Object.assign(new Error('Спортсмен выключил вам правку своих планов — остался только просмотр.' +
+                                 (kept ? ' Несохранённые правки пока на экране, «Отмена» их уберёт.' : '')),
+                       { editRevoked: true });
+}
+
+function coachFlash(text, ok) {
+  flashMsg(document.getElementById('coach-plan-msg'), text, ok, ok ? 5000 : 8000);
+}
+
+// Сообщение после записи. Спортсмену о правке пишет сервер — в общий диалог.
+function coachSaved(notified, text = '✓ Сохранено') {
+  coachFlash(notified === false
+    ? `${text}. Сообщение спортсмену не отправилось — напишите ему в диалоге.`
+    : `${text}. Спортсмен увидит сообщение в диалоге.`, true);
+  chatPull('coach');
+}
+
+// Ошибка записи, которую не обработал вызывающий. Потеря доступа уже показана.
+function coachWriteFailed(e, flash) {
+  if (e.accessLost) return;
+  if (e.editRevoked) { alert(e.message); return; }
+  flash('⚠ ' + e.message, false);
+}
+
+function coachCanEdit() { return !!(COACH.athlete && COACH.athlete.can_edit === true); }
+
+// Разрешение правки могло измениться, пока экран спортсмена открыт: свежий
+// список спортсменов приходит и со счётчиком непрочитанных (#60).
+function coachSyncCanEdit(athletes) {
+  const open = COACH.athlete;
+  const fresh = open && athletes.find(a => a.sub === open.sub);
+  if (!fresh || fresh.can_edit === open.can_edit) return;
+  open.can_edit = fresh.can_edit;
+  if (!coachCanEdit() && (COACH.editing || COACH.raceForm)) {
+    coachCloseRaceForm();
+    // Набранное молча не выбрасываем: сохранить его уже нельзя, но можно
+    // скопировать или переслать спортсмену в диалоге.
+    const kept = COACH.editing && coachDirty();
+    if (!kept) coachStopEdit();
+    coachFlash('Спортсмен выключил вам правку своих планов — остался только просмотр.' +
+               (kept ? ' Несохранённые правки пока на экране, «Отмена» их уберёт.' : ''), false);
+  }
+  renderCoachAthlete();
+}
+function coachPlan() { return COACH.plans.find(p => p.id === COACH.planId) || null; }
+function coachEnc(id) { return encodeURIComponent(id); }
+
+// ── Правка недель (#60) ──
+
+function coachSetDraft(weeks) {
+  COACH.draft = weeks.map(w => ({ ...w }));
+  COACH.draftToken += 1;
+}
+
+// Поля редактора → черновик. Только если на экране редактор именно этого
+// черновика: после перечитывания плана старые поля не должны затереть свежие.
+function coachCollect() {
+  const body = document.getElementById('coach-plan-body');
+  if (COACH.editing && COACH.draft && body.dataset.draft === String(COACH.draftToken))
+    collectPlanEditsFrom(body, COACH.draft);
+}
+
+function coachDirty() {
+  if (!COACH.editing) return false;
+  coachCollect();
+  return !!COACH.importInfo || JSON.stringify(COACH.draft) !== COACH.draftClean;
+}
+
+function coachConfirmDiscard() {
+  return !coachDirty() || confirm('Несохранённые правки плана пропадут. Продолжить?');
+}
+
+function coachStartEdit() {
+  if (!coachCanEdit() || !coachPlan() || !COACH.base) return;
+  COACH.editing = true;
+  COACH.importInfo = null;
+  coachSetDraft(COACH.weeks);
+  renderCoachAthlete();
+  // Точка отсчёта — то, что редактор собрал из своих полей: он дописывает
+  // недостающие дни и тип, и сравнение с COACH.weeks видело бы «правку»
+  // в нетронутом плане.
+  coachCollect();
+  COACH.draftClean = JSON.stringify(COACH.draft);
+}
+
+function coachStopEdit() {
+  Object.assign(COACH, { editing: false, draft: null, draftClean: null, importInfo: null });
+  document.getElementById('coach-change-note').value = '';
+  coachHideImportBar();
+}
+
+function coachToggleEdit() {
+  if (!COACH.editing) { coachStartEdit(); return; }
+  if (!coachConfirmDiscard()) return;
+  coachStopEdit();
+  renderCoachAthlete();
+}
+
+function coachAddWeek() {
+  coachCollect();
+  COACH.draft.push(newPlanWeek(COACH.draft.length + 1));
+  COACH.draftToken += 1;          // строки на экране уже не соответствуют черновику
+  renderCoachPlanTable();
+}
+
+function coachDeleteWeek(i) {
+  coachCollect();
+  COACH.draft.splice(i, 1);
+  COACH.draft.forEach((r, idx) => { r.w = idx + 1; });
+  COACH.draftToken += 1;
+  renderCoachPlanTable();
+}
+
+function coachDraftWeeks() {
+  coachCollect();
+  return COACH.draft.map((r, i) => ({ ...r, w: i + 1 }));
+}
+
+function coachChangeNote() {
+  const note = document.getElementById('coach-change-note').value.trim();
+  return note || (COACH.importInfo ? `Загружен из файла ${COACH.importInfo.fileName}` : '');
+}
+
+async function coachSavePlan() {
+  const plan = coachPlan();
+  if (!COACH.editing || !plan || !COACH.base) return;
+  // Без правок не пишем: пустая версия сделала бы устаревшими открытые
+  // правки спортсмена и ИИ, а спортсмен получил бы «Тренер изменил план».
+  if (!coachDirty()) {
+    // Комментарий без правок — это сообщение, а не версия плана: не стираем его.
+    if (document.getElementById('coach-change-note').value.trim()) {
+      coachFlash('В неделях ничего не изменилось — комментарий напишите спортсмену в диалоге', false);
+      return;
+    }
+    coachStopEdit();
+    renderCoachAthlete();
+    coachFlash('Изменений нет — сохранять нечего', true);
+    return;
+  }
+  const athlete = COACH.athlete, planId = plan.id;
+  const btn = document.getElementById('coach-save-btn');
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Сохранение…';
+  try {
+    const saved = await coachPost(`plans/${coachEnc(planId)}/weeks`, {
+      weeks: coachDraftWeeks(), base_version: COACH.base.version, change_reason: coachChangeNote(),
+    });
+    if (COACH.athlete !== athlete) return;
+    await selectCoachPlan(planId);      // свежие недели, факт и версия
+    coachSaved(saved.notified);
+  } catch (e) {
+    if (e.code === 'plan_stale') { await coachStale(athlete, planId); return; }
+    coachWriteFailed(e, coachFlash);
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+// 409: план изменился. Правка недель продолжается уже поверх свежих;
+// предпросмотр файла закрывается, как у спортсмена (#51).
+async function coachStale(athlete, planId) {
+  const importing = !!COACH.importInfo;
+  const note = document.getElementById('coach-change-note').value;
+  await selectCoachPlan(planId);
+  if (COACH.athlete !== athlete || COACH.planId !== planId) return;
+  if (!COACH.base) {
+    // Свежий план не загрузился — о «загруженной свежей версии» не говорим.
+    alert('Спортсмен успел изменить план, а загрузить свежую версию не удалось. ' +
+          'Ваша правка не сохранена — обновите экран и внесите её заново.');
+    return;
+  }
+  if (!importing) {
+    coachStartEdit();
+    document.getElementById('coach-change-note').value = note;
+  }
+  alert(COACH_STALE_TEXT + (importing
+    ? ' Если план всё ещё нужно заменить, загрузите файл ещё раз.' : ' Внесите её заново.'));
+}
+
+// ── Новый план и карточка гонки (#60) ──
+
+function coachRaceFlash(text, ok) {
+  flashMsg(document.getElementById('coach-race-msg'), text, ok, 5000);
+}
+
+function coachOpenRaceForm(mode) {
+  if (!coachCanEdit()) return;
+  const plan = mode === 'edit' ? coachPlan() : null;
+  if (mode === 'edit' && !plan) return;
+  if (mode === 'create' && !coachConfirmDiscard()) return;
+  if (mode === 'create' && COACH.editing) { coachStopEdit(); renderCoachAthlete(); }
+  COACH.raceForm = mode;
+  fillRaceFields('cp', plan);
+  document.getElementById('coach-race-title').textContent =
+    mode === 'create' ? 'Новый план для спортсмена' : 'Гонка этого плана';
+  document.getElementById('coach-race-save').textContent = mode === 'create' ? 'Создать план' : 'Сохранить';
+  document.getElementById('coach-race-hint').style.display = mode === 'create' ? '' : 'none';
+  document.getElementById('coach-race-form').style.display = '';
+  if (mode === 'create') document.getElementById('cp-race-name').focus();
+}
+
+function coachCloseRaceForm() {
+  COACH.raceForm = null;
+  document.getElementById('coach-race-form').style.display = 'none';
+}
+
+function coachToggleRaceForm() {
+  if (COACH.raceForm === 'edit') coachCloseRaceForm();
+  else coachOpenRaceForm('edit');
+}
+
+function coachNewPlan() { coachOpenRaceForm('create'); }
+
+function coachCreatedText(planId) {
+  return COACH.activePlanId === planId
+    ? '✓ План создан и стал у спортсмена активным'
+    : '✓ План создан. Сделать его активным может только спортсмен';
+}
+
+// План уже создан: сбой перечитывания — не повод думать, что создать не
+// вышло (иначе повтор дал бы второй такой же план). false — список не обновился.
+async function coachAfterCreate(res) {
+  try {
+    await coachReloadPlans(res.plan.id);
+  } catch (e) {
+    if (!e.accessLost) coachFlash('✓ План создан, но список планов не обновился — откройте спортсмена заново', true);
+    return false;
+  }
+  coachSaved(res.notified, coachCreatedText(res.plan.id));
+  return true;
+}
+
+// Перечитывает список планов спортсмена и открывает selectId.
+async function coachReloadPlans(selectId) {
+  const athlete = COACH.athlete;
+  const index = await coachGet('plans');
+  if (COACH.athlete !== athlete) return;
+  COACH.plans = (index.plans || []).filter(p => !p.archived);
+  COACH.activePlanId = index.active_plan_id || null;
+  await selectCoachPlan(selectId);
+}
+
+async function coachSaveRace() {
+  const mode = COACH.raceForm;
+  if (!mode) return;
+  const body = readRaceFields('cp');
+  if (mode === 'create' && !body.race_name) { coachRaceFlash('⚠ Введите название гонки', false); return; }
+  const athlete = COACH.athlete;
+  const btn = document.getElementById('coach-race-save');
+  btn.disabled = true;
+  try {
+    if (mode === 'create') {
+      const res = await coachPost('plans', body);
+      if (COACH.athlete !== athlete) return;
+      coachCloseRaceForm();
+      if (await coachAfterCreate(res)) coachStartEdit();   // недель нет — сразу конструктор
+      return;
+    }
+    const planId = COACH.planId;
+    const res = await coachPost(`plans/${coachEnc(planId)}/meta`, body);
+    if (COACH.athlete !== athlete) return;
+    if (res.changed === false) {         // сервер ничего не записал и спортсмену не писал
+      coachCloseRaceForm();
+      coachFlash('Без изменений', true);
+      return;
+    }
+    COACH.plans = COACH.plans.map(p => p.id === res.plan.id ? res.plan : p);
+    coachCloseRaceForm();
+    renderCoachHeader();
+    coachSaved(res.notified);
+    // «Старт плана» двигает недели по датам — факт пересчитывается. Недели и
+    // открытый черновик не трогаем.
+    const compliance = await coachGet(`plans/${coachEnc(planId)}/compliance`);
+    if (COACH.athlete !== athlete || COACH.planId !== planId) return;
+    COACH.compliance = compliance;
+    renderCoachAthlete();
+  } catch (e) {
+    if (e.editRevoked) coachCloseRaceForm();
+    coachWriteFailed(e, coachRaceFlash);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Загрузка плана из файла (#60): тот же разбор, что у спортсмена (#28) ──
+
+function coachImportBar({ fileName, count, warnings, errors }) {
+  const bar = document.getElementById('coach-import-bar');
+  const warnEl = document.getElementById('coach-import-warnings');
+  bar.style.display = '';
+  bar.classList.toggle('error', !!errors);
+  document.getElementById('coach-import-close').style.display = errors ? '' : 'none';
+  if (errors) {
+    document.getElementById('coach-import-summary').textContent = `⚠ Не удалось загрузить «${fileName}»`;
+    warnEl.style.display = '';
+    warnEl.innerHTML = errors.map(escapeHtml).join('<br>');
+    return;
+  }
+  document.getElementById('coach-import-summary').textContent =
+    `✓ Загружено недель: ${count} из «${fileName}». Проверьте и сохраните в план или создайте новый.`;
+  warnEl.style.display = warnings.length ? '' : 'none';
+  warnEl.innerHTML = warnings.map(w => '⚠ ' + escapeHtml(w)).join('<br>');
+}
+
+function coachHideImportBar() {
+  const bar = document.getElementById('coach-import-bar');
+  bar.style.display = 'none';
+  bar.classList.remove('error');
+}
+
+function coachImportFile(file) {
+  const input = document.getElementById('coach-import-file');
+  if (input) input.value = '';
+  if (!file || !coachCanEdit() || !coachConfirmDiscard()) return;
+  const athlete = COACH.athlete;
+  readPlanFile(file, res => {
+    if (COACH.athlete !== athlete) return;
+    if (res.errors && res.errors.length) { coachImportBar({ fileName: file.name, errors: res.errors }); return; }
+    coachCloseRaceForm();
+    COACH.editing = true;
+    COACH.importInfo = { fileName: file.name, race: res.race || null };
+    coachSetDraft(res.weeks);
+    renderCoachAthlete();
+    coachImportBar({ fileName: file.name, count: res.weeks.length, warnings: res.warnings || [] });
+  });
+}
+
+async function coachSaveAsNewPlan() {
+  if (!COACH.editing || !COACH.importInfo) return;
+  const athlete = COACH.athlete;
+  const race = COACH.importInfo.race || {};
+  const btn = document.getElementById('coach-save-new-btn');
+  btn.disabled = true;
+  try {
+    const res = await coachPost('plans', {
+      race_name: String(race.race_name || '').trim() || 'План от тренера',
+      race_date: race.race_date || '', target_time: race.target_time || '',
+      plan_start: race.plan_start || '',
+      weeks: coachDraftWeeks(), change_reason: coachChangeNote(),
+    });
+    if (COACH.athlete !== athlete) return;
+    // План уже создан: закрываем предпросмотр до перечитывания, иначе при его
+    // сбое повторное «Создать новый план» дало бы второй такой же план.
+    coachStopEdit();
+    renderCoachAthlete();
+    await coachAfterCreate(res);
+  } catch (e) {
+    coachWriteFailed(e, coachFlash);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function coachShowHistory() {
+  const plan = coachPlan();
+  if (!plan) return;
+  showPlanHistory(coachUrl(`plans/${coachEnc(plan.id)}/history`), `История плана «${planLabel(plan)}»`);
+}
+
 async function loadCoachAthletes() {
   const el = document.getElementById('coach-athletes-list');
   el.innerHTML = '<div class="empty">Загрузка…</div>';
@@ -2922,6 +3491,7 @@ async function loadCoachAthletes() {
     if (res.status === 403) { el.innerHTML = '<div class="empty">Вы не назначены тренером</div>'; return; }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     COACH.athletes = (await res.json()).athletes || [];
+    coachSyncCanEdit(COACH.athletes);
     el.innerHTML = COACH.athletes.length
       // В onclick идёт индекс, а не sub: так в разметку не попадает чужая строка.
       ? COACH.athletes.map((a, i) => `<div class="run-item" onclick="openCoachAthlete(${i})" style="cursor:pointer">
@@ -2949,6 +3519,7 @@ function openCoachTab() {
   if (COACH.athlete) {
     renderCoachAthlete();     // график в скрытой вкладке не имел размера
     chatPull('coach');
+    refreshCoachBadge();      // заодно сверит разрешение правки (#60)
     return;
   }
   if (currentIsCoach) loadCoachAthletes();
@@ -2958,8 +3529,12 @@ function openCoachTab() {
 async function openCoachAthlete(index) {
   const athlete = COACH.athletes[index];
   if (!athlete) return;
-  Object.assign(COACH, { athlete, plans: [], planId: null, weeks: [], compliance: null,
-                         runs: [], runScope: 'plan', error: 'Загрузка…' });
+  coachStopEdit();
+  coachCloseRaceForm();
+  coachFlash('');
+  Object.assign(COACH, { athlete, plans: [], activePlanId: null, planId: null, weeks: [],
+                         base: null, compliance: null, runs: [], runScope: 'plan',
+                         error: 'Загрузка…' });
   chatClose('my');
   syncCoachTab();
   document.getElementById('coach-athlete-name').textContent = athlete.name;
@@ -2969,6 +3544,7 @@ async function openCoachAthlete(index) {
     const [index_, runs_] = await Promise.all([coachGet('plans'), coachGet('runs')]);
     if (COACH.athlete !== athlete) return;          // успели открыть другого
     COACH.plans = (index_.plans || []).filter(p => !p.archived);
+    COACH.activePlanId = index_.active_plan_id || null;
     COACH.runs = (Array.isArray(runs_) ? runs_ : [])
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     const active = COACH.plans.find(p => p.id === index_.active_plan_id) || COACH.plans[0];
@@ -2983,16 +3559,21 @@ async function openCoachAthlete(index) {
 
 async function selectCoachPlan(planId) {
   const athlete = COACH.athlete;
-  Object.assign(COACH, { planId, weeks: [], compliance: null, error: 'Загрузка…' });
+  coachStopEdit();
+  if (COACH.raceForm === 'edit') coachCloseRaceForm();
+  Object.assign(COACH, { planId, weeks: [], base: null, compliance: null, error: 'Загрузка…' });
   renderCoachAthlete();
   try {
-    const [weeks, compliance] = await Promise.all([
-      coachGet(`plans/${encodeURIComponent(planId)}/weeks`),
-      coachGet(`plans/${encodeURIComponent(planId)}/compliance`),
+    const [state, compliance] = await Promise.all([
+      coachGet(`plans/${coachEnc(planId)}/weeks?meta=1`),
+      coachGet(`plans/${coachEnc(planId)}/compliance`),
     ]);
     // Пока грузилось, могли открыть другого спортсмена или другой план.
     if (COACH.athlete !== athlete || COACH.planId !== planId) return;
-    COACH.weeks = Array.isArray(weeks) ? weeks : [];
+    // Бэкенд до #60 отдаёт голый массив: версии нет — правка недоступна.
+    const bare = Array.isArray(state);
+    COACH.weeks = bare ? state : (state.weeks || []);
+    COACH.base = bare ? null : { plan_id: state.plan_id, version: state.version };
     COACH.compliance = compliance;
     COACH.error = '';
   } catch (e) {
@@ -3002,16 +3583,30 @@ async function selectCoachPlan(planId) {
   renderCoachAthlete();
 }
 
+// Выбор плана в списке: несохранённую правку молча не бросаем.
+function coachPickPlan(planId) {
+  if (planId === COACH.planId) return;
+  if (!coachConfirmDiscard()) { renderCoachHeader(); return; }
+  selectCoachPlan(planId);
+}
+
 function closeCoachAthlete() {
   chatClose('coach');
+  coachStopEdit();
+  coachCloseRaceForm();
   COACH.athlete = null;
   if (coachChart) { coachChart.destroy(); coachChart = null; }
   openCoachTab();
 }
 
+// «← Спортсмены»: в отличие от потери доступа, уход — решение тренера.
+function leaveCoachAthlete() {
+  if (coachConfirmDiscard()) closeCoachAthlete();
+}
+
 function setCoachRunScope(scope) {
   COACH.runScope = scope;
-  renderCoachAthlete();
+  renderCoachRunLog();
 }
 
 function coachSummaryText() {
@@ -3040,22 +3635,75 @@ function coachSummaryText() {
 
 function renderCoachAthlete() {
   if (!COACH.athlete) return;
+  renderCoachHeader();
+  renderCoachPlanTable();
+  renderCoachChart();
+  renderCoachRunLog();
+}
+
+// Выбор плана, сводка и кнопки правки (#60). Кнопки записи — только если
+// спортсмен разрешил правку; конструктор, как и у самого спортсмена, — на десктопе.
+function renderCoachHeader() {
   const sel = document.getElementById('coach-plan-select');
   sel.innerHTML = COACH.plans.map(p =>
-    `<option value="${escapeHtml(p.id)}"${p.id === COACH.planId ? ' selected' : ''}>${escapeHtml(planLabel(p))}</option>`).join('');
+    `<option value="${escapeHtml(p.id)}"${p.id === COACH.planId ? ' selected' : ''}>${escapeHtml(planLabel(p))}${p.id === COACH.activePlanId && COACH.plans.length > 1 ? ' · активный' : ''}</option>`).join('');
   sel.style.display = COACH.plans.length > 1 ? '' : 'none';
   document.getElementById('coach-summary').textContent = coachSummaryText();
 
-  // Таблица плана — тем же кодом, что и своя, но без кнопок правки.
-  const c = COACH.compliance;
-  const dated = !!(c && c.dated);
+  const canEdit = coachCanEdit();
+  const hasPlan = !!coachPlan();
+  const editable = canEdit && hasPlan && !!COACH.base;
+  const show = (id, on) => { document.getElementById(id).style.display = on ? '' : 'none'; };
+  show('coach-new-plan-btn', canEdit && !COACH.editing);
+  show('coach-import-btn', canEdit && !COACH.editing);
+  show('coach-race-btn', canEdit && hasPlan);
+  show('coach-edit-btn', editable);
+  show('coach-history-btn', hasPlan);
+  document.getElementById('coach-edit-btn').textContent = COACH.editing ? '✕ Отмена' : '✏ Редактировать';
+  // Бэкенд до #60 поля can_edit не знает — тогда и отказа не показываем.
+  show('coach-edit-note', COACH.athlete.can_edit === false);
+  show('coach-save-bar', COACH.editing);
+  show('coach-save-btn', COACH.editing && editable);
+  show('coach-save-new-btn', COACH.editing && !!COACH.importInfo && canEdit);
+  document.getElementById('coach-save-btn').textContent =
+    COACH.importInfo ? 'Сохранить в этот план' : 'Сохранить изменения';
+}
+
+function coachEmptyPlanHtml() {
+  const canEdit = coachCanEdit();
+  const plan = coachPlan();
+  const text = plan || COACH.error ? 'План пуст' : 'У спортсмена пока нет плана';
+  const action = !canEdit || COACH.error ? ''
+    : plan ? (COACH.base ? '<button class="btn-primary desktop-only" onclick="coachStartEdit()">Заполнить план</button>' : '')
+    : '<button class="btn-primary desktop-only" onclick="coachNewPlan()">Создать план</button>';
+  return `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:2rem">
+      <div class="empty" style="padding:0${action ? ' 0 12px' : ''}">${text}</div>${action}</td></tr>`;
+}
+
+// Таблица плана — тем же кодом, что и своя: просмотр с план/фактом или
+// конструктор (#60).
+function renderCoachPlanTable() {
+  const body = document.getElementById('coach-plan-body');
   document.getElementById('coach-plan-head').innerHTML =
     `<tr><th>Нед</th><th>Даты</th><th>Акцент</th><th title="План и факт за неделю, км">км</th>${
       PLAN_DAYS.map(([, label]) => `<th>${label}</th>`).join('')}</tr>`;
-  document.getElementById('coach-plan-body').innerHTML = COACH.weeks.length
+  if (COACH.editing && COACH.draft) {
+    coachCollect();               // перерисовка не должна терять набранное
+    body.innerHTML = planEditRowsHtml(COACH.draft, { onDelete: 'coachDeleteWeek', onAdd: 'coachAddWeek' });
+    body.dataset.draft = String(COACH.draftToken);
+    return;
+  }
+  body.dataset.draft = '';
+  const c = COACH.compliance;
+  const dated = !!(c && c.dated);
+  body.innerHTML = COACH.weeks.length
     ? planViewRowsHtml(COACH.weeks, dated ? c.weeks : null, c ? c.current_week : -1)
-    : `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;padding:2rem"><div class="empty" style="padding:0">План пуст</div></td></tr>`;
+    : coachEmptyPlanHtml();
+}
 
+function renderCoachChart() {
+  const c = COACH.compliance;
+  const dated = !!(c && c.dated);
   if (coachChart) { coachChart.destroy(); coachChart = null; }
   document.getElementById('coach-chart-card').style.display = dated ? '' : 'none';
   if (dated) {
@@ -3063,7 +3711,9 @@ function renderCoachAthlete() {
       weekChartConfig(c.weeks.length, c.weeks.map(w => w.planned_km || null),
                       c.weeks.map(w => w.complete), c.weeks.map(w => w.actual_km)));
   }
+}
 
+function renderCoachRunLog() {
   const byPlan = COACH.runScope === 'plan' && COACH.planId;
   document.getElementById('coach-scope-plan').classList.toggle('active', COACH.runScope === 'plan');
   document.getElementById('coach-scope-all').classList.toggle('active', COACH.runScope === 'all');
@@ -3096,8 +3746,8 @@ const CHATS = {
 };
 // session растёт при каждом открытии и закрытии: ответ, пришедший в уже
 // другой диалог (сменили спортсмена, ушли со вкладки), отбрасывается.
-Object.values(CHATS).forEach(chat =>
-  Object.assign(chat, { messages: [], hasMore: false, open: false, session: 0 }));
+Object.entries(CHATS).forEach(([key, chat]) =>
+  Object.assign(chat, { key, messages: [], hasMore: false, open: false, session: 0 }));
 
 function chatEl(chat, name) { return document.getElementById(`${chat.prefix}-${name}`); }
 
@@ -3139,12 +3789,24 @@ function chatTime(ts) {
     { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+// Сообщение о правке плана (#60) пишет сервер от имени тренера: оно выделено и
+// ведёт к плану. В обработчик уходит номер сообщения, а не id плана из данных.
+function chatMessageHtml(chat, m, index) {
+  const mine = m.from_role === chat.role ? ' mine' : '';
+  const time = `<span class="chat-time">${chatTime(m.ts)}</span>`;
+  const key = chat.key === 'coach' ? 'coach' : 'my';
+  // Без переносов внутри: у сообщения white-space: pre-wrap, они стали бы пустыми строками.
+  if (m.kind === 'plan_change' && m.plan_id)
+    return `<div class="chat-msg plan-change${mine}">${escapeHtml(m.text)}` +
+      `<button class="btn-sm" onclick="openChangedPlan('${key}',${Number(index)})">Открыть план</button>${time}</div>`;
+  return `<div class="chat-msg${mine}">${escapeHtml(m.text)}${time}</div>`;
+}
+
 function chatRender(chat, scrollToEnd) {
   const log = chatEl(chat, 'log');
   chatEl(chat, 'earlier').style.display = chat.hasMore ? '' : 'none';
   log.innerHTML = chat.messages.length
-    ? chat.messages.map(m =>
-        `<div class="chat-msg${m.from_role === chat.role ? ' mine' : ''}">${escapeHtml(m.text)}<span class="chat-time">${chatTime(m.ts)}</span></div>`).join('')
+    ? chat.messages.map((m, i) => chatMessageHtml(chat, m, i)).join('')
     : '<div class="empty">Сообщений пока нет</div>';
   if (scrollToEnd) log.scrollTop = log.scrollHeight;
 }
@@ -3162,6 +3824,9 @@ async function chatOpen(key) {
     chat.hasMore = !!page.has_more;
     chatRender(chat, true);
     chatMarkRead(key);
+    // Правки тренера, сделанные, пока диалог был закрыт (#60): план на экране
+    // мог устареть ещё до открытия диалога.
+    if (key === 'my' && chat.messages.some(planChangeUnseen)) onCoachChangedPlan();
   } catch (e) {
     if (!e.handled && chat.session === session)
       chatEl(chat, 'log').innerHTML = '<div class="empty">Не удалось загрузить диалог</div>';
@@ -3196,6 +3861,10 @@ async function chatPull(key) {
   // К новому прокручиваем, только если человек и так был внизу или написал сам.
   chatRender(chat, wasAtEnd || fresh.some(m => m.from_role === chat.role));
   if (fresh.some(m => m.from_role !== chat.role)) chatMarkRead(key);
+  // Тренер поменял активный план или создал новый (#60) — спортсмен сразу
+  // видит свежий. Правка другого плана на экране ничего не меняет.
+  if (key === 'my' && fresh.some(m => m.kind === 'plan_change'
+      && (m.plan_id === activePlanId() || planChangeUnseen(m)))) onCoachChangedPlan();
 }
 
 async function chatEarlier(key) {
@@ -3273,7 +3942,11 @@ async function refreshCoachBadge() {
     }
     if (currentIsCoach) {
       const res = await fetch(API_URL + 'coach/athletes', { headers: authHeaders() });
-      if (res.ok) total += ((await res.json()).athletes || []).reduce((s, a) => s + (a.unread || 0), 0);
+      if (res.ok) {
+        const athletes = (await res.json()).athletes || [];
+        coachSyncCanEdit(athletes);
+        total += athletes.reduce((s, a) => s + (a.unread || 0), 0);
+      }
     }
   } catch (e) { return; }
   show(total);

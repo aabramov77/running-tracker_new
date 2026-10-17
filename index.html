@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=28">
+<link rel="stylesheet" href="style.css?v=29">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -106,6 +106,7 @@
           <select id="plan-select" onchange="switchPlan(this.value)" style="max-width:220px"></select>
           <button class="btn-sm" onclick="createNewPlan()">+ Новый план</button>
           <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
+          <button class="btn-sm" id="plan-history-btn" onclick="showOwnPlanHistory()" style="display:none">История</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <label class="btn-sm desktop-only" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Загрузить план из CSV или JSON">
@@ -522,7 +523,7 @@
     <!-- Мой тренер (#44) -->
     <div class="card" style="margin-bottom:12px">
       <div class="card-title">Мой тренер</div>
-      <p class="hint">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается, и менять ваши данные он не может.</p>
+      <p class="hint">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается. Менять тренер может только планы, и только пока вы это разрешаете.</p>
       <div class="form-grid">
         <div class="form-group full">
           <label>Тренер</label>
@@ -531,6 +532,13 @@
           </select>
         </div>
       </div>
+      <!-- #60: разрешение тренеру править планы, по умолчанию включено -->
+      <label class="check-row" id="coach-plan-edit-row" style="display:none">
+        <input type="checkbox" id="coach-plan-edit" checked onchange="saveCoachPlanEdit(this.checked)">
+        <span>Тренер может создавать и менять мои планы
+          <small>О каждой правке тренер сообщает в диалоге, прежние версии плана остаются в истории. Активный план и архив всегда выбираете вы.</small>
+        </span>
+      </label>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn-primary" id="coach-save-btn" onclick="saveMyCoach()" disabled>Сохранить</button>
         <span id="coach-msg" class="save-msg"></span>
@@ -589,7 +597,7 @@
     </div>
   </div>
 
-  <!-- ТРЕНЕР (#44): спортсмены тренера, только просмотр -->
+  <!-- ТРЕНЕР (#44): спортсмены тренера; правка их планов — #60 -->
   <div id="tab-coach" class="tab">
     <!-- Спортсмену: диалог со своим тренером -->
     <div class="card" id="mychat-card" style="display:none;margin-bottom:12px">
@@ -611,7 +619,7 @@
         <div class="card-title" style="margin:0">Мои спортсмены</div>
         <button class="btn-sm" onclick="loadCoachAthletes()">↻ Обновить</button>
       </div>
-      <p class="hint">Здесь те, кто выбрал вас тренером в своём Профиле. Их планы и журнал доступны только для просмотра.</p>
+      <p class="hint">Здесь те, кто выбрал вас тренером в своём Профиле. Вы видите их планы и журнал, а если спортсмен разрешил, — создаёте и правите планы.</p>
       <div id="coach-athletes-list"><div class="empty">Загрузка…</div></div>
     </div>
 
@@ -619,12 +627,64 @@
       <div class="card" style="margin-bottom:12px">
         <div class="week-header" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <button class="btn-sm" onclick="closeCoachAthlete()">← Спортсмены</button>
+            <button class="btn-sm" onclick="leaveCoachAthlete()">← Спортсмены</button>
             <div class="card-title" id="coach-athlete-name" style="margin:0"></div>
           </div>
-          <select id="coach-plan-select" onchange="selectCoachPlan(this.value)" style="max-width:240px;display:none"></select>
+          <select id="coach-plan-select" onchange="coachPickPlan(this.value)" style="max-width:240px;display:none"></select>
         </div>
         <div id="coach-summary" class="hint" style="margin:0 0 8px"></div>
+        <!-- Правка плана тренером (#60) -->
+        <div class="coach-plan-tools">
+          <button class="btn-sm desktop-only" id="coach-new-plan-btn" onclick="coachNewPlan()" style="display:none">+ Новый план</button>
+          <button class="btn-sm desktop-only" id="coach-race-btn" onclick="coachToggleRaceForm()" style="display:none">✏ Гонка</button>
+          <label class="btn-sm desktop-only" id="coach-import-btn" style="display:none;cursor:pointer" title="Загрузить план из CSV или JSON">
+            ⤒ Загрузить
+            <input type="file" id="coach-import-file" accept=".csv,.json"
+                   onchange="coachImportFile(this.files[0])" style="display:none">
+          </label>
+          <button class="btn-sm desktop-only" id="coach-edit-btn" onclick="coachToggleEdit()" style="display:none">✏ Редактировать</button>
+          <button class="btn-sm" id="coach-history-btn" onclick="coachShowHistory()" style="display:none">История</button>
+          <span id="coach-plan-msg" class="save-msg"></span>
+        </div>
+        <div id="coach-edit-note" class="hint" style="display:none;margin:0 0 8px">Спортсмен не разрешил вам менять его планы — доступен только просмотр.</div>
+        <div class="card" id="coach-race-form" style="display:none;background:var(--bg-metric);margin-bottom:12px">
+          <div class="card-title" id="coach-race-title">Гонка этого плана</div>
+          <p class="hint" id="coach-race-hint" style="display:none">План появится у спортсмена в списке планов. Активным он станет, только если других планов нет: какой план вести сейчас, решает спортсмен.</p>
+          <div class="form-grid">
+            <div class="form-group full">
+              <label>Название гонки</label>
+              <input type="text" id="cp-race-name" placeholder="Например: Московский полумарафон">
+            </div>
+            <div class="form-group">
+              <label>Дата старта</label>
+              <input type="date" id="cp-race-date">
+            </div>
+            <div class="form-group">
+              <label>Целевое время (чч:мм)</label>
+              <input type="text" id="cp-target-time" placeholder="1:40">
+            </div>
+            <div class="form-group">
+              <label>Старт плана (для расчёта недели)</label>
+              <input type="date" id="cp-plan-start">
+            </div>
+          </div>
+          <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn-primary" id="coach-race-save" onclick="coachSaveRace()">Сохранить</button>
+            <button class="btn-sm" onclick="coachCloseRaceForm()">Закрыть</button>
+            <span id="coach-race-msg" class="save-msg"></span>
+          </div>
+        </div>
+        <div id="coach-import-bar" class="plan-import-bar" style="display:none">
+          <div id="coach-import-summary"></div>
+          <div id="coach-import-warnings" class="hint" style="display:none;margin:6px 0 0"></div>
+          <button class="btn-sm" id="coach-import-close" onclick="coachHideImportBar()" style="display:none;margin-top:10px">Закрыть</button>
+        </div>
+        <div id="coach-save-bar" class="plan-save-bar coach-save-bar" style="display:none">
+          <input type="text" id="coach-change-note" maxlength="200" placeholder="Что изменилось — увидит спортсмен">
+          <button class="btn-primary" id="coach-save-btn" onclick="coachSavePlan()">Сохранить изменения</button>
+          <button class="btn-sm" id="coach-save-new-btn" onclick="coachSaveAsNewPlan()" style="display:none">Создать новый план</button>
+          <button class="btn-sm" onclick="coachToggleEdit()">Отмена</button>
+        </div>
         <div style="overflow-x:auto">
           <table class="plan">
             <thead id="coach-plan-head"></thead>
@@ -720,6 +780,20 @@
     </div>
   </div>
 
+  <!-- История плана (#60): у спортсмена и у тренера -->
+  <div id="plan-history-overlay" class="run-detail-overlay" onclick="closePlanHistory(event)">
+    <div class="run-detail-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px">
+        <div class="card-title" id="plan-history-title" style="margin:0">История плана</div>
+        <button class="btn-sm" onclick="closePlanHistory()" style="color:var(--text-muted);font-size:16px">✕</button>
+      </div>
+      <div id="plan-history-body"></div>
+      <div style="margin-top:16px">
+        <button class="btn-primary" onclick="closePlanHistory()">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Контекст для ИИ (#32) -->
   <div id="llm-preview-overlay" class="run-detail-overlay" onclick="closeLlmPreview(event)">
     <div class="run-detail-card">
@@ -805,6 +879,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=44"></script>
+<script src="app.js?v=45"></script>
 </body>
 </html>

@@ -178,6 +178,22 @@ def test_lazy_migration_is_idempotent(storage_module, fake_bucket):
     assert len(second["plans"]) == 1
 
 
+def test_concurrent_migrations_keep_one_plan(storage_module, fake_bucket):
+    """Тренер и спортсмен разом увидели, что реестра нет (#60): второй перенос
+    не должен затереть первый и перепривязать пробежки к другому id."""
+    _seed_single_plan(storage_module, fake_bucket)
+    storage_module.write_runs(fake_bucket, SUB, [{"id": 1, "dist": 10}])
+    first = storage_module.migrate_single_plan(fake_bucket, SUB)
+    second = storage_module.migrate_single_plan(fake_bucket, SUB)   # опоздавший запрос
+
+    assert second == first and len(first["plans"]) == 1
+    plan_id = first["plans"][0]["id"]
+    assert storage_module.read_plans_index(fake_bucket, SUB) == first
+    assert [r["plan_id"] for r in storage_module.read_runs(fake_bucket, SUB)] == [plan_id]
+    assert not any("/plans/" in n and plan_id not in n and n.endswith("plan.json")
+                   for n in fake_bucket._store), "у проигравшего переноса не должно быть недель"
+
+
 def test_lazy_migration_noop_for_fresh_user(storage_module, fake_bucket):
     """Новый пользователь без плана и профиля → пустой реестр, ничего не создаётся."""
     index = storage_module.read_plans_index(fake_bucket, "u-fresh")
@@ -333,7 +349,9 @@ def test_coach_writes_do_not_clobber_another_instances_change(storage_module, fa
 def test_coach_can_access_only_the_athlete_who_chose_them(storage_module, fake_bucket):
     storage_module.resolve_user(fake_bucket, ADMIN_TOKEN)
     _coach_and_athlete(storage_module, fake_bucket)
-    can = storage_module.coach_can_access
+
+    def can(bucket, coach, athlete):
+        return storage_module.coach_access(bucket, coach, athlete) is not None
 
     assert not can(fake_bucket, "c1", "u1")               # ещё не выбрал
     storage_module.set_user_coach(fake_bucket, "u1", "c1")
@@ -352,7 +370,7 @@ def test_rejecting_either_side_closes_access(storage_module, fake_bucket, who):
     _coach_and_athlete(storage_module, fake_bucket)
     storage_module.set_user_coach(fake_bucket, "u1", "c1")
     storage_module.set_user_status(fake_bucket, who, "rejected", "admin-sub")
-    assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
+    assert storage_module.coach_access(fake_bucket, "c1", "u1") is None
 
 
 def test_stale_instance_does_not_bring_a_dropped_coach_back(storage_module, fake_bucket):
@@ -373,7 +391,7 @@ def test_stale_instance_does_not_bring_a_dropped_coach_back(storage_module, fake
 
     stored = json.loads(fake_bucket.blob("users/registry.json").download_as_text())
     assert stored["users"]["u1"]["coach_sub"] is None
-    assert not storage_module.coach_can_access(fake_bucket, "c1", "u1")
+    assert storage_module.coach_access(fake_bucket, "c1", "u1") is None
 
 
 def test_list_athletes_of(storage_module, fake_bucket):
@@ -382,4 +400,101 @@ def test_list_athletes_of(storage_module, fake_bucket):
     assert storage_module.list_athletes_of(fake_bucket, "c1") == []
 
     storage_module.set_user_coach(fake_bucket, "u1", "c1")
-    assert storage_module.list_athletes_of(fake_bucket, "c1") == [{"sub": "u1", "name": "Runner"}]
+    assert storage_module.list_athletes_of(fake_bucket, "c1") == [
+        {"sub": "u1", "name": "Runner", "can_edit": True}]
+
+
+# ── Тренер (#60): разрешение править планы ───────────────────────────────────
+
+def test_switch_state_is_read_past_the_instance_cache(storage_module, fake_bucket):
+    """Переключатель поменяли на соседнем инстансе: карточка «Мой тренер»
+    показывает то, что стоит на самом деле, а не прогретый кэш."""
+    import json
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert storage_module.my_coach(fake_bucket, "u1")[1] is True             # кэш прогрет
+
+    _approved(storage_module, fake_bucket, {"sub": "c2", "email": "c2@example.com", "name": "C2"})
+    storage_module.set_coach_flag(fake_bucket, "c2", True, "admin-sub")
+    blob = fake_bucket.blob("users/registry.json")
+    remote = json.loads(blob.download_as_text())
+    remote["users"]["u1"].update(coach_sub="c2", coach_plan_edit=False)
+    blob.upload_from_string(json.dumps(remote))                              # «соседний инстанс»
+    storage_module._registry_cache["ts"] = __import__("time").time()
+
+    # тренер и переключатель — из одного свежего снимка, а не вперемешку с кэшем
+    coach, can_edit = storage_module.my_coach(fake_bucket, "u1", fresh=True)
+    assert (coach["sub"], can_edit) == ("c2", False)
+
+
+def test_plan_editing_is_allowed_by_default(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert storage_module.coach_access(fake_bucket, "c1", "u1") == "edit"
+    assert storage_module.my_coach(fake_bucket, "u1")[1] is True
+    # у записей, заведённых до #60, поля нет — это тоже «разрешено»
+    assert "coach_plan_edit" not in storage_module.read_registry(fake_bucket)["users"]["u1"]
+
+
+def test_athlete_switches_plan_editing_with_an_audit_trail(storage_module, fake_bucket):
+    import json
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+
+    storage_module.set_coach_plan_edit(fake_bucket, "u1", False)
+    assert storage_module.coach_access(fake_bucket, "c1", "u1") == "view"      # смотреть можно
+    assert storage_module.list_athletes_of(fake_bucket, "c1")[0]["can_edit"] is False
+
+    storage_module.set_coach_plan_edit(fake_bucket, "u1", True)
+    assert storage_module.coach_access(fake_bucket, "c1", "u1") == "edit"
+
+    (deny,) = [n for n in _events(fake_bucket) if "u1-coach_plan_edit_deny" in n]
+    assert json.loads(fake_bucket.blob(deny).download_as_text())["details"] == {"coach_sub": "c1"}
+    assert any("u1-coach_plan_edit_allow" in n for n in _events(fake_bucket))
+
+
+def test_switching_to_the_same_value_writes_nothing(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    before = dict(fake_bucket._store)
+    storage_module.set_coach_plan_edit(fake_bucket, "u1", True)          # и так включено
+    assert fake_bucket._store == before
+
+
+@pytest.mark.parametrize("setup", ["no_coach", "revoked", "unknown"])
+def test_switch_needs_a_current_coach(storage_module, fake_bucket, setup):
+    _coach_and_athlete(storage_module, fake_bucket)
+    sub = "ghost" if setup == "unknown" else "u1"
+    if setup == "revoked":
+        storage_module.set_user_coach(fake_bucket, "u1", "c1")
+        storage_module.set_coach_flag(fake_bucket, "c1", False, "admin-sub")
+    with pytest.raises(storage_module.CoachLinkError, match="no_coach"):
+        storage_module.set_coach_plan_edit(fake_bucket, sub, False)
+
+
+def test_permission_does_not_carry_over_to_another_coach(storage_module, fake_bucket):
+    _coach_and_athlete(storage_module, fake_bucket)
+    _approved(storage_module, fake_bucket, {"sub": "c2", "email": "c2@example.com", "name": "C2"})
+    storage_module.set_coach_flag(fake_bucket, "c2", True, "admin-sub")
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_coach_plan_edit(fake_bucket, "u1", False)
+
+    storage_module.set_user_coach(fake_bucket, "u1", "c2")
+    assert storage_module.coach_access(fake_bucket, "c2", "u1") == "edit"
+    # и возвращение к прежнему тренеру — тоже новая связь
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    assert storage_module.coach_access(fake_bucket, "c1", "u1") == "edit"
+
+
+def test_coach_access_levels(storage_module, fake_bucket):
+    storage_module.resolve_user(fake_bucket, ADMIN_TOKEN)
+    _coach_and_athlete(storage_module, fake_bucket)
+    access = storage_module.coach_access
+    assert access(fake_bucket, "c1", "u1") is None                       # ещё не выбрал
+    storage_module.set_user_coach(fake_bucket, "u1", "c1")
+    storage_module.set_coach_plan_edit(fake_bucket, "u1", False)
+    # выключенная правка не открывает и не закрывает ничего лишнего
+    for coach, athlete in (("u1", "c1"), ("admin-sub", "u1"), ("c1", "ghost"),
+                           ("ghost", "u1"), ("c1", "c1")):
+        assert access(fake_bucket, coach, athlete) is None, (coach, athlete)
+    assert access(fake_bucket, "c1", "u1") == "view"

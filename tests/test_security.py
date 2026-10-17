@@ -194,28 +194,29 @@ def test_plan_weeks_of_a_wrong_shape_are_rejected_and_nothing_is_written(
     assert _plan_objects(fake_bucket) == before
 
 
-def test_plan_week_keeps_only_the_known_fields(api, patched_api, fake_bucket):
+def test_plan_week_keeps_only_the_known_fields(api, patched_api, storage_module, fake_bucket):
     plan_id = _plan(patched_api, fake_bucket)
     week = {**WEEK, "html": XSS, "days": [1, 2], "constructor": {"x": 1}}
     assert _status(_post(api, "/plan", {"weeks": [week]})) == 201
-    assert patched_api.read_plan_weeks(fake_bucket, "u1", plan_id) == [WEEK]
+    assert storage_module.read_plan_weeks(fake_bucket, "u1", plan_id) == [WEEK]
 
 
-def test_sparse_and_old_weeks_pass_without_gaining_fields(api, patched_api, fake_bucket):
+def test_sparse_and_old_weeks_pass_without_gaining_fields(api, patched_api, storage_module,
+                                                         fake_bucket):
     """План до #23 хранится без вт и чт, а фронтенд шлёт его назад как есть:
     проверка не должна ни отвергать такую неделю, ни дописывать ей поля."""
     plan_id = _plan(patched_api, fake_bucket)
     weeks = [{"w": 1, "sun": "10 км"}, {"w": "2", "mon": None, "wed": 8}, {}]
     assert _status(_post(api, f"/plans/{plan_id}/weeks", {"weeks": weeks})) == 201
-    assert patched_api.read_plan_weeks(fake_bucket, "u1", plan_id) == [
+    assert storage_module.read_plan_weeks(fake_bucket, "u1", plan_id) == [
         {"w": 1, "sun": "10 км"}, {"w": 2, "mon": "", "wed": "8"}, {}]
 
 
-def test_a_plan_can_still_be_emptied(api, patched_api, fake_bucket):
+def test_a_plan_can_still_be_emptied(api, patched_api, storage_module, fake_bucket):
     plan_id = _plan(patched_api, fake_bucket)
     assert _status(_post(api, "/plan", {"weeks": [WEEK]})) == 201
     assert _status(_post(api, "/plan", {"weeks": []})) == 201
-    assert patched_api.read_plan_weeks(fake_bucket, "u1", plan_id) == []
+    assert storage_module.read_plan_weeks(fake_bucket, "u1", plan_id) == []
 
 
 @pytest.mark.parametrize("sent,stored", [

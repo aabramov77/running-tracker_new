@@ -44,6 +44,9 @@ def p_races(sub):              return f"{upfx(sub)}races.json"
 def p_plans_index(sub):        return f"{upfx(sub)}plans/index.json"
 def p_plan_manifest(sub, pid): return f"{upfx(sub)}plans/{pid}/manifest.json"
 def p_plan_ver(sub, pid, v):   return f"{upfx(sub)}plans/{pid}/v{v}/plan.json"
+# Правка карточки гонки (#60): событие с прежними и новыми значениями
+def p_plan_meta_prefix(sub, pid):     return f"{upfx(sub)}plans/{pid}/meta/"
+def p_plan_meta_event(sub, pid, eid): return f"{p_plan_meta_prefix(sub, pid)}{eid}.json"
 # Одиночный план до #25 — только для ленивой миграции
 def p_singleplan_manifest(sub): return f"{upfx(sub)}plan/manifest.json"
 def p_singleplan_ver(sub, v):   return f"{upfx(sub)}plan/v{v}/plan.json"
@@ -872,7 +875,10 @@ def read_plan_weeks(bucket, sub, plan_id):
     return read_plan_state(bucket, sub, plan_id)["weeks"]
 
 
-def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api"):
+def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api",
+                       author=None):
+    """author — {role, sub}: кто правил план (#60). created_by — почта для
+    аудита, author — для истории, которую видят спортсмен и тренер."""
     object_path = p_plan_ver(sub, plan_id, version)
     now = datetime.utcnow().isoformat() + "Z"
 
@@ -885,6 +891,8 @@ def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, crea
         "supersedes_version": version - 1 if version > 1 else None,
         "weeks": weeks,
     }
+    if author:
+        payload["author"] = author
     payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
     checksum = hashlib.sha256(payload_str.encode()).hexdigest()
 
@@ -902,6 +910,8 @@ def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, crea
         "change_reason": payload["change_reason"],
         "checksum": checksum,
     }
+    if author:
+        manifest["author"] = author
     bucket.blob(p_plan_manifest(sub, plan_id)).upload_from_string(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         content_type="application/json"
@@ -914,7 +924,7 @@ class PlanStale(Exception):
 
 
 def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="api",
-                    base_version=None):
+                    base_version=None, author=None):
     """Пишет следующую версию недель плана.
 
     base_version — версия, поверх которой сделана правка (0 — недель ещё не
@@ -930,7 +940,66 @@ def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="a
     if base_version is not None and base_version != current:
         raise PlanStale("plan_stale")
     return write_plan_version(bucket, sub, plan_id, current + 1, weeks,
-                              change_reason, created_by)
+                              change_reason, created_by, author=author)
+
+
+# ── История версий плана (#60) ────────────────────────────────────────────────
+# План теперь правят трое: спортсмен, тренер и ИИ-тренер. История отвечает,
+# кто, когда и почему, — по объектам версий, которые и так не перезаписываются.
+
+PLAN_AUTHOR_ROLES = ("athlete", "coach", "ai")
+PLAN_HISTORY_LIMIT = 50
+_PLAN_VER_RE = re.compile(r"/v(\d+)/plan\.json$")
+
+
+def plan_author(role, sub):
+    return {"role": role, "sub": sub}
+
+
+def _version_author_role(payload):
+    """Роль автора версии. До #60 автора не писали — выводим из того, что было:
+    перенос одиночного плана, причина правки ИИ-тренера, иначе сам спортсмен."""
+    role = (payload.get("author") or {}).get("role")
+    if role in PLAN_AUTHOR_ROLES:
+        return role
+    if payload.get("created_by") == "auto-migrate":
+        return "migration"
+    if str(payload.get("change_reason") or "").startswith("ИИ-тренер:"):
+        return "ai"
+    return "athlete"
+
+
+def read_plan_history(bucket, sub, plan_id, limit=PLAN_HISTORY_LIMIT):
+    """Версии недель плана от новых к старым: номер, время, причина и автор.
+
+    Автор — роль, sub и имя из реестра. Почта в историю не попадает, как и в
+    карточку тренера: историю видит и вторая сторона пары.
+    """
+    prefix = f"{upfx(sub)}plans/{plan_id}/v"
+    numbers = sorted({int(m.group(1)) for blob in bucket.list_blobs(prefix=prefix)
+                      if (m := _PLAN_VER_RE.search(blob.name))}, reverse=True)
+    page = numbers[:limit]
+    # Нечитаемая версия выпадает из истории, а не роняет её целиком.
+    payloads = _load_json_objects(bucket, [p_plan_ver(sub, plan_id, v) for v in page],
+                                  skip_broken=True)
+    users = read_registry(bucket).get("users", {})
+    versions = []
+    for number, payload in zip(page, payloads):
+        if not isinstance(payload, dict):
+            continue
+        role = _version_author_role(payload)
+        author_sub = (payload.get("author") or {}).get("sub")
+        if author_sub is None and role in ("athlete", "ai"):
+            author_sub = sub              # до #60 план писал только его владелец
+        versions.append({
+            "version": number,
+            "created_at": payload.get("created_at"),
+            "change_reason": payload.get("change_reason") or "",
+            "author_role": role,
+            "author_sub": author_sub,
+            "author_name": (users.get(author_sub) or {}).get("name") or "",
+        })
+    return {"plan_id": plan_id, "versions": versions, "has_more": len(numbers) > len(page)}
 
 
 # ── Plans registry (#25: несколько планов на пользователя) ────────────────────
@@ -1008,11 +1077,15 @@ def _read_plans_index_raw(bucket, sub):
     return data
 
 
-def write_plans_index(bucket, sub, index):
-    bucket.blob(p_plans_index(sub)).upload_from_string(
-        json.dumps(index, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+def _create_plans_index(bucket, sub, index):
+    """Пишет реестр, только если его ещё нет. None — его успел создать другой
+    запрос (if_generation_match=0)."""
+    try:
+        bucket.blob(p_plans_index(sub)).upload_from_string(
+            json.dumps(index, ensure_ascii=False, indent=2),
+            content_type="application/json", if_generation_match=0)
+    except PreconditionFailed:
+        return None
     return index
 
 
@@ -1037,57 +1110,133 @@ def get_active_plan(bucket, sub):
     return find_plan(index, index.get("active_plan_id"))
 
 
-def create_plan(bucket, sub, meta, make_active=True):
-    index = read_plans_index(bucket, sub)
-    plan = {
-        "id": _new_plan_id(),
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "archived": False,
-        **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
-    }
-    index["plans"].append(plan)
-    if make_active or not index.get("active_plan_id"):
-        index["active_plan_id"] = plan["id"]
-    write_plans_index(bucket, sub, index)
-    return plan
+# Реестр планов с #60 пишут двое — спортсмен и его тренер, и «прочитал,
+# поправил, записал» из двух запросов разом теряло бы одну из правок. Запись
+# идёт с предусловием, как у счётчика обращений к LLM: объект с момента
+# чтения меняли — читаем заново и повторяем.
+PLANS_INDEX_WRITE_ATTEMPTS = 8
+_PLAN_META_EVENT_RE = re.compile(r"^\d{8}T\d{12}-[a-z]+-[0-9a-f]{8}$")
+
+
+class PlansIndexBusy(Exception):
+    """Реестр планов не удалось обновить: его всё время меняют параллельно."""
+
+
+def _update_plans_index(bucket, sub, change):
+    """change(index) правит реестр на месте и возвращает результат; None —
+    записывать нечего. При повторе change зовётся заново на свежем реестре."""
+    path = p_plans_index(sub)
+    for _ in range(PLANS_INDEX_WRITE_ATTEMPTS):
+        blob = bucket.get_blob(path)                # вместе с номером поколения
+        if blob is None:
+            read_plans_index(bucket, sub)           # ленивая миграция создаст реестр
+            blob = bucket.get_blob(path)
+        try:
+            index = json.loads(blob.download_as_text())
+            index.setdefault("plans", [])
+            index.setdefault("active_plan_id", None)
+            result = change(index)
+            if result is None:
+                return None
+            bucket.blob(path).upload_from_string(
+                json.dumps(index, ensure_ascii=False, indent=2),
+                content_type="application/json", if_generation_match=blob.generation)
+            return result
+        except (PreconditionFailed, NotFound):
+            continue        # реестр успели изменить — берём свежий
+    raise PlansIndexBusy()
+
+
+def create_plan(bucket, sub, meta, make_active=True, author=None):
+    """Новый план в реестре. make_active=False — активным он станет, только
+    если активного плана нет (так создаёт план тренер, #60)."""
+    def add(index):
+        plan = {
+            "id": _new_plan_id(),
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "archived": False,
+            **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
+        }
+        if author:
+            plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
+        index["plans"].append(plan)
+        if make_active or not index.get("active_plan_id"):
+            index["active_plan_id"] = plan["id"]
+        return plan
+
+    return _update_plans_index(bucket, sub, add)
 
 
 def set_active_plan(bucket, sub, plan_id):
-    index = read_plans_index(bucket, sub)
-    plan = find_plan(index, plan_id)
-    if not plan or plan.get("archived"):
-        return None
-    index["active_plan_id"] = plan_id
-    write_plans_index(bucket, sub, index)
-    return plan
+    def activate(index):
+        plan = find_plan(index, plan_id)
+        if not plan or plan.get("archived"):
+            return None
+        index["active_plan_id"] = plan_id
+        return plan
+
+    return _update_plans_index(bucket, sub, activate)
 
 
-def update_plan_meta(bucket, sub, plan_id, meta):
-    index = read_plans_index(bucket, sub)
-    plan = find_plan(index, plan_id)
-    if not plan:
-        return None
-    for f in PLAN_META_FIELDS:
-        if f in meta:
-            plan[f] = meta.get(f) or ""
-    plan["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    write_plans_index(bucket, sub, index)
+def plan_meta_unchanged(plan, meta):
+    """Правка карточки ничего не меняет: формы шлют все поля разом (#60)."""
+    return all((plan.get(f) or "") == (meta.get(f) or "") for f in PLAN_META_FIELDS if f in meta)
+
+
+def update_plan_meta(bucket, sub, plan_id, meta, author=None):
+    """Правит карточку гонки плана. Реестр перезаписывается, поэтому прежние
+    значения уходят в неизменяемое событие рядом с планом (#60): после правки
+    тренером спортсмен может узнать, что стояло раньше. Правка без изменений
+    ничего не пишет и возвращает план как есть."""
+    before, found = {}, {}
+
+    def edit(index):
+        found.clear()
+        plan = find_plan(index, plan_id)
+        if not plan:
+            return None
+        found["plan"] = plan
+        if plan_meta_unchanged(plan, meta):
+            return None                 # писать нечего — ни реестр, ни событие
+        before.clear()
+        before.update({f: plan.get(f, "") for f in PLAN_META_FIELDS})
+        for f in PLAN_META_FIELDS:
+            if f in meta:
+                plan[f] = meta.get(f) or ""
+        plan["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        if author:
+            plan["updated_by_role"], plan["updated_by_sub"] = author["role"], author["sub"]
+        return plan
+
+    plan = _update_plans_index(bucket, sub, edit)
+    if plan is None:
+        return found.get("plan")        # плана нет — None, без изменений — он сам
+    if plan:
+        # Время в id строго растёт, как у сообщений чата: порядок событий —
+        # порядок правок, даже если часы инстанса грубее двух правок подряд.
+        ids = _message_ids(bucket, p_plan_meta_prefix(sub, plan_id), _PLAN_META_EVENT_RE)
+        event_id, _ = _next_message_id(ids, (author or {}).get("role") or "owner")
+        event = {"plan_id": plan_id, "ts": plan["updated_at"], "author": author,
+                 "before": before, "after": {f: plan.get(f, "") for f in PLAN_META_FIELDS}}
+        bucket.blob(p_plan_meta_event(sub, plan_id, event_id)).upload_from_string(
+            json.dumps(event, ensure_ascii=False, indent=2), content_type="application/json")
     return plan
 
 
 def archive_plan(bucket, sub, plan_id):
     """Логическое удаление: archived=true. Объекты плана не удаляются."""
-    index = read_plans_index(bucket, sub)
-    plan = find_plan(index, plan_id)
-    if not plan:
-        return None
-    plan["archived"] = True
-    plan["archived_at"] = datetime.utcnow().isoformat() + "Z"
-    if index.get("active_plan_id") == plan_id:
-        remaining = active_plans(index)
-        index["active_plan_id"] = remaining[0]["id"] if remaining else None
-    write_plans_index(bucket, sub, index)
-    return plan
+    def archive(index):
+        plan = find_plan(index, plan_id)
+        if not plan:
+            return None
+        plan["archived"] = True
+        plan["archived_at"] = datetime.utcnow().isoformat() + "Z"
+        if index.get("active_plan_id") == plan_id:
+            remaining = active_plans(index)
+            index["active_plan_id"] = remaining[0]["id"] if remaining else None
+        return plan
+
+    return _update_plans_index(bucket, sub, archive)
 
 
 def migrate_single_plan(bucket, sub):
@@ -1106,7 +1255,7 @@ def migrate_single_plan(bucket, sub):
 
     if not old_manifest_blob.exists() and not has_profile:
         # Нечего мигрировать — пустой реестр
-        return write_plans_index(bucket, sub, index)
+        return _create_plans_index(bucket, sub, index) or _read_plans_index_raw(bucket, sub)
 
     plan = {
         "id": _new_plan_id(),
@@ -1116,7 +1265,10 @@ def migrate_single_plan(bucket, sub):
     }
     index["plans"].append(plan)
     index["active_plan_id"] = plan["id"]
-    write_plans_index(bucket, sub, index)
+    if _create_plans_index(bucket, sub, index) is None:
+        # Параллельный запрос (тренер и спортсмен разом, #60) уже перенёс план:
+        # второй перенос с другим id затёр бы первый и перепривязал пробежки.
+        return _read_plans_index_raw(bucket, sub)
 
     # Текущие недели старого плана → v1 нового
     if old_manifest_blob.exists():
@@ -1859,6 +2011,9 @@ def set_user_coach(bucket, sub, coach_sub):
         return rec
 
     rec["coach_sub"] = coach_sub
+    # Разрешение править планы давалось прежнему тренеру. Новому действует
+    # значение по умолчанию (#60).
+    rec.pop("coach_plan_edit", None)
     rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
     write_registry(bucket, registry)
     append_user_event(bucket, sub, "coach_select" if coach_sub else "coach_clear", sub,
@@ -1894,23 +2049,68 @@ def _is_coached_by(athlete, coach_sub):
                 and athlete.get("coach_sub") == coach_sub)
 
 
-def coach_can_access(bucket, coach_sub, athlete_sub):
-    """Единственная проверка права тренера на данные спортсмена.
+def coach_plan_edit_allowed(rec):
+    """Разрешил ли спортсмен своему тренеру править планы (#60). Поля нет —
+    разрешил: по умолчанию переключатель включён."""
+    return (rec or {}).get("coach_plan_edit") is not False
 
-    Реестр читается мимо кэша: спортсмен, снявший тренера, закрывает доступ
-    сразу, а не через REGISTRY_TTL_SEC на соседнем инстансе.
+
+def coach_access(bucket, coach_sub, athlete_sub):
+    """Единственная проверка права тренера на данные спортсмена:
+    None — права нет, "view" — только просмотр, "edit" — и правка планов.
+
+    Реестр читается мимо кэша: спортсмен, снявший тренера или выключивший
+    правку, закрывает доступ сразу, а не через REGISTRY_TTL_SEC на соседнем
+    инстансе.
     """
     users = _fresh_registry(bucket).get("users", {})
-    return (_is_active_coach(users.get(coach_sub))
-            and _is_coached_by(users.get(athlete_sub), coach_sub))
+    athlete = users.get(athlete_sub)
+    if not (_is_active_coach(users.get(coach_sub)) and _is_coached_by(athlete, coach_sub)):
+        return None
+    return "edit" if coach_plan_edit_allowed(athlete) else "view"
+
+
+def set_coach_plan_edit(bucket, sub, allow):
+    """Спортсмен разрешает или запрещает тренеру править планы (#60).
+
+    Разрешение — часть связи с тренером, поэтому без действующего тренера
+    ставить нечего: CoachLinkError("no_coach").
+    """
+    registry = _fresh_registry(bucket)
+    users = registry.get("users", {})
+    rec = users.get(sub)
+    if rec is None or not _is_active_coach(users.get(rec.get("coach_sub"))):
+        raise CoachLinkError("no_coach")
+    allow = bool(allow)
+    if coach_plan_edit_allowed(rec) == allow:
+        return rec
+    rec["coach_plan_edit"] = allow
+    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    write_registry(bucket, registry)
+    append_user_event(bucket, sub, "coach_plan_edit_allow" if allow else "coach_plan_edit_deny",
+                      sub, {"coach_sub": rec["coach_sub"]})
+    return rec
+
+
+def my_coach(bucket, sub, fresh=False):
+    """(карточка действующего тренера или None, можно ли ему править планы) —
+    из одного снимка реестра, чтобы тренер и переключатель не разошлись.
+
+    fresh — мимо кэша инстанса: карточке «Мой тренер» нужно то, что стоит на
+    самом деле; счётчику непрочитанных хватает кэша."""
+    users = (_fresh_registry(bucket) if fresh else read_registry(bucket)).get("users", {})
+    rec = users.get(sub) or {}
+    coach = users.get(rec.get("coach_sub"))
+    return (_coach_card(coach) if _is_active_coach(coach) else None), coach_plan_edit_allowed(rec)
 
 
 def list_athletes_of(bucket, coach_sub):
-    """Спортсмены тренера: [{sub, name}]. None — пользователь не тренер."""
+    """Спортсмены тренера: [{sub, name, can_edit}]. None — пользователь не тренер."""
     users = _fresh_registry(bucket).get("users", {})
     if not _is_active_coach(users.get(coach_sub)):
         return None
-    athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен"}
+    athletes = [{"sub": u["sub"], "name": u.get("name") or u.get("email") or "Спортсмен",
+                 "can_edit": coach_plan_edit_allowed(u)}
                 for u in users.values() if _is_coached_by(u, coach_sub)]
     return sorted(athletes, key=lambda a: a["name"].lower())
 
@@ -1972,10 +2172,16 @@ def _next_message_id(ids, role):
     return f"{now.strftime('%Y%m%dT%H%M%S%f')}-{role}-{secrets_mod.token_hex(4)}", now
 
 
-def _load_json_objects(bucket, paths):
-    """Объект на сообщение — это запрос на сообщение; читаем параллельно."""
+def _load_json_objects(bucket, paths, skip_broken=False):
+    """Объект на сообщение — это запрос на сообщение; читаем параллельно.
+    skip_broken — нечитаемый объект даёт None вместо исключения."""
     def load(path):
-        return json.loads(bucket.blob(path).download_as_text())
+        try:
+            return json.loads(bucket.blob(path).download_as_text())
+        except Exception:
+            if not skip_broken:
+                raise
+            return None
 
     if len(paths) > 1:
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -1987,21 +2193,54 @@ def _chat_ids(bucket, athlete, coach):
     return _message_ids(bucket, p_chat_prefix(athlete, coach), _CHAT_ID_RE)
 
 
-def append_chat_message(bucket, athlete, coach, from_sub, role, text):
-    """Пишет сообщение новым объектом и возвращает его."""
+def append_chat_message(bucket, athlete, coach, from_sub, role, text, extra=None):
+    """Пишет сообщение новым объектом и возвращает его.
+
+    extra — служебные поля сообщения, которое пишет сервер (уведомление о
+    правке плана, #60). Основные поля ими не перекрыть.
+    """
     text = text.strip() if isinstance(text, str) else ""
     if not text:
         raise ChatError("empty_message")
     if len(text) > CHAT_TEXT_MAX:
         raise ChatError("message_too_long")
     msg_id, now = _next_message_id(_chat_ids(bucket, athlete, coach), role)
-    message = {"id": msg_id, "ts": now.isoformat() + "Z",
+    message = {**(extra or {}), "id": msg_id, "ts": now.isoformat() + "Z",
                "from_sub": from_sub, "from_role": role, "text": text}
     bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
         json.dumps(message, ensure_ascii=False, indent=2),
         content_type="application/json"
     )
     return message
+
+
+# Что изменил тренер → начало сообщения спортсмену (#60).
+PLAN_CHANGE_TEXT = {"create": "Тренер создал план",
+                    "weeks": "Тренер изменил план",
+                    "meta": "Тренер изменил карточку гонки плана"}
+
+
+def plan_label(plan):
+    """Название плана так же, как его показывает фронтенд (planLabel)."""
+    return (plan.get("race_name")
+            or (f"Забег {plan['race_date']}" if plan.get("race_date") else "Без названия"))
+
+
+def notify_plan_change(bucket, athlete, coach, change, plan, version=None, comment=""):
+    """Сообщение в чат пары о том, что тренер поменял план спортсмена.
+
+    Обычное сообщение от роли тренера: бейдж непрочитанных у спортсмена уже
+    умеет его показать. kind и plan_id нужны фронтенду, чтобы выделить его
+    и открыть план.
+    """
+    text = f"{PLAN_CHANGE_TEXT[change]} «{plan_label(plan)}»"
+    if comment:
+        text += f": {comment}"
+    extra = {"kind": "plan_change", "change": change, "plan_id": plan["id"]}
+    if version is not None:
+        extra["plan_version"] = version
+    return append_chat_message(bucket, athlete, coach, coach, "coach",
+                               text[:CHAT_TEXT_MAX], extra)
 
 
 def read_chat(bucket, athlete, coach, after=None, before=None, limit=CHAT_PAGE):
@@ -2504,7 +2743,7 @@ def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=No
     try:
         saved = save_plan_weeks(bucket, sub, plan_id, weeks,
                                 f"ИИ-тренер: {proposal['summary']}", applied_by,
-                                base_version=version)
+                                base_version=version, author=plan_author("ai", sub))
     except PlanStale:
         # План переписали между сверкой выше и записью.
         raise AICoachError("proposal_stale")

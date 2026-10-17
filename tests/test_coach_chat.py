@@ -193,3 +193,40 @@ def test_foreign_objects_in_the_thread_folder_are_ignored(storage_module, fake_b
     prefix = storage_module.p_chat_prefix(A, C)
     fake_bucket.blob(prefix + "notes.json").upload_from_string(json.dumps({"text": "мусор"}))
     assert _texts(storage_module.read_chat(fake_bucket, A, C)) == ["настоящее"]
+
+
+# ── уведомление о правке плана тренером (#60) ─────────────────────────────────
+
+PLAN = {"id": "p-1", "race_name": "HM", "race_date": "2026-11-01"}
+
+
+def test_plan_change_is_an_ordinary_message_from_the_coach(storage_module, fake_bucket):
+    msg = storage_module.notify_plan_change(fake_bucket, A, C, "weeks", PLAN, 4,
+                                            "Длительную сократил")
+    assert msg["text"] == "Тренер изменил план «HM»: Длительную сократил"
+    assert (msg["from_role"], msg["from_sub"]) == ("coach", C)
+    assert (msg["kind"], msg["change"], msg["plan_id"], msg["plan_version"]) == \
+           ("plan_change", "weeks", "p-1", 4)
+    (stored,) = storage_module.read_chat(fake_bucket, A, C)["messages"]
+    assert stored == msg
+    assert storage_module.chat_unread(fake_bucket, A, C, "athlete") == 1
+    assert storage_module.chat_unread(fake_bucket, A, C, "coach") == 0
+
+
+@pytest.mark.parametrize("change,plan,text", [
+    ("create", PLAN, "Тренер создал план «HM»"),
+    ("meta", PLAN, "Тренер изменил карточку гонки плана «HM»"),
+    ("weeks", {"id": "p-2", "race_date": "2026-11-01"}, "Тренер изменил план «Забег 2026-11-01»"),
+    ("weeks", {"id": "p-3"}, "Тренер изменил план «Без названия»"),
+])
+def test_plan_change_text_names_the_plan(storage_module, fake_bucket, change, plan, text):
+    msg = storage_module.notify_plan_change(fake_bucket, A, C, change, plan)
+    assert msg["text"] == text and "plan_version" not in msg
+
+
+def test_extra_fields_cannot_forge_the_author(storage_module, fake_bucket):
+    msg = storage_module.append_chat_message(fake_bucket, A, C, C, "coach", "текст",
+                                             {"from_role": "athlete", "from_sub": A,
+                                              "id": "x", "kind": "plan_change"})
+    assert (msg["from_role"], msg["from_sub"], msg["kind"]) == ("coach", C, "plan_change")
+    assert msg["id"] != "x"
