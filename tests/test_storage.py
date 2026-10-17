@@ -524,6 +524,19 @@ def test_plan_meta_edit_keeps_the_previous_values(storage_module, fake_bucket):
     assert storage_module.read_plan_history(fake_bucket, SUB, plan["id"])["versions"] == []
 
 
+def test_unchanged_race_card_writes_nothing(storage_module, fake_bucket):
+    """Форма шлёт все поля: сохранение без правок не двигает updated_at и не
+    пишет событие — ни у спортсмена, ни у тренера."""
+    plan = storage_module.create_plan(fake_bucket, SUB, {"race_name": "HM", "target_time": "1:40"})
+    before = dict(fake_bucket._store)
+    same = storage_module.update_plan_meta(fake_bucket, SUB, plan["id"],
+                                           {"race_name": "HM", "target_time": "1:40", "race_date": ""},
+                                           author=storage_module.plan_author("athlete", SUB))
+    assert same["id"] == plan["id"] and "updated_at" not in same
+    assert fake_bucket._store == before
+    assert storage_module.update_plan_meta(fake_bucket, SUB, "ghost", {"race_name": "X"}) is None
+
+
 def test_plans_index_write_does_not_lose_a_concurrent_change(storage_module, fake_bucket):
     """Тренер создаёт план, пока спортсмен переключает активный: запись по
     устаревшему реестру отклоняется и повторяется поверх свежего."""

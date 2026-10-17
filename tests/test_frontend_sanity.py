@@ -676,7 +676,18 @@ def test_coach_saves_only_real_changes():
 def test_coach_write_failures_do_not_invite_duplicates_or_false_claims():
     js = APP_JS.read_text(encoding="utf-8")
     as_new = _js_section(js, "async function coachSaveAsNewPlan() {", "\n}\n")
-    assert as_new.index("coachStopEdit()") < as_new.index("coachReloadPlans(")
+    assert as_new.index("coachStopEdit()") < as_new.index("coachAfterCreate(")
+    # сбой перечитывания после создания не выдаётся за сбой создания
+    after = _js_section(js, "async function coachAfterCreate(", "\n}\n")
+    assert "План создан" in after and "coachReloadPlans(" in after
+    assert "coachAfterCreate(res)" in _js_section(js, "async function coachSaveRace() {", "\n}\n")
+    revoked = _js_section(js, "function coachEditRevoked() {", "\n}\n")
+    assert "coachDirty()" in revoked, "отказ при сохранении не выбрасывает набранное"
+    save = _js_section(js, "async function coachSavePlan() {", "\n}\n")
+    assert "coach-change-note" in save[:save.index("coachStopEdit()")], "комментарий без правок не стираем"
+    for name in ("async function switchPlan(", "async function archiveCurrentPlan("):
+        assert "throw await apiError(res)" in _js_section(js, name, "\n}\n"), name
+    assert "'my/coach?fresh=1'" in _js_section(js, "async function loadMyCoach(", "\n}\n")
     stale = _js_section(js, "async function coachStale(", "\n}\n")
     assert stale.index("!COACH.base") < stale.index("coachStartEdit()")
     sync = _js_section(js, "function coachSyncCanEdit(", "\n}\n")

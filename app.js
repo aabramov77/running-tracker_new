@@ -317,7 +317,7 @@ async function switchPlan(planId) {
       body: JSON.stringify({ plan_id: planId }),
     });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw await apiError(res);     // в том числе plans_busy (#60)
     cancelPlanEdit();
     COMPLIANCE = null;      // факт прежнего плана к новому не относится
     await loadPlans();
@@ -394,7 +394,7 @@ async function archiveCurrentPlan() {
       method: 'POST', headers: authHeaders(),
     });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw await apiError(res);     // в том числе plans_busy (#60)
     cancelPlanEdit();
     toggleRaceForm(false);
     await loadPlans();
@@ -3003,7 +3003,8 @@ async function loadMyCoach() {
   try {
     const [coachesRes, mineRes] = await Promise.all([
       fetch(API_URL + 'coaches', { headers: authHeaders() }),
-      fetch(API_URL + 'my/coach', { headers: authHeaders() }),
+      // fresh=1: переключатель правки — мимо кэша реестра на сервере (#60)
+      fetch(API_URL + 'my/coach?fresh=1', { headers: authHeaders() }),
     ]);
     if (coachesRes.status === 401 || mineRes.status === 401) { handleAuthError(); return; }
     if (!coachesRes.ok || !mineRes.ok) throw new Error('HTTP ' + (coachesRes.ok ? mineRes.status : coachesRes.status));
@@ -3113,13 +3114,17 @@ async function coachPost(tail, body) {
 }
 
 function coachEditRevoked() {
+  let kept = false;
   if (COACH.athlete) {
     COACH.athlete.can_edit = false;
-    coachStopEdit();
     coachCloseRaceForm();
+    // Как и при сверке разрешения (coachSyncCanEdit): набранное не выбрасываем.
+    kept = COACH.editing && coachDirty();
+    if (!kept) coachStopEdit();
     renderCoachAthlete();
   }
-  return Object.assign(new Error('Спортсмен выключил вам правку своих планов — остался только просмотр.'),
+  return Object.assign(new Error('Спортсмен выключил вам правку своих планов — остался только просмотр.' +
+                                 (kept ? ' Несохранённые правки пока на экране, «Отмена» их уберёт.' : '')),
                        { editRevoked: true });
 }
 
@@ -3247,6 +3252,11 @@ async function coachSavePlan() {
   // Без правок не пишем: пустая версия сделала бы устаревшими открытые
   // правки спортсмена и ИИ, а спортсмен получил бы «Тренер изменил план».
   if (!coachDirty()) {
+    // Комментарий без правок — это сообщение, а не версия плана: не стираем его.
+    if (document.getElementById('coach-change-note').value.trim()) {
+      coachFlash('В неделях ничего не изменилось — комментарий напишите спортсмену в диалоге', false);
+      return;
+    }
     coachStopEdit();
     renderCoachAthlete();
     coachFlash('Изменений нет — сохранять нечего', true);
@@ -3332,6 +3342,19 @@ function coachCreatedText(planId) {
     : '✓ План создан. Сделать его активным может только спортсмен';
 }
 
+// План уже создан: сбой перечитывания — не повод думать, что создать не
+// вышло (иначе повтор дал бы второй такой же план). false — список не обновился.
+async function coachAfterCreate(res) {
+  try {
+    await coachReloadPlans(res.plan.id);
+  } catch (e) {
+    if (!e.accessLost) coachFlash('✓ План создан, но список планов не обновился — откройте спортсмена заново', true);
+    return false;
+  }
+  coachSaved(res.notified, coachCreatedText(res.plan.id));
+  return true;
+}
+
 // Перечитывает список планов спортсмена и открывает selectId.
 async function coachReloadPlans(selectId) {
   const athlete = COACH.athlete;
@@ -3355,9 +3378,7 @@ async function coachSaveRace() {
       const res = await coachPost('plans', body);
       if (COACH.athlete !== athlete) return;
       coachCloseRaceForm();
-      await coachReloadPlans(res.plan.id);
-      coachSaved(res.notified, coachCreatedText(res.plan.id));
-      coachStartEdit();           // у нового плана недель нет — сразу конструктор
+      if (await coachAfterCreate(res)) coachStartEdit();   // недель нет — сразу конструктор
       return;
     }
     const planId = COACH.planId;
@@ -3447,8 +3468,7 @@ async function coachSaveAsNewPlan() {
     // сбое повторное «Создать новый план» дало бы второй такой же план.
     coachStopEdit();
     renderCoachAthlete();
-    await coachReloadPlans(res.plan.id);
-    coachSaved(res.notified, coachCreatedText(res.plan.id));
+    await coachAfterCreate(res);
   } catch (e) {
     coachWriteFailed(e, coachFlash);
   } finally {

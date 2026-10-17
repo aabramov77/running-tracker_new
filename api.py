@@ -35,8 +35,8 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
                      mark_proposal_states, mask_key,
-                     migrate_legacy_to_user, my_coach_plan_edit, notify_plan_change,
-                     parse_coach_reply, parse_fit_file, plan_author,
+                     migrate_legacy_to_user, my_coach, notify_plan_change,
+                     parse_coach_reply, parse_fit_file, plan_author, plan_meta_unchanged,
                      read_advice_usage, read_ai_messages,
                      read_ai_thread, read_athlete_history,
                      read_athlete_profile,
@@ -157,10 +157,9 @@ def h_coaches(c):
 
 
 def h_my_coach_get(c):
-    coach = current_coach(c.bucket, c.sub)
+    coach, can_edit_plans = my_coach(c.bucket, c.sub, fresh=c.request.args.get("fresh") == "1")
     unread = chat_unread(c.bucket, c.sub, coach["sub"], "athlete") if coach else 0
-    return jresp({"coach": coach, "unread": unread,
-                  "can_edit_plans": my_coach_plan_edit(c.bucket, c.sub)}, 200)
+    return jresp({"coach": coach, "unread": unread, "can_edit_plans": can_edit_plans}, 200)
 
 
 def h_my_coach_post(c):
@@ -336,7 +335,7 @@ def h_coach_plan_meta(c):
         return jresp({"error": "plan not found"}, 404)
     # Форма шлёт все поля разом: «Сохранить» без правок — не повод писать
     # событие и сообщать спортсмену об изменении, которого нет.
-    if all((current.get(f) or "") == (v or "") for f, v in meta.items()):
+    if plan_meta_unchanged(current, meta):
         return jresp({"plan": current, "notified": False, "changed": False}, 200)
     plan = update_plan_meta(c.bucket, athlete, c.args[1], meta,
                             author=plan_author("coach", c.sub))

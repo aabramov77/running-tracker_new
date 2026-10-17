@@ -412,22 +412,26 @@ def test_switch_state_is_read_past_the_instance_cache(storage_module, fake_bucke
     import json
     _coach_and_athlete(storage_module, fake_bucket)
     storage_module.set_user_coach(fake_bucket, "u1", "c1")
-    assert storage_module.my_coach_plan_edit(fake_bucket, "u1") is True      # кэш прогрет
+    assert storage_module.my_coach(fake_bucket, "u1")[1] is True             # кэш прогрет
 
+    _approved(storage_module, fake_bucket, {"sub": "c2", "email": "c2@example.com", "name": "C2"})
+    storage_module.set_coach_flag(fake_bucket, "c2", True, "admin-sub")
     blob = fake_bucket.blob("users/registry.json")
     remote = json.loads(blob.download_as_text())
-    remote["users"]["u1"]["coach_plan_edit"] = False
+    remote["users"]["u1"].update(coach_sub="c2", coach_plan_edit=False)
     blob.upload_from_string(json.dumps(remote))                              # «соседний инстанс»
     storage_module._registry_cache["ts"] = __import__("time").time()
 
-    assert storage_module.my_coach_plan_edit(fake_bucket, "u1") is False
+    # тренер и переключатель — из одного свежего снимка, а не вперемешку с кэшем
+    coach, can_edit = storage_module.my_coach(fake_bucket, "u1", fresh=True)
+    assert (coach["sub"], can_edit) == ("c2", False)
 
 
 def test_plan_editing_is_allowed_by_default(storage_module, fake_bucket):
     _coach_and_athlete(storage_module, fake_bucket)
     storage_module.set_user_coach(fake_bucket, "u1", "c1")
     assert storage_module.coach_access(fake_bucket, "c1", "u1") == "edit"
-    assert storage_module.my_coach_plan_edit(fake_bucket, "u1") is True
+    assert storage_module.my_coach(fake_bucket, "u1")[1] is True
     # у записей, заведённых до #60, поля нет — это тоже «разрешено»
     assert "coach_plan_edit" not in storage_module.read_registry(fake_bucket)["users"]["u1"]
 

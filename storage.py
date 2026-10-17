@@ -1178,16 +1178,26 @@ def set_active_plan(bucket, sub, plan_id):
     return _update_plans_index(bucket, sub, activate)
 
 
+def plan_meta_unchanged(plan, meta):
+    """Правка карточки ничего не меняет: формы шлют все поля разом (#60)."""
+    return all((plan.get(f) or "") == (meta.get(f) or "") for f in PLAN_META_FIELDS if f in meta)
+
+
 def update_plan_meta(bucket, sub, plan_id, meta, author=None):
     """Правит карточку гонки плана. Реестр перезаписывается, поэтому прежние
     значения уходят в неизменяемое событие рядом с планом (#60): после правки
-    тренером спортсмен может узнать, что стояло раньше."""
-    before = {}
+    тренером спортсмен может узнать, что стояло раньше. Правка без изменений
+    ничего не пишет и возвращает план как есть."""
+    before, found = {}, {}
 
     def edit(index):
+        found.clear()
         plan = find_plan(index, plan_id)
         if not plan:
             return None
+        found["plan"] = plan
+        if plan_meta_unchanged(plan, meta):
+            return None                 # писать нечего — ни реестр, ни событие
         before.clear()
         before.update({f: plan.get(f, "") for f in PLAN_META_FIELDS})
         for f in PLAN_META_FIELDS:
@@ -1199,6 +1209,8 @@ def update_plan_meta(bucket, sub, plan_id, meta, author=None):
         return plan
 
     plan = _update_plans_index(bucket, sub, edit)
+    if plan is None:
+        return found.get("plan")        # плана нет — None, без изменений — он сам
     if plan:
         # Время в id строго растёт, как у сообщений чата: порядок событий —
         # порядок правок, даже если часы инстанса грубее двух правок подряд.
@@ -2080,11 +2092,16 @@ def set_coach_plan_edit(bucket, sub, allow):
     return rec
 
 
-def my_coach_plan_edit(bucket, sub):
-    """Как стоит переключатель у пользователя — для его карточки «Мой тренер».
-    Реестр мимо кэша: переключатель мог поменяться на соседнем инстансе, и
-    спортсмен увидел бы галочку не там, где она стоит на самом деле."""
-    return coach_plan_edit_allowed(_fresh_registry(bucket).get("users", {}).get(sub))
+def my_coach(bucket, sub, fresh=False):
+    """(карточка действующего тренера или None, можно ли ему править планы) —
+    из одного снимка реестра, чтобы тренер и переключатель не разошлись.
+
+    fresh — мимо кэша инстанса: карточке «Мой тренер» нужно то, что стоит на
+    самом деле; счётчику непрочитанных хватает кэша."""
+    users = (_fresh_registry(bucket) if fresh else read_registry(bucket)).get("users", {})
+    rec = users.get(sub) or {}
+    coach = users.get(rec.get("coach_sub"))
+    return (_coach_card(coach) if _is_active_coach(coach) else None), coach_plan_edit_allowed(rec)
 
 
 def list_athletes_of(bucket, coach_sub):
