@@ -575,10 +575,12 @@ def test_coach_screen_keeps_out_of_own_data():
     section = js[start:js.index("function renderAll()", start)]
     assert "showCoachRunDetail" in section, "секция тренера найдена не целиком"
     assert "localStorage" not in section
-    for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races"):
+    for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races",
+                "dayEdit", "planWeekIdx", "planWeekPlanId"):
         assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"
-    # и чужой план не уходит в свои функции записи (#60)
-    for own_write in ("postPlanWeeks", "savePlanEdits", "rememberPlan", "loadPlan()"):
+    # и чужой план не уходит в свои функции записи (#60) и свой лист дня (#62)
+    for own_write in ("postPlanWeeks", "savePlanEdits", "rememberPlan", "loadPlan()",
+                      "openDaySheet", "saveDayEdit"):
         assert own_write not in section, own_write
 
 
@@ -821,8 +823,16 @@ def test_mobile_plan_views_call_existing_handlers():
     for handler in re.findall(r'onclick="([^"]*)"', section):
         handler = re.sub(r"\$\{[^}]*\}", "", handler)
         called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
-    assert {"planWeekStep", "planWeekToday", "openDaySheet", "openAddSheet", "showTab"} <= called
+    assert {"openAddSheet", "showTab"} <= called
     assert not (called - defined), sorted(called - defined)
+    # неделю спортсмен и тренер рисуют одним planWeekHtml — обработчики по имени (#62)
+    passed = set(re.findall(r"on(?:Step|Today|Day): (?:[^,}']*\? )?'(\w+)'", js))
+    assert passed == {"planWeekStep", "planWeekToday", "openDaySheet",
+                      "coachWeekStep", "coachWeekToday", "coachOpenDay"}
+    assert passed <= defined
+    week = _js_section(js, "function planWeekHtml(", "\n}\n")
+    for name in ("planWeekStep", "planWeekToday", "openDaySheet"):
+        assert name not in week, f"{name} зашит в planWeekHtml"
 
 
 def test_today_screen_does_not_guess_for_an_undated_plan():
@@ -878,3 +888,61 @@ def test_day_edit_writes_a_new_plan_version_and_leaves_staleness_to_the_server()
     assert "PLAN.map(" in body
     assert not re.search(r"(?<![.\w])PLAN\s*(\[[^\]]*\]\s*)*(\.\w+\s*)?=[^=]", body)
     assert "postPlanWeeks(PLAN" not in body
+
+
+# ── Тренер на телефоне (#62) ──────────────────────────────────────────────────
+
+def test_coach_plan_week_list_sits_right_before_the_table():
+    """Тот же соседний селектор, что у спортсмена, прячет на телефоне таблицу
+    плана тренера, пока список недели не пуст."""
+    html = INDEX.read_text(encoding="utf-8")
+    assert re.search(r'<div id="coach-plan-week" class="plan-week"></div>\s*'
+                     r'<div class="plan-table-wrap"[^>]*>\s*<table class="plan">\s*'
+                     r'<thead id="coach-plan-head">', html)
+    body = _js_section(APP_JS.read_text(encoding="utf-8"), "function renderCoachAthlete() {", "\n}\n")
+    for view in ("renderCoachPlanTable()", "renderCoachPlanWeek()"):
+        assert view in body, view
+
+
+def test_coach_day_edit_writes_a_new_version_of_the_athletes_plan():
+    """Правка дня тренером — та же версионная запись, что из его конструктора:
+    недели открытой версии с одной изменённой ячейкой, base_version и
+    комментарий для спортсмена. Без правок версия не пишется."""
+    html = INDEX.read_text(encoding="utf-8")
+    for piece in ('id="coach-day-sheet"', 'onclick="coachSaveDay()"', 'id="coach-day-note"'):
+        assert piece in html, piece
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "async function coachSaveDay() {", "\n}\n")
+    write = body.index("await coachPost(`plans/${coachEnc(edit.planId)}/weeks`")
+    for piece in ("base_version: COACH.base.version", "change_reason: reason"):
+        assert piece in body[write:], piece
+    assert "coach-day-note" in body[:write]
+    assert body.index("text === edit.was.trim()") < write, "без правок не пишем"
+    assert body.index("COACH.editing") < write, "открытый конструктор записал бы план без правки"
+    # на запись уходит копия недель; COACH.weeks остаются версией с сервера
+    assert "COACH.weeks.map(" in body
+    assert not re.search(r"COACH\.weeks\s*(\[[^\]]*\]\s*)*(\.\w+\s*)?=[^=]", body)
+    assert body.index("await coachPost(") < body.index("await selectCoachPlan(")
+
+
+def test_coach_day_edit_handles_a_stale_plan_and_a_revoked_permission():
+    """409 — план перечитан, лист знает, что теперь стоит в дне. 403
+    edit_not_allowed — только просмотр: набранный текст остаётся, сохранить
+    нельзя, дни больше не открываются."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "async function coachSaveDay() {", "\n}\n")
+    assert body.index("e.code === 'plan_stale'") < body.index("coachDayStale(edit)")
+    assert "e.editRevoked" in body and "coachDayReadOnly(e.message)" in body
+    stale = _js_section(js, "async function coachDayStale(", "\n}\n")
+    assert stale.index("await selectCoachPlan(") < stale.index("edit.was = ")
+    assert "COACH_STALE_LOST_TEXT" in stale, "без свежей версии о ней не говорим"
+    read_only = _js_section(js, "function coachDayReadOnly(", "\n}\n")
+    assert "readOnly = true" in read_only and ".disabled = true" in read_only
+    assert "coachDayReadOnly(" in _js_section(js, "function coachSyncCanEdit(", "\n}\n")
+    assert "coachCloseDay()" in _js_section(js, "function closeCoachAthlete() {", "\n}\n")
+    # день открывается, только если план можно править
+    week = _js_section(js, "function renderCoachPlanWeek() {", "\n}\n")
+    assert "coachPlanEditable() ? 'coachOpenDay'" in week
+    assert "coachPlanEditable()" in _js_section(js, "function coachOpenDay(", "\n}\n")
+    assert "onDay ?" in _js_section(js, "function planWeekHtml(", "\n}\n")
+    assert ".pw-day[onclick]" in STYLE.read_text(encoding="utf-8")

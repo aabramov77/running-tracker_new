@@ -718,7 +718,7 @@ table.pb-table td:last-child { text-align: right; }
     margin: 0 -8px; padding: 10px 8px;
     border-bottom: 0.5px solid var(--border); font-size: 14px;
   }
-  .pw-day { cursor: pointer; }
+  .pw-day[onclick] { cursor: pointer; }      /* у тренера без права правки дни не открываются (#62) */
   .pw-day:last-child { border-bottom: none; }
   .pw-day.today {
     background: var(--c-accent-light); color: var(--c-accent-dark);
