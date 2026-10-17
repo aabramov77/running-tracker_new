@@ -3035,7 +3035,9 @@ const COACH = { athletes: [], athlete: null, plans: [], activePlanId: null, plan
                 weeks: [], base: null, compliance: null, runs: [], runScope: 'plan', error: '',
                 // Правка плана (#60): черновик недель, загруженный файл, форма гонки.
                 // draftToken меняется, когда черновик подменяют целиком (см. coachCollect).
-                editing: false, draft: null, draftToken: 0, importInfo: null, raceForm: null };
+                // draftClean — черновик сразу после открытия редактора, для coachDirty.
+                editing: false, draft: null, draftToken: 0, draftClean: null, importInfo: null,
+                raceForm: null };
 let coachChart = null;
 
 function coachUrl(tail) {
@@ -3142,7 +3144,7 @@ function coachCollect() {
 function coachDirty() {
   if (!COACH.editing) return false;
   coachCollect();
-  return !!COACH.importInfo || JSON.stringify(COACH.draft) !== JSON.stringify(COACH.weeks);
+  return !!COACH.importInfo || JSON.stringify(COACH.draft) !== COACH.draftClean;
 }
 
 function coachConfirmDiscard() {
@@ -3155,10 +3157,15 @@ function coachStartEdit() {
   COACH.importInfo = null;
   coachSetDraft(COACH.weeks);
   renderCoachAthlete();
+  // Точка отсчёта — то, что редактор собрал из своих полей: он дописывает
+  // недостающие дни и тип, и сравнение с COACH.weeks видело бы «правку»
+  // в нетронутом плане.
+  coachCollect();
+  COACH.draftClean = JSON.stringify(COACH.draft);
 }
 
 function coachStopEdit() {
-  Object.assign(COACH, { editing: false, draft: null, importInfo: null });
+  Object.assign(COACH, { editing: false, draft: null, draftClean: null, importInfo: null });
   document.getElementById('coach-change-note').value = '';
   coachHideImportBar();
 }
