@@ -577,6 +577,83 @@ def test_coach_screen_keeps_out_of_own_data():
     assert "localStorage" not in section
     for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races"):
         assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"
+    # и чужой план не уходит в свои функции записи (#60)
+    for own_write in ("postPlanWeeks", "savePlanEdits", "rememberPlan", "loadPlan()"):
+        assert own_write not in section, own_write
+
+
+# ── Тренер правит план спортсмена (#60) ──────────────────────────────────────
+
+def _coach_section(js):
+    return _js_section(js, "const COACH = {", "function renderAll()")
+
+
+def test_coach_and_athlete_edit_plans_with_one_constructor():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "planEditRowsHtml(PLAN || []" in _js_section(js, "function renderPlanTable() {", "\n}\n")
+    assert "planEditRowsHtml(COACH.draft" in _js_section(js, "function renderCoachPlanTable() {",
+                                                        "\n}\n")
+    assert "collectPlanEditsFrom(" in _js_section(js, "function collectPlanEdits() {", "\n}\n")
+    assert "collectPlanEditsFrom(body, COACH.draft)" in _js_section(js, "function coachCollect() {",
+                                                                   "\n}\n")
+
+
+def test_coach_generated_handlers_exist():
+    """Кнопки экрана тренера и конструктора рисует app.js — проверка
+    inline-обработчиков из index.html их не видит."""
+    js = APP_JS.read_text(encoding="utf-8")
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    called = set()
+    for handler in re.findall(r'onclick="([^"]*)"', _coach_section(js)):
+        handler = re.sub(r"\$\{[^}]*\}", "", handler)
+        called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
+    assert {"coachStartEdit", "coachNewPlan", "openCoachAthlete"} <= called
+    assert not (called - defined), sorted(called - defined)
+    # конструктор получает обработчики по имени
+    passed = set(re.findall(r"on(?:Delete|Add): '(\w+)'", js))
+    assert {"deletePlanWeek", "addPlanWeek", "coachDeleteWeek", "coachAddWeek"} == passed
+    assert passed <= defined
+
+
+def test_coach_writes_carry_the_version_and_tell_refusals_apart():
+    js = APP_JS.read_text(encoding="utf-8")
+    post = _js_section(js, "async function coachPost(", "\n}\n")
+    for piece in ("'edit_not_allowed'", "coachEditRevoked()", "coachAccessLost()",
+                  "res.status === 409", "code: 'plan_stale'"):
+        assert piece in post, piece
+    save = _js_section(js, "async function coachSavePlan() {", "\n}\n")
+    assert "base_version: COACH.base.version" in save
+    assert save.index("e.code === 'plan_stale'") < save.index("coachStale(")
+    assert "weeks?meta=1" in _js_section(js, "async function selectCoachPlan(", "\n}\n")
+    # после отказа правка недель продолжается поверх свежего плана
+    stale = _js_section(js, "async function coachStale(", "\n}\n")
+    assert stale.index("await selectCoachPlan(") < stale.index("coachStartEdit()")
+
+
+def test_coach_does_not_pick_the_active_plan_or_archive():
+    """Какой план вести и что убрать в архив, решает спортсмен: экран тренера
+    таких запросов не шлёт."""
+    section = _coach_section(APP_JS.read_text(encoding="utf-8"))
+    assert "plans/active" not in section and "/archive" not in section
+
+
+def test_unsaved_coach_draft_is_not_dropped_silently():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("function coachPickPlan(", "function leaveCoachAthlete(",
+                 "function coachOpenRaceForm(", "function coachImportFile(",
+                 "function coachToggleEdit("):
+        assert "coachConfirmDiscard()" in _js_section(js, name, "\n}\n"), name
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'onclick="leaveCoachAthlete()"' in html and 'onchange="coachPickPlan(this.value)"' in html
+
+
+def test_plan_history_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="plan-history-overlay"' in html and 'id="plan-history-body"' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "showPlanHistory(coachUrl(" in _js_section(js, "function coachShowHistory() {", "\n}\n")
+    # «Вы» определяется по sub автора, а не по роли: история общая для обеих сторон
+    assert "v.author_sub === userSub" in _js_section(js, "function planHistoryAuthor(", "\n}\n")
 
 
 # ── Мобильная раскладка (#48) ─────────────────────────────────────────────────

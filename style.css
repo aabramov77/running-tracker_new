@@ -199,6 +199,25 @@ table.plan tr:hover td { background: var(--bg-metric); }
 }
 .plan-import-bar .hint { color: inherit; opacity: .85; margin: 0; }
 
+/* Правка плана тренером (#60) */
+.coach-plan-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.coach-save-bar { flex-wrap: wrap; }
+.coach-save-bar input {
+  flex: 1 1 260px; min-width: 0;
+  padding: 7px 10px;
+  border: 0.5px solid var(--border); border-radius: 8px;
+  font-family: inherit; font-size: 13px;
+  background: var(--bg); color: var(--text);
+}
+
+/* История плана (#60) */
+.history-row { padding: 8px 0; border-bottom: 0.5px solid var(--border); }
+.history-row:last-of-type { border-bottom: none; }
+.history-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.history-who { font-size: 13px; font-weight: 500; }
+.history-coach { color: var(--c-blue); }
+.history-why { font-size: 13px; color: var(--text-muted); margin-top: 2px; overflow-wrap: anywhere; }
+
 /* Переключатель области данных: текущий план / все (#25) */
 .scope-btn.active {
   background: var(--c-accent);
