@@ -760,3 +760,32 @@ table.pb-table td:last-child { text-align: right; }
   #tab-add.active { display: flex; flex-direction: column; }
   #calc-card { order: 2; }
 }
+
+/* ── Нагрузка по темпу и пульсу (#66) ── */
+.load-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.load-sub { font-size: 12px; color: var(--text-muted); flex: 1 1 260px; }
+.load-axis { display: flex; gap: 6px; flex-wrap: wrap; }
+.load-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--text-muted); margin: 6px 0 10px; }
+.load-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.load-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.load-tile { background: var(--bg-metric); border-radius: 8px; padding: 10px 12px; }
+.load-tile-label { font-size: 11px; color: var(--text-muted); }
+.load-tile-value { font-family: 'DM Mono', monospace; font-size: 20px; font-weight: 500; margin: 2px 0 4px; }
+.load-tile-note { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.load-pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 6px; white-space: nowrap; }
+.load-pill.ok, .load-pill.cost-usual { background: var(--c-accent-light); color: var(--c-accent-dark); }
+.load-pill.low, .load-pill.cost-lower { background: var(--c-blue-light); color: var(--c-blue); }
+.load-pill.high, .load-pill.cost-higher { background: var(--c-warn-light); color: var(--c-warn); }
+.load-pill.spike { background: var(--c-danger-light); color: var(--c-danger); }
+.load-pill.none { background: var(--bg-metric); color: var(--text-muted); }
+.load-note { margin: 8px 0 0; font-size: 12px; }
+.load-how { margin-top: 10px; font-size: 12px; color: var(--text-muted); line-height: 1.6; }
+.load-how summary { cursor: pointer; }
+.load-today .load-verdict .load-pill { font-size: 13px; padding: 2px 10px; }
+.load-cost-line { font-size: 12px; margin-top: 6px; }
+.load-cost-line.higher { color: var(--c-warn); }
+.load-cost-line.lower { color: var(--c-blue); }
+.load-more { font-size: 12px; color: var(--c-accent); margin-top: 6px; }
+.coach-load-badges { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: 6px; vertical-align: 1px; }
+.coach-load-badges .load-pill { font-size: 11px; font-weight: 400; }
+.field-hint { margin: 4px 0 0; font-size: 12px; }

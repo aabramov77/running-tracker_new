@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
 <title>Running Tracker — Полумарафон 09.08.2026</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=30">
+<link rel="stylesheet" href="style.css?v=31">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
@@ -321,6 +321,8 @@
       </div>
     </div>
     <div class="card"><div class="card-title">Недельный объём: план и факт (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
+    <!-- Нагрузка по темпу и пульсу (#66): содержимое рисует renderLoadCard -->
+    <div class="card" style="margin-top:12px"><div class="card-title">Недельная нагрузка</div><div id="load-body"></div></div>
     <div class="card" style="margin-top:12px"><div class="card-title">Динамика темпа (мин/км)</div><div class="chart-wrap"><canvas id="paceChart"></canvas></div></div>
   </div>
 
@@ -410,6 +412,12 @@
         <div class="form-group">
           <label>МПК (VO₂max)</label>
           <input type="number" id="pr-vo2max" step="0.1" min="20" max="90" placeholder="52">
+        </div>
+        <!-- #66: темп, который держится около часа; без него — оценка по «Стартам» -->
+        <div class="form-group">
+          <label>Пороговый темп, мин/км</label>
+          <input type="text" id="pr-threshold-pace" inputmode="numeric" maxlength="5" placeholder="4:35">
+          <p class="hint field-hint" id="pr-threshold-hint"></p>
         </div>
       </div>
 
@@ -715,6 +723,12 @@
         <div class="chart-wrap"><canvas id="coachWeekChart"></canvas></div>
       </div>
 
+      <!-- Нагрузка спортсмена (#66): без порога и параметров профиля -->
+      <div class="card" id="coach-load-card" style="margin-bottom:12px">
+        <div class="card-title">Недельная нагрузка</div>
+        <div id="coach-load-body"></div>
+      </div>
+
       <div class="card">
         <div class="week-header">
           <div class="card-title" style="margin:0">Журнал</div>
@@ -905,6 +919,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=46"></script>
+<script src="app.js?v=47"></script>
 </body>
 </html>
