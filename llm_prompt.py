@@ -21,6 +21,28 @@ def plural_ru(number, one, few, many):
         return few
     return many
 
+def _pace(seconds):
+    seconds = int(round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _threshold_line(derived):
+    """Пороговый темп (#66): заданный или оценка по забегу. Время забега
+    собрано заново из секунд (load.estimate_threshold), а не взято строкой
+    из «Стартов» — текст из поля времени в промпт не попадает."""
+    pace = derived.get("threshold_pace_sec")
+    if not pace:
+        return None
+    if derived.get("threshold_source") == "manual":
+        return f"Пороговый темп: {_pace(pace)}/км (задан спортсменом)"
+    basis = derived.get("threshold_basis") or {}
+    km = DIST_LABEL_KM.get(basis.get("dist_label"))
+    if not km:
+        return f"Пороговый темп: ~{_pace(pace)}/км (оценка)"
+    return (f"Пороговый темп: ~{_pace(pace)}/км (оценка по забегу {km:g} км за "
+            f"{basis.get('time')} от {basis.get('date')})")
+
+
 def format_profile_block(profile, derived, bests):
     """Строки профиля для промпта. Незаполненное не печатаем — шум для модели."""
     lines = []
@@ -60,6 +82,9 @@ def format_profile_block(profile, derived, bests):
             for z in derived.get("hr_zones") or []))
     if profile.get("vo2max"):
         lines.append(f"МПК: {profile['vo2max']:g}")
+    threshold = _threshold_line(derived)
+    if threshold:
+        lines.append(threshold)
 
     # Ноль здесь — валидное и сильное значение (новичок без стажа), поэтому
     # сравниваем с None, а не проверяем на истинность.
@@ -137,6 +162,100 @@ def format_compliance_block(compliance):
     return lines
 
 
+LOAD_BAND_RU = {"low": "ниже обычного", "ok": "в норме", "high": "выше обычного",
+                "spike": "резкий рост"}
+COST_BAND_RU = {"usual": "как обычно",
+                "higher": "дороже обычного: пульс выше при той же работе",
+                "lower": "дешевле обычного: пульс ниже при той же работе"}
+INTERNAL_METHOD_RU = {"banister": "по пульсу, метод Банистера",
+                      "edwards": "по пульсу, по зонам (метод Эдвардса)"}
+LOAD_BLOCK_WEEKS = 5            # 4 полные недели и текущая
+
+
+def _ratio(ratio):
+    return f"×{ratio:.2f}".replace(".", ",")
+
+
+def _load_axis(name, axis, rated, first=True):
+    if axis["unknown"]:
+        count = axis["unknown"]
+        text = (f"{name} не меньше {axis['load']} ({count} "
+                f"{plural_ru(count, 'пробежка', 'пробежки', 'пробежек')} без данных не в счёт)")
+    else:
+        text = f"{name} {axis['load']}"
+    if rated:
+        if axis.get("ratio") is not None:
+            base = " к средней за 4 недели" if first else ""
+            text += f" — {_ratio(axis['ratio'])}{base} ({LOAD_BAND_RU[axis['band']]})"
+        else:
+            text += " — сравнивать не с чем: мало истории"
+    return text
+
+
+def _intensity(period):
+    split = [period.get(key) for key in ("easy", "moderate", "hard")]
+    total = sum(m or 0 for m in split)
+    if None in split or total <= 0:
+        return ""
+    easy, moderate, hard = (round(m / total * 100) for m in split)
+    return f"лёгкая {easy}% / средняя {moderate}% / высокая {hard}%"
+
+
+def _load_period(head, period, rated):
+    present = [(key, name) for key, name in (("ext", "rTSS"), ("int", "TRIMP")) if period.get(key)]
+    axes = [_load_axis(name, period[key], rated, first=i == 0)
+            for i, (key, name) in enumerate(present)]
+    line = f"{head}: " + (", ".join(axes) if axes else "нет данных")
+    split = _intensity(period)
+    return line + (f"; {split}" if split else "")
+
+
+def format_load_block(load):
+    """Нагрузка по двум осям (#66): 4 полные недели, текущая и 7 дней.
+
+    Только числа и подписи, которые собрал сервер. Модели прямо сказано, где
+    число — нижняя граница, где сравнивать не с чем и какой оси нет: иначе
+    она сделает вывод о недогрузе, которого нет.
+    """
+    if load is None:
+        return ["Нагрузка: посчитать не удалось."]
+    internal = (load.get("internal") or {}).get("method")
+    external = (load.get("external") or {}).get("method")
+    if not internal and not external:
+        return ["Нагрузка: не считается — нет ни пульсовых зон, ни порогового темпа."]
+
+    scales = []
+    if external:
+        scales.append("rTSS — по темпу с поправкой на уклон, 100 = час на пороге")
+    if internal:
+        scales.append("TRIMP — " + INTERNAL_METHOD_RU.get(internal, "по пульсу"))
+    lines = [f"Нагрузка (все пробежки; {'; '.join(scales)}):"]
+    if not external:
+        lines.append("  (нагрузки по темпу нет: не задан пороговый темп и нет результатов забегов)")
+    if not internal:
+        lines.append("  (нагрузки по пульсу нет: нет пульсовых зон)")
+
+    for week in (load.get("weeks") or [])[-LOAD_BLOCK_WEEKS:]:
+        partial = week.get("partial")
+        head = f"  - {week['start']}–{week['end']}" + (" (текущая, неполная)" if partial else "")
+        lines.append(_load_period(head, week, rated=not partial))
+
+    rolling = load.get("rolling")
+    if rolling:
+        lines.append(_load_period(f"  - последние 7 дней ({rolling['start']}–{rolling['end']})",
+                                  rolling, rated=True))
+        cost = rolling.get("cost")
+        if cost:
+            sign = "+" if cost["dev_pct"] > 0 else ""
+            lines.append(f"  - цена работы на лёгких и длительных за 7 дней: {sign}{cost['dev_pct']}% "
+                         f"к обычной ({COST_BAND_RU[cost['band']]})")
+    if load.get("pending"):
+        pending = load["pending"]
+        lines.append(f"  (по {pending} {plural_ru(pending, 'пробежке', 'пробежкам', 'пробежкам')} "
+                     "с файлом часов пока оценка по средним — посекундные данные ещё считаются)")
+    return lines
+
+
 def format_context_for_llm(ctx):
     """Превращает контекст в текстовый user prompt."""
     lines = []
@@ -172,6 +291,11 @@ def format_context_for_llm(ctx):
     if compliance_block:
         lines.append("")
         lines.extend(compliance_block)
+
+    # Контекст, собранный до #66, ключа load не знает — блока тогда нет вовсе.
+    if "load" in ctx:
+        lines.append("")
+        lines.extend(format_load_block(ctx["load"]))
 
     lines.append("")
     lines.append("Последние 14 тренировок (сначала свежие):")
@@ -234,11 +358,12 @@ COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер, �
 - Интенсивность: лёгкий и аэробный бег, темп, порог, интервалы, длительная.
 - Смотри на общую картину: тренд, восстановление, соответствие цели. Не делай выводов по одному показателю.
 - Главный приоритет — долгосрочный прогресс без травм. Риск травмы, накопленное утомление или неадекватная нагрузка важнее амбиций по результату.
+- Нагрузку читай по двум осям: rTSS по темпу — сколько работы сделано, TRIMP по пульсу — чего она стоила организму. Отношение к обычной оценивай с учётом фазы плана: на разгрузке и подводке «ниже обычного» — норма, а резкий рост — повод для осторожности, а не для похвалы. Выросла цена работы (пульс выше при той же работе) — спроси про сон, жару, болезнь и самочувствие, а не добавляй нагрузку.
 
 Правила:
 - Опирайся на данные спортсмена ниже. Если для вывода данных не хватает — скажи об этом прямо и спроси недостающее, не додумывай цифры. То, что в данных уже есть, не переспрашивай.
 - Учитывай профиль: возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
-- По тренировкам у тебя есть темп, средний и максимальный пульс, каденс, набор высоты, круги, дрейф пульса, время в пульсовых зонах, ощущения и заметки спортсмена. Других показателей часов (HRV, training effect, время восстановления, готовность к тренировке и т. п.) в данных нет: учитывай их, только если спортсмен сам о них написал, и не требуй их.
+- По тренировкам у тебя есть темп, средний и максимальный пульс, каденс, набор высоты, круги, дрейф пульса, время в пульсовых зонах, недельная нагрузка по темпу (rTSS) и по пульсу (TRIMP) с отношением к обычной, цена работы, ощущения и заметки спортсмена. Других показателей часов (HRV, training effect, время восстановления, готовность к тренировке и т. п.) в данных нет: учитывай их, только если спортсмен сам о них написал, и не требуй их.
 - Жару, ветер, недосып и стресс учитывай по заметкам спортсмена, рельеф — по набору высоты. Если тренировка вышла заметно хуже ожидаемого без видимой причины — спроси о них.
 - Ты не врач и диагнозов не ставишь. При жалобах на боль или тревожных симптомах советуй снизить нагрузку и обратиться к специалисту.
 - Отвечай на заданный вопрос и конкретно: темпы, пульс, километры, дни недели. Без шаблонных фраз. Не пересказывай данные, которые спортсмен и так видит.

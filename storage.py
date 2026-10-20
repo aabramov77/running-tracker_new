@@ -7,6 +7,7 @@ config → domain/llm_prompt → storage → api → main.
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import secrets as secrets_mod
@@ -26,7 +27,11 @@ from compliance import (DEFAULT as UNDATED, anchor_source,
                         current_week_idx, plan_compliance,
                         planned_for_date, to_date, week_days, week_window)
 from domain import (DIST_LABEL_KM, FEEL_LABELS, HR_ZONE_BOUNDS, PLAN_DAYS,
-                    TYPE_LABELS, personal_bests)
+                    TYPE_LABELS, parse_time_to_sec, personal_bests)
+from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
+                  ZONE_GAP_CAP_SEC, axes, clean_hist_entry, format_duration,
+                  hr_histogram, run_hist_entry, threshold_for, weekly_load,
+                  zone_seconds)
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_plan_window,
                         format_run_focus)
@@ -59,6 +64,9 @@ def p_athlete_ver(sub, v):     return f"{upfx(sub)}athlete/v{v}/profile.json"
 def p_run_manifest(sub, rid):  return f"{upfx(sub)}runs/{rid}/manifest.json"
 def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
 def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
+# Кэш гистограмм пульса и скорости по пробежкам (#66): производное от FIT,
+# не бизнес-запись — восстанавливается целиком, поэтому перезаписывается.
+def p_run_hist(sub):           return f"{upfx(sub)}derived/run_hist.json"
 def p_tmp_fit(sub, token):     return f"tmp/{sub}/{token}/activity.fit"
 def p_tmp_details(sub, token): return f"tmp/{sub}/{token}/details.json"
 # Чат с тренером (#44) — в namespace спортсмена, ветка на каждого тренера
@@ -311,7 +319,8 @@ ATHLETE_NUM_FIELDS = {
 }
 
 # Поля, по которым имеет смысл смотреть динамику между версиями
-ATHLETE_HISTORY_FIELDS = ("weight_kg", "hr_max", "hr_threshold", "hr_rest", "vo2max")
+ATHLETE_HISTORY_FIELDS = ("weight_kg", "hr_max", "hr_threshold", "hr_rest", "vo2max",
+                          "threshold_pace_sec")
 
 # Ручные пульсовые зоны (#56) — нижние границы Z1…Z5 в уд/мин. Коридор тот же,
 # что у пульса покоя снизу и максимального сверху.
@@ -323,7 +332,31 @@ def empty_athlete_profile():
     profile.update({f: None for f in ATHLETE_NUM_FIELDS})
     profile["available_days"] = []
     profile["hr_zones_custom"] = None       # None — зоны считаются от HRmax
+    profile["threshold_pace_sec"] = None    # None — порог оценивается по «Стартам» (#66)
     return profile
+
+
+def clean_threshold_pace(value):
+    """Пороговый темп (#66): «м:сс» или секунды на км → (секунды или None, ошибка).
+
+    Поле скалярное, поэтому список, объект и bool — ошибка, а не «пусто».
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, None
+    if isinstance(value, str):
+        seconds = parse_time_to_sec(value.strip())
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value
+    else:
+        seconds = None
+    if seconds is None:
+        return None, "ожидается темп «м:сс»"
+    # Сравнение отсекает и NaN, и бесконечность, и целое больше float —
+    # math.isfinite на последнем падает.
+    if not THRESHOLD_PACE_MIN <= seconds <= THRESHOLD_PACE_MAX:
+        return None, (f"допустимо от {format_duration(THRESHOLD_PACE_MIN)} "
+                      f"до {format_duration(THRESHOLD_PACE_MAX)} на км")
+    return int(round(seconds)), None
 
 
 def clean_hr_zone_starts(value, hr_max):
@@ -428,6 +461,10 @@ def clean_athlete_profile(raw):
     if zones_error:
         errors["hr_zones_custom"] = zones_error
 
+    profile["threshold_pace_sec"], pace_error = clean_threshold_pace(raw.get("threshold_pace_sec"))
+    if pace_error:
+        errors["threshold_pace_sec"] = pace_error
+
     return profile, errors
 
 
@@ -491,6 +528,22 @@ def compute_athlete_derived(profile, today=None):
     if manual:
         derived["hr_zones"] = manual
         derived["hr_zones_source"] = "manual"
+    return derived
+
+
+def athlete_derived(profile, races, today=None):
+    """compute_athlete_derived плюс пороговый темп (#66): ручной или оценка по
+    «Стартам». Отдельной функцией, потому что порогу нужны забеги.
+
+    threshold_pace_auto — оценка всегда, даже при ручном пороге: её профиль
+    показывает подсказкой рядом с полем.
+    """
+    derived = compute_athlete_derived(profile, today)
+    threshold = threshold_for(profile, races, today or datetime.utcnow().date())
+    derived.update(threshold_pace_sec=threshold["threshold_pace_sec"],
+                   threshold_source=threshold["threshold_source"],
+                   threshold_basis=threshold["threshold_basis"],
+                   threshold_pace_auto=threshold["threshold_auto"])
     return derived
 
 
@@ -833,6 +886,14 @@ def attach_fit_details_to_run(bucket, sub, run, fit_token):
 
     tmp_fit.delete()
     tmp_details.delete()
+
+    # Гистограммы для нагрузки (#66) — сразу, чтобы новую пробежку не пришлось
+    # дочитывать. Не вышло — пробежка всё равно сохраняется, а гистограммы
+    # дочитает build_training_load.
+    try:
+        remember_run_hist(bucket, sub, run_id, final_details)
+    except Exception:
+        logging.exception("run_hist: гистограммы пробежки %s не записаны", run_id)
 
     run["details_available"] = True
     run["max_hr"] = summary.get("max_hr")
@@ -1595,37 +1656,154 @@ def half_paces(details):
     return pace(laps[:mid]), pace(laps[mid:])
 
 
-# Сэмпл «держит» время до следующего. Разрыв длиннее — часы стояли на паузе,
-# и записывать его в зону последнего пульса нельзя.
-ZONE_GAP_CAP_SEC = 30
-
-
 def hr_zone_minutes(details, zones):
     """Время в пульсовых зонах по сэмплам: [{name, min, pct}]. [] — считать не из чего.
 
     zones — как в compute_athlete_derived: [{name, from, to}] по возрастанию.
     Пульс ниже первой зоны идёт отдельной строкой, а не теряется: иначе
-    проценты остальных зон завышены.
+    проценты остальных зон завышены. Гистограмма та же, по которой считается
+    нагрузка (#66), поэтому время в зонах у разбора и у нагрузки не расходится.
     """
-    samples = details.get("samples") or {}
-    times, hrs = samples.get("t_offset_sec") or [], samples.get("hr") or []
-    if not zones or len(times) < 2 or len(times) != len(hrs):
+    if not zones:
         return []
-
-    seconds = [0.0] * (len(zones) + 1)          # [0] — ниже первой зоны
-    for i in range(len(times) - 1):
-        span = min(times[i + 1] - times[i], ZONE_GAP_CAP_SEC)
-        if not hrs[i] or span <= 0:
-            continue
-        slot = sum(1 for zone in zones if hrs[i] >= zone["from"])
-        seconds[slot] += span
-
+    seconds = zone_seconds(hr_histogram(details), zones)     # [0] — ниже первой зоны
     total = sum(seconds)
     if total <= 0:
         return []
     names = ["ниже " + zones[0]["name"].split()[0]] + [zone["name"] for zone in zones]
     return [{"name": name, "min": round(sec / 60, 1), "pct": round(sec / total * 100)}
             for name, sec in zip(names, seconds) if sec > 0]
+
+
+# ── Нагрузка (#66) ────────────────────────────────────────────────────────────
+#
+# Нагрузка считается по сэмплам FIT, а они лежат по объекту на пробежку —
+# читать их на каждый запрос нельзя. Поэтому из них один раз строятся
+# гистограммы (load.run_hist_entry) и копятся в derived/run_hist.json.
+# Гистограммы не зависят от профиля, так что кэш не устаревает при правке зон,
+# пульса покоя или порога. Это производное от неизменяемого FIT, а не
+# бизнес-запись: объект восстанавливается целиком и поэтому перезаписывается,
+# с предусловием по поколению, как счётчик обращений к ИИ.
+
+RUN_HIST_FILL_LIMIT = 60        # столько details.json дочитывается за вызов
+RUN_HIST_WRITE_ATTEMPTS = 3
+
+
+def _load_run_hist(bucket, sub):
+    """(записи кэша как в JSON, поколение объекта). Нет, битый или другой
+    версии — пустой: пересоберётся. 0 — объекта нет."""
+    blob = bucket.get_blob(p_run_hist(sub))
+    if blob is None:
+        return {}, 0
+    try:
+        data = json.loads(blob.download_as_text())
+    except (ValueError, NotFound):
+        return {}, blob.generation
+    runs = data.get("runs") if isinstance(data, dict) and data.get("v") == HIST_VERSION else None
+    return (dict(runs) if isinstance(runs, dict) else {}), blob.generation
+
+
+def _write_run_hist(bucket, sub, entries, generation):
+    """Запись с предусловием. False — объект успели изменить: не ошибка,
+    недостающее дочитается в следующий раз."""
+    try:
+        bucket.blob(p_run_hist(sub)).upload_from_string(
+            json.dumps({"v": HIST_VERSION, "runs": entries},
+                       ensure_ascii=False, separators=(",", ":")),
+            content_type="application/json", if_generation_match=generation)
+        return True
+    except (PreconditionFailed, NotFound):
+        return False
+
+
+def remember_run_hist(bucket, sub, run_id, details):
+    """Гистограммы пробежки — в кэш (при прикреплении FIT)."""
+    entry = run_hist_entry(details)
+    for _ in range(RUN_HIST_WRITE_ATTEMPTS):
+        entries, generation = _load_run_hist(bucket, sub)
+        entries[str(run_id)] = entry
+        if _write_run_hist(bucket, sub, entries, generation):
+            return True
+    return False
+
+
+def build_training_load(bucket, sub, runs=None, profile=None, races=None,
+                        fill_limit=RUN_HIST_FILL_LIMIT, today=None):
+    """Нагрузка по двум осям: недели, 7 дней, цена работы, нагрузка пробежек.
+
+    Читающая операция, кроме кэша гистограмм: его она дозаполняет не больше
+    чем fill_limit пробежками за вызов, остаток — в pending. fill_limit=0 —
+    только чтение: так считает тренер, в данные спортсмена он не пишет.
+    Детали читаются только у пробежек из runs.json самого sub и только через
+    read_run_details, поэтому правило #53 о legacy-деталях здесь не обходится.
+    runs, profile и races можно передать уже прочитанными.
+    """
+    today = today or datetime.utcnow().date()
+    runs = read_runs(bucket, sub) if runs is None else runs
+    runs = [r for r in runs if isinstance(r, dict) and not r.get("deleted", False)]
+    profile = read_athlete_profile(bucket, sub)[0] if profile is None else profile
+    races = read_races(bucket, sub) if races is None else races
+
+    entries, generation = _load_run_hist(bucket, sub)
+    missing = [r for r in runs if r.get("details_available") and str(r.get("id")) not in entries]
+    added = False
+    for run in missing[:max(0, fill_limit)]:
+        try:
+            details = read_run_details(bucket, sub, run["id"])
+        except Exception:
+            logging.exception("run_hist: детали пробежки %s не прочитаны", run.get("id"))
+            continue
+        entries[str(run["id"])] = run_hist_entry(details)    # нет деталей — пустые гистограммы
+        added = True
+    if added:
+        _write_run_hist(bucket, sub, entries, generation)
+    pending = sum(1 for r in runs if r.get("details_available") and str(r.get("id")) not in entries)
+
+    ctx = axes(profile, compute_athlete_derived(profile), races, today)
+    result = weekly_load(runs, {rid: clean_hist_entry(e) for rid, e in entries.items()},
+                         ctx, today)
+    threshold = ctx["threshold_pace_sec"]
+    result["internal"] = {"method": ctx["internal"], "zones_source": ctx["zones_source"]}
+    result["external"] = {"method": "rtss" if threshold else None,
+                          "threshold_pace": format_duration(threshold) if threshold else None,
+                          "threshold_source": ctx["threshold_source"],
+                          "threshold_basis": ctx["threshold_basis"]}
+    result["pending"] = pending
+    return result
+
+
+def _pick(source, keys):
+    return {key: source.get(key) for key in keys} if isinstance(source, dict) else None
+
+
+_LOAD_AXIS_KEYS = ("load", "unknown", "chronic", "ratio", "band")
+_LOAD_COST_KEYS = ("dev_pct", "band")
+_LOAD_SPLIT_KEYS = ("easy", "moderate", "hard")
+_LOAD_RUN_KEYS = ("int", "int_est", "ext", "ext_est")
+
+
+def coach_load_view(load):
+    """Нагрузка спортсмена для тренера — собрана заново по белому списку.
+
+    Порога, его основания (забег из «Стартов») и источника зон здесь нет по
+    построению: поле, добавленное в нагрузку позже, само тренеру не уйдёт.
+    Названия методов остаются — без них непонятна шкала.
+    """
+    def period(row, extra):
+        return {**_pick(row, extra), **_pick(row, _LOAD_SPLIT_KEYS),
+                "int": _pick(row.get("int"), _LOAD_AXIS_KEYS),
+                "ext": _pick(row.get("ext"), _LOAD_AXIS_KEYS),
+                "cost": _pick(row.get("cost"), _LOAD_COST_KEYS)}
+
+    return {
+        "internal": {"method": (load.get("internal") or {}).get("method")},
+        "external": {"method": (load.get("external") or {}).get("method")},
+        "pending": load.get("pending", 0),
+        "today": load.get("today"),
+        "weeks": [period(w, ("start", "end", "partial", "runs")) for w in load.get("weeks", [])],
+        "rolling": period(load.get("rolling") or {}, ("start", "end", "runs")),
+        "runs": {str(rid): _pick(r, _LOAD_RUN_KEYS) for rid, r in (load.get("runs") or {}).items()},
+    }
 
 
 def build_llm_context(bucket, sub):
@@ -1660,6 +1838,15 @@ def build_llm_context(bucket, sub):
     active_races = [r for r in all_races if not r.get("deleted", False)]
     active_races.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_races = active_races[:3]
+
+    # Нагрузка (#66) — по всем пробежкам, а не по плану: устаёт организм, а не
+    # план. Сбой расчёта не роняет ход ИИ: модель получит «нагрузка недоступна».
+    try:
+        training_load = build_training_load(bucket, sub, runs=all_runs,
+                                            profile=profile, races=all_races)
+    except Exception:
+        logging.exception("load: нагрузка для контекста ИИ не посчитана")
+        training_load = None
 
     # Plan (недели активного плана)
     plan = None
@@ -1710,8 +1897,9 @@ def build_llm_context(bucket, sub):
     return {
         "compliance": compliance,
         "profile": profile,
-        "profile_derived": compute_athlete_derived(profile),
+        "profile_derived": athlete_derived(profile, all_races),
         "profile_version": profile_version,
+        "load": training_load,
         "personal_bests": personal_bests(all_races),
         "last_runs": last_runs,
         "last_races": last_races,

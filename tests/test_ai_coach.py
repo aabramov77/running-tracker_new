@@ -823,7 +823,9 @@ def test_instructions_carry_the_coaching_rules_with_either_format(storage_module
         text = llm_prompt.coach_chat_instructions(with_proposals)
         for rule in ("по одному показателю", "не компенсируй дополнительной нагрузкой",
                      "не переспрашивай", "только если спортсмен сам о них написал",
-                     "**Вывод**", "Раздел, которому нечего сказать, пропускай"):
+                     "**Вывод**", "Раздел, которому нечего сказать, пропускай",
+                     "недельная нагрузка по темпу (rTSS) и по пульсу (TRIMP)",
+                     "с учётом фазы плана", "Выросла цена работы"):
             assert rule in text, rule
 
 
@@ -1159,3 +1161,98 @@ def test_next_turn_sees_the_applied_plan_and_the_earlier_proposal(api, llm, patc
     assert "): 6 км легко" in call["system"]                     # окно плана уже с правкой
     remembered = json.loads(call["history"][1]["content"])
     assert remembered["proposal"]["changes"][0]["text"] == "6 км легко"
+
+
+# ── нагрузка в контексте (#66) ────────────────────────────────────────────────
+
+def _axis(load, unknown=0, ratio=None, band=None, chronic=None):
+    return {"load": load, "unknown": unknown, "chronic": chronic, "ratio": ratio, "band": band}
+
+
+def _load_week(start, ext, int_, partial=False):
+    return {"start": start, "end": start[:-2] + "07", "partial": partial, "runs": 3,
+            "ext": ext, "int": int_, "easy": 160, "moderate": 24, "hard": 16, "cost": None}
+
+
+def _load(**over):
+    weeks = [_load_week(f"2026-09-{d:02d}", _axis(200 + d, ratio=1.0, band="ok"),
+                        _axis(300 + d, ratio=1.0, band="ok")) for d in (1, 8, 15, 22, 29)]
+    weeks.append(_load_week("2026-10-06", _axis(90), _axis(140), partial=True))
+    load = {"internal": {"method": "banister"}, "external": {"method": "rtss"}, "pending": 0,
+            "weeks": weeks,
+            "rolling": {"start": "2026-10-01", "end": "2026-10-07", "runs": 4,
+                        "ext": _axis(330, ratio=1.31, band="high", chronic=252),
+                        "int": _axis(520, ratio=1.62, band="spike", chronic=321),
+                        "easy": 160, "moderate": 24, "hard": 16,
+                        "cost": {"dev_pct": 14, "band": "higher"}}}
+    load.update(over)
+    return load
+
+
+def test_load_block_reaches_the_prompt_and_the_preview(api, patched_api, fake_bucket):
+    assert api(FakeRequest("POST", "/profile", {"profile": {
+        "hr_max": 190, "hr_rest": 50, "sex": "m", "threshold_pace_sec": "4:40"}}))[1] == 201
+    api(FakeRequest("POST", "/", json_body={"id": 5, "date": "2026-08-16", "dist": 10.0,
+                                            "time": "50:00", "pace": "5:00", "hr": 145}))
+    prompt = _json(api(FakeRequest("GET", "/advise/preview")))["prompt"]
+    assert ("Нагрузка (все пробежки; rTSS — по темпу с поправкой на уклон, 100 = час на "
+            "пороге; TRIMP — по пульсу, метод Банистера):") in prompt
+    assert prompt.index("Нагрузка (все пробежки") < prompt.index("Последние 14 тренировок")
+    assert "Пороговый темп: 4:40/км (задан спортсменом)" in prompt
+
+
+def test_load_block_states_lower_bounds_and_missing_history(storage_module):
+    import llm_prompt
+    weeks = _load()["weeks"]
+    weeks[-2] = _load_week("2026-09-29", _axis(210, unknown=1), _axis(320, unknown=2))
+    lines = llm_prompt.format_load_block(_load(weeks=weeks, pending=3))
+    text = "\n".join(lines)
+    assert ("  - 2026-09-29–2026-09-07: rTSS не меньше 210 (1 пробежка без данных не в счёт) — "
+            "сравнивать не с чем: мало истории, TRIMP не меньше 320 (2 пробежки без данных "
+            "не в счёт) — сравнивать не с чем: мало истории; лёгкая 80% / средняя 12% / "
+            "высокая 8%") in lines
+    assert "  - 2026-10-06–2026-10-07 (текущая, неполная): rTSS 90, TRIMP 140" in text
+    assert ("  - последние 7 дней (2026-10-01–2026-10-07): rTSS 330 — ×1,31 к средней за 4 "
+            "недели (выше обычного), TRIMP 520 — ×1,62 (резкий рост)") in text
+    assert ("  - цена работы на лёгких и длительных за 7 дней: +14% к обычной "
+            "(дороже обычного: пульс выше при той же работе)") in lines
+    assert "по 3 пробежкам с файлом часов пока оценка по средним" in text
+    assert "2026-09-01" not in text                          # только 4 полные недели и текущая
+    assert len(lines) <= 10
+
+
+def test_load_block_says_which_axis_is_unavailable(storage_module):
+    import llm_prompt
+    no_pace = _load(external={"method": None})
+    for week in no_pace["weeks"] + [no_pace["rolling"]]:
+        week["ext"], week["cost"] = None, None
+    text = "\n".join(llm_prompt.format_load_block(no_pace))
+    assert "нагрузки по темпу нет: не задан пороговый темп и нет результатов забегов" in text
+    assert "rTSS" not in text and "цена работы" not in text
+
+    nothing = _load(external={"method": None}, internal={"method": None})
+    assert llm_prompt.format_load_block(nothing) == [
+        "Нагрузка: не считается — нет ни пульсовых зон, ни порогового темпа."]
+    assert llm_prompt.format_load_block(None) == ["Нагрузка: посчитать не удалось."]
+
+
+def test_old_context_without_load_prints_no_block(storage_module, fake_bucket):
+    import llm_prompt
+    ctx = storage_module.build_llm_context(fake_bucket, SUB)
+    assert "Нагрузка:" in llm_prompt.format_context_for_llm(ctx)
+    del ctx["load"]
+    assert "Нагрузка" not in llm_prompt.format_context_for_llm(ctx)
+
+
+def test_profile_block_prints_the_threshold_with_its_source(storage_module):
+    import llm_prompt
+    manual = {"threshold_pace_sec": 275, "threshold_source": "manual"}
+    assert "Пороговый темп: 4:35/км (задан спортсменом)" in \
+        llm_prompt.format_profile_block({}, manual, [])
+    estimate = {"threshold_pace_sec": 277, "threshold_source": "races",
+                "threshold_basis": {"dist_label": "10km", "time": "45:30",
+                                    "date": "2026-09-14", "stale": False}}
+    assert ("Пороговый темп: ~4:37/км (оценка по забегу 10 км за 45:30 от 2026-09-14)"
+            in llm_prompt.format_profile_block({}, estimate, []))
+    assert not [line for line in llm_prompt.format_profile_block({}, {}, [])
+                if line.startswith("Пороговый темп")]

@@ -5,6 +5,8 @@ FakeBucket) implements only the blob/list_blobs/copy_blob surface we use.
 """
 import json
 import time
+from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -739,3 +741,191 @@ def test_read_run_details_lazy_legacy_fallback(storage_module, fake_bucket):
     # now materialized in the user namespace
     assert fake_bucket.blob(f"users/{SUB}/runs/999/v1/details.json").exists()
     assert fake_bucket.blob(f"users/{SUB}/runs/999/manifest.json").exists()
+
+
+# ── Нагрузка (#66): кэш гистограмм и пороговый темп ──────────────────────────
+
+LOAD_TODAY = date(2026, 10, 20)
+HIST_PATH = f"users/{SUB}/derived/run_hist.json"
+FIT_SAMPLES = {"samples": {"t_offset_sec": [0, 300, 600], "hr": [130, 130, 130],
+                           "pace_sec_per_km": [300, 300, 300]}}
+
+
+def _fit_runs(storage_module, bucket, count):
+    runs = [{"id": i, "date": "2026-10-13", "dist": 5.0, "type": "easy", "time": "25:00",
+             "pace": "5:00", "hr": 130, "details_available": True, "deleted": False}
+            for i in range(1, count + 1)]
+    storage_module.write_runs(bucket, SUB, runs)
+    return runs
+
+
+@pytest.fixture
+def details_reads(storage_module, monkeypatch):
+    """Подменяет чтение деталей: считает обращения и отдаёт DETAILS[run_id]
+    или FIT_SAMPLES."""
+    reads, answers = [], {}
+
+    def fake(bucket, sub, run_id):
+        reads.append(run_id)
+        return answers.get(run_id, FIT_SAMPLES)
+
+    monkeypatch.setattr(storage_module, "read_run_details", fake)
+    fake.reads, fake.answers = reads, answers
+    return fake
+
+
+def _load(storage_module, bucket, **kw):
+    return storage_module.build_training_load(bucket, SUB, today=LOAD_TODAY, **kw)
+
+
+def _cached(bucket):
+    raw = bucket._store.get(HIST_PATH)
+    return json.loads(raw) if raw else None
+
+
+def test_attaching_fit_puts_its_histograms_into_the_cache(storage_module, fake_bucket):
+    """Синтетический FIT: пульс 120→170, подъём 60→75 м при 3,3 м/с."""
+    fit = (Path(__file__).parent / "fixtures" / "synthetic_activity.fit").read_bytes()
+    parsed = storage_module.parse_fit_file(fit)
+    token = storage_module.write_parsed_fit_to_tmp(fake_bucket, SUB, fit, parsed)
+    storage_module.attach_fit_details_to_run(fake_bucket, SUB, {"id": 123}, token)
+
+    entry = _cached(fake_bucket)["runs"]["123"]
+    pulses = [int(k) for k in entry["hr"]]
+    assert pulses and min(pulses) >= 120 and max(pulses) <= 170
+    speeds = [int(k) for k in entry["spd"]]
+    assert speeds and min(speeds) > 330            # подъём — дороже ровного 3,3 м/с
+
+
+def test_cache_failure_does_not_lose_the_run(storage_module, fake_bucket, monkeypatch):
+    def broken(*args):
+        raise RuntimeError("кэш недоступен")
+
+    monkeypatch.setattr(storage_module, "remember_run_hist", broken)
+    token = storage_module.write_parsed_fit_to_tmp(fake_bucket, SUB, b"FIT", FIT_SAMPLES)
+    run = {"id": 5}
+    storage_module.attach_fit_details_to_run(fake_bucket, SUB, run, token)
+    assert run["details_available"] is True
+    assert fake_bucket.blob(f"users/{SUB}/runs/5/v1/details.json").exists()
+    assert _cached(fake_bucket) is None
+
+
+def test_old_runs_are_filled_at_most_60_per_call(storage_module, fake_bucket, details_reads):
+    _fit_runs(storage_module, fake_bucket, 100)
+    assert _load(storage_module, fake_bucket)["pending"] == 40
+    assert len(details_reads.reads) == 60 and len(_cached(fake_bucket)["runs"]) == 60
+
+    assert _load(storage_module, fake_bucket)["pending"] == 0
+    assert len(details_reads.reads) == 100 and len(set(details_reads.reads)) == 100
+
+
+def test_cached_runs_are_not_read_again(storage_module, fake_bucket, details_reads):
+    _fit_runs(storage_module, fake_bucket, 3)
+    first = _load(storage_module, fake_bucket)
+    assert _load(storage_module, fake_bucket) == first
+    assert sorted(details_reads.reads) == [1, 2, 3]
+
+
+def test_fit_without_pulse_or_speed_is_cached_empty(storage_module, fake_bucket, details_reads):
+    _fit_runs(storage_module, fake_bucket, 2)
+    details_reads.answers.update({1: {"laps": []}, 2: None})       # 2 — деталей нет вовсе
+    result = _load(storage_module, fake_bucket, profile={"hr_max": 190})
+    assert _cached(fake_bucket)["runs"] == {"1": {"hr": {}, "spd": {}}, "2": {"hr": {}, "spd": {}}}
+    assert result["runs"]["1"]["int_est"] is True                # оценка по среднему пульсу
+    _load(storage_module, fake_bucket)
+    assert sorted(details_reads.reads) == [1, 2]
+
+
+def test_new_algorithm_version_rebuilds_the_cache(storage_module, fake_bucket, details_reads):
+    _fit_runs(storage_module, fake_bucket, 1)
+    fake_bucket.blob(HIST_PATH).upload_from_string(
+        json.dumps({"v": 0, "runs": {"1": {"hr": {"999": 1}, "spd": {}}}}))
+    _load(storage_module, fake_bucket)
+    assert details_reads.reads == [1]
+    assert _cached(fake_bucket)["v"] == storage_module.HIST_VERSION
+    assert _cached(fake_bucket)["runs"]["1"]["hr"] == {"130": 60}
+
+
+def test_lost_generation_race_is_not_an_error(storage_module, fake_bucket, monkeypatch):
+    """Пока мы читали детали, кэш записал соседний инстанс: наша запись не
+    проходит и его не затирает, а ответ всё равно посчитан по сэмплам."""
+    _fit_runs(storage_module, fake_bucket, 1)
+    other = json.dumps({"v": storage_module.HIST_VERSION, "runs": {"77": {"hr": {}, "spd": {}}}})
+
+    def racing(bucket, sub, run_id):
+        fake_bucket.blob(HIST_PATH).upload_from_string(other)
+        return FIT_SAMPLES
+
+    monkeypatch.setattr(storage_module, "read_run_details", racing)
+    result = _load(storage_module, fake_bucket, profile={"hr_max": 190})
+    assert result["runs"]["1"]["int"] is not None and result["runs"]["1"]["int_est"] is False
+    assert fake_bucket._store[HIST_PATH].decode() == other
+
+
+def test_read_only_call_writes_nothing(storage_module, fake_bucket, details_reads):
+    _fit_runs(storage_module, fake_bucket, 3)
+    before = dict(fake_bucket._store)
+    result = _load(storage_module, fake_bucket, fill_limit=0, profile={"hr_max": 190})
+    assert fake_bucket._store == before and details_reads.reads == []
+    assert result["pending"] == 3
+    assert all(r["int_est"] for r in result["runs"].values())       # пока по средним
+
+
+def test_profile_changes_move_the_numbers_without_a_rebuild(storage_module, fake_bucket,
+                                                            details_reads):
+    _fit_runs(storage_module, fake_bucket, 1)
+    edwards = _load(storage_module, fake_bucket, profile={"hr_max": 190})
+    banister = _load(storage_module, fake_bucket,
+                     profile={"hr_max": 190, "hr_rest": 50, "sex": "m"})
+    assert edwards["internal"]["method"] == "edwards" and banister["internal"]["method"] == "banister"
+    assert edwards["runs"]["1"]["int"] != banister["runs"]["1"]["int"]
+
+    slow = _load(storage_module, fake_bucket, profile={"threshold_pace_sec": 300})
+    fast = _load(storage_module, fake_bucket, profile={"threshold_pace_sec": 240})
+    assert slow["runs"]["1"]["ext"] > fast["runs"]["1"]["ext"]
+    assert details_reads.reads == [1]
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("4:35", 275), (" 4:35 ", 275), (275, 275), (275.4, 275), ("2:30", 150), ("10:00", 600),
+    ("", None), ("  ", None), (None, None),
+])
+def test_threshold_pace_is_cleaned(storage_module, value, expected):
+    assert storage_module.clean_threshold_pace(value) == (expected, None)
+
+
+def test_threshold_pace_is_versioned_with_the_profile(storage_module, fake_bucket):
+    for pace in ("4:35", "4:20"):
+        profile, errors = storage_module.clean_athlete_profile({"threshold_pace_sec": pace})
+        assert not errors
+        storage_module.write_athlete_version(fake_bucket, SUB, profile)
+    history = storage_module.read_athlete_history(fake_bucket, SUB)
+    assert [v["threshold_pace_sec"] for v in history] == [275, 260]
+    assert fake_bucket.blob(f"users/{SUB}/athlete/v1/profile.json").exists()
+
+
+def test_old_profile_version_reads_without_a_threshold(storage_module, fake_bucket):
+    fake_bucket.blob(f"users/{SUB}/athlete/v1/profile.json").upload_from_string(
+        json.dumps({"version": 1, "profile": {"hr_max": 185}}))
+    fake_bucket.blob(f"users/{SUB}/athlete/manifest.json").upload_from_string(
+        json.dumps({"current_version": 1,
+                    "gcs_object_path": f"users/{SUB}/athlete/v1/profile.json"}))
+    profile, _, _ = storage_module.read_athlete_profile(fake_bucket, SUB)
+    assert profile["threshold_pace_sec"] is None
+    races = [{"dist_label": "10km", "time": "45:30", "date": "2026-09-14"}]
+    derived = storage_module.athlete_derived(profile, races, LOAD_TODAY)
+    assert (derived["threshold_pace_sec"], derived["threshold_source"]) == (277, "races")
+
+
+def test_coach_view_hides_the_threshold_and_the_zone_source(storage_module, fake_bucket,
+                                                            details_reads):
+    _fit_runs(storage_module, fake_bucket, 2)
+    races = [{"dist_label": "10km", "time": "45:30", "date": "2026-09-14"}]
+    load = _load(storage_module, fake_bucket, profile={"hr_max": 190}, races=races)
+    assert load["external"]["threshold_basis"]["time"] == "45:30"
+    view = storage_module.coach_load_view(load)
+    text = json.dumps(view, ensure_ascii=False)
+    for secret in ("threshold", "basis", "zones_source", "45:30", "4:37"):
+        assert secret not in text, secret
+    assert view["weeks"] == [{k: w[k] for k in view["weeks"][0]} for w in load["weeks"]]
+    assert view["runs"] == load["runs"] and view["rolling"]["int"] == load["rolling"]["int"]
