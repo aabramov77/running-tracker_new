@@ -269,7 +269,7 @@ config/llm/…                      конфиг и ключ LLM (только �
 
 ```bash
 git checkout Dev        # весь код пишется в Dev, в main — только merge
-python -m pytest -q     # 1151 тест
+python -m pytest -q     # 1152 теста
 ```
 
 - Тесты не требуют доступа к GCP: `tests/conftest.py` подменяет

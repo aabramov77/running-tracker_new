@@ -1750,7 +1750,10 @@ def build_training_load(bucket, sub, runs=None, profile=None, races=None,
     for run in missing[:max(0, fill_limit)]:
         try:
             details = read_run_details(bucket, sub, run["id"])
+        except ValueError:
+            details = None          # битый JSON сам не починится — перечитывать незачем
         except Exception:
+            # Сбой сети или хранилища — пробежка остаётся в pending до следующего раза.
             logging.exception("run_hist: детали пробежки %s не прочитаны", run.get("id"))
             continue
         entries[str(run["id"])] = run_hist_entry(details)    # нет деталей — пустые гистограммы

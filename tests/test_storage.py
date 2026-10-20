@@ -929,3 +929,23 @@ def test_coach_view_hides_the_threshold_and_the_zone_source(storage_module, fake
         assert secret not in text, secret
     assert view["weeks"] == [{k: w[k] for k in view["weeks"][0]} for w in load["weeks"]]
     assert view["runs"] == load["runs"] and view["rolling"]["int"] == load["rolling"]["int"]
+
+
+def test_broken_details_are_cached_empty_but_a_failed_read_is_retried(storage_module, fake_bucket,
+                                                                     monkeypatch):
+    """Битый details.json сам не починится — его не перечитываем. Сбой чтения
+    временный — пробежка остаётся в pending и читается в следующий раз."""
+    _fit_runs(storage_module, fake_bucket, 2)
+    reads = []
+
+    def flaky(bucket, sub, run_id):
+        reads.append(run_id)
+        if run_id == 1:
+            raise json.JSONDecodeError("битый", "{", 0)
+        raise RuntimeError("503 от хранилища")
+
+    monkeypatch.setattr(storage_module, "read_run_details", flaky)
+    assert _load(storage_module, fake_bucket)["pending"] == 1
+    assert _cached(fake_bucket)["runs"] == {"1": {"hr": {}, "spd": {}}}
+    _load(storage_module, fake_bucket)
+    assert reads == [1, 2, 2]
