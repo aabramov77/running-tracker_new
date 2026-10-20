@@ -2349,11 +2349,17 @@ function runLoadText(load) {
   return parts.join(' · ');
 }
 
+// Основная ось нагрузки: темп, без порога — пульс; null — считать нечего.
+function loadMainAxis(period) {
+  if (!period) return null;
+  return period.ext ? 'ext' : (period.int ? 'int' : null);
+}
+
 // «Сегодня»: нагрузка за 7 дней. Основная ось — темп, без порога — пульс.
 // Цена работы — отдельной строкой и только когда она заметно отклонилась.
 function todayLoadHtml() {
   const period = LOAD && LOAD.rolling;
-  const key = period ? (period.ext ? 'ext' : (period.int ? 'int' : null)) : null;
+  const key = loadMainAxis(period);
   if (!key) return '';
   const axis = period[key];
   const of = key === 'ext' ? 'по темпу' : 'по пульсу';
@@ -2452,13 +2458,8 @@ function fillProfileForm(profile) {
   PROFILE_ZONES_MANUAL = Array.isArray(starts) && starts.length === ZONE_INPUT_IDS.length;
   fillZoneInputs(PROFILE_ZONES_MANUAL ? starts : null);
   // #66: хранится в секундах на км, вводится и показывается как «м:сс»
-  document.getElementById('pr-threshold-pace').value = paceSecText(profile.threshold_pace_sec);
-}
-
-function paceSecText(seconds) {
-  const s = Number(seconds);
-  if (!s || s <= 0) return '';
-  return `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+  const pace = profile.threshold_pace_sec;
+  document.getElementById('pr-threshold-pace').value = pace > 0 ? secondsToTime(pace) : '';
 }
 
 // Подсказка у порогового темпа: оценка по «Стартам» — видна и при ручном пороге.
@@ -2467,7 +2468,7 @@ function renderThresholdHint() {
   const auto = PROFILE_DERIVED && PROFILE_DERIVED.threshold_pace_auto;
   const basis = auto && auto.basis;
   el.textContent = basis
-    ? `Оценка ${paceSecText(auto.pace_sec)}/км — по забегу ${PB_LABELS[basis.dist_label] || basis.dist_label} `
+    ? `Оценка ${secondsToTime(auto.pace_sec)}/км — по забегу ${PB_LABELS[basis.dist_label] || basis.dist_label} `
       + `${basis.time} от ${basis.date}${basis.stale ? ' (забег старше года)' : ''}. `
       + 'Оставьте поле пустым, чтобы нагрузка считалась по оценке.'
     : 'Темп, который вы держите около часа. Не знаете — добавьте результат забега в «Стартах», и он оценится сам.';
@@ -3393,7 +3394,8 @@ const COACH = { athletes: [], athlete: null, plans: [], activePlanId: null, plan
                 // План неделей на телефоне (#62): показанная неделя (null — текущая),
                 // для какого плана она выбрана, и открытый в листе день.
                 weekIdx: null, weekPlanId: null, dayEdit: null,
-                // Нагрузка (#66): открытого спортсмена и отметки списка {sub: {at, data}}.
+                // Нагрузка (#66): открытого спортсмена и отметки списка
+                // {sub: {at, data, promise}}, см. coachCachedLoad.
                 load: null, loadError: false, loads: {} };
 let coachChart = null;
 // Отметки нагрузки в списке живут столько, потом перечитываются (#66).
@@ -3939,19 +3941,30 @@ async function loadCoachAthletes() {
 
 // Отметки нагрузки за 7 дней (#66). Список показывается сразу, отметки
 // догружаются по одной: ждать N запросов перед показом списка незачем.
-// Свежий ответ берётся из COACH.loads, а не запрашивается заново.
 function coachLoadBadges() {
   COACH.athletes.forEach((athlete, i) => {
-    const cached = COACH.loads[athlete.sub];
-    if (cached && Date.now() - cached.at < COACH_LOAD_TTL_MS) {
-      coachShowLoadBadge(i, athlete, cached.data);
-      return;
-    }
-    coachFetchLoad(athlete.sub).then(data => {
-      COACH.loads[athlete.sub] = { at: Date.now(), data };
-      coachShowLoadBadge(i, athlete, data);
-    }).catch(() => {});      // нет отметки — список от этого не ломается
+    coachCachedLoad(athlete.sub)
+      .then(data => coachShowLoadBadge(i, athlete, data))
+      .catch(() => {});      // нет отметки — список от этого не ломается
   });
+}
+
+// Нагрузка спортсмена из COACH.loads, пока свежая, иначе — новый запрос.
+// Промис кладётся в кэш сразу: список, открытый повторно, пока запрос в пути,
+// ждёт его же. Упавший запрос из кэша убирается — следующий спросит заново.
+function coachCachedLoad(sub) {
+  const cached = COACH.loads[sub];
+  if (cached && Date.now() - cached.at < COACH_LOAD_TTL_MS) return cached.promise;
+  const entry = { at: Date.now(), data: null };
+  entry.promise = coachFetchLoad(sub).then(data => {
+    Object.assign(entry, { at: Date.now(), data });
+    return data;
+  }, e => {
+    if (COACH.loads[sub] === entry) COACH.loads[sub] = null;
+    throw e;
+  });
+  COACH.loads[sub] = entry;
+  return entry.promise;
 }
 
 // Нагрузка спортсмена из списка: без coachGet, потому что спортсмен ещё не
@@ -3970,7 +3983,7 @@ function coachShowLoadBadge(i, athlete, data) {
 
 function coachLoadBadgeHtml(load) {
   const period = load && load.rolling;
-  const key = period ? (period.ext ? 'ext' : (period.int ? 'int' : null)) : null;
+  const key = loadMainAxis(period);
   if (!key) return '';
   const cost = period.cost;
   const costBand = cost && (cost.band === 'higher' || cost.band === 'lower') ? cost.band : null;
@@ -4074,7 +4087,7 @@ async function coachLoadOpen(athlete) {
     const data = await coachGet('load');
     if (COACH.athlete !== athlete) return;              // успели открыть другого
     COACH.load = data;
-    COACH.loads[athlete.sub] = { at: Date.now(), data };
+    COACH.loads[athlete.sub] = { at: Date.now(), data, promise: Promise.resolve(data) };
   } catch (e) {
     if (e.accessLost || COACH.athlete !== athlete) return;
     COACH.loadError = !COACH.load;
@@ -4108,7 +4121,7 @@ function setCoachRunScope(scope) {
 // «нагрузка 7 дней: в норме ×1,12» — для сводки над планом (#66).
 function coachLoadSummary() {
   const period = COACH.load && COACH.load.rolling;
-  const key = period ? (period.ext ? 'ext' : (period.int ? 'int' : null)) : null;
+  const key = loadMainAxis(period);
   const axis = key && period[key];
   if (!axis || !LOAD_BAND_LABELS[axis.band]) return '';
   return `нагрузка 7 дней: ${LOAD_BAND_LABELS[axis.band]} ${loadRatioText(axis.ratio)}`;

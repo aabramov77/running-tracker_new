@@ -21,7 +21,7 @@ def plural_ru(number, one, few, many):
         return few
     return many
 
-def _pace(seconds):
+def _mmss(seconds):
     seconds = int(round(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
 
@@ -34,12 +34,12 @@ def _threshold_line(derived):
     if not pace:
         return None
     if derived.get("threshold_source") == "manual":
-        return f"Пороговый темп: {_pace(pace)}/км (задан спортсменом)"
+        return f"Пороговый темп: {_mmss(pace)}/км (задан спортсменом)"
     basis = derived.get("threshold_basis") or {}
     km = DIST_LABEL_KM.get(basis.get("dist_label"))
     if not km:
-        return f"Пороговый темп: ~{_pace(pace)}/км (оценка)"
-    return (f"Пороговый темп: ~{_pace(pace)}/км (оценка по забегу {km:g} км за "
+        return f"Пороговый темп: ~{_mmss(pace)}/км (оценка)"
+    return (f"Пороговый темп: ~{_mmss(pace)}/км (оценка по забегу {km:g} км за "
             f"{basis.get('time')} от {basis.get('date')})")
 
 
@@ -424,11 +424,6 @@ def format_plan_window(window):
     return "\n".join(lines)
 
 FOCUS_LAPS_MAX = 45           # марафон на километровом автокруге помещается целиком
-
-
-def _mmss(seconds):
-    seconds = int(round(seconds))
-    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def _lap_line(lap):

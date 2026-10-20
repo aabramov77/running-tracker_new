@@ -242,6 +242,9 @@ def clean_hist_entry(raw):
 # ── Профиль: зоны, метод пульсовой оси, порог ────────────────────────────────
 
 def format_duration(seconds):
+    """h:mm:ss или m:ss; пусто, ноль или меньше — None."""
+    if not seconds or seconds <= 0:
+        return None
     seconds = int(round(seconds))
     if seconds >= 3600:
         return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"

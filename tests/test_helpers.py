@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import llm_prompt
+import load
 from conftest import FIT_FIXTURE, SYNTHETIC_FIT
 
 
@@ -38,11 +39,12 @@ def test_fmt_pace(storage_module, sec, expected):
 
 
 @pytest.mark.parametrize("sec,expected", [
-    (None, None), (0, None),
+    (None, None), (0, None), (-5, None),
     (65, "1:05"), (600, "10:00"), (3665, "1:01:05"), (7200, "2:00:00"),
+    (245.6, "4:06"),        # оценка порога дробная — округляется
 ])
-def test_fmt_duration(storage_module, sec, expected):
-    assert storage_module._fmt_duration(sec) == expected
+def test_format_duration(sec, expected):
+    assert load.format_duration(sec) == expected
 
 
 # ── LLM JSON extraction ───────────────────────────────────────────────────────

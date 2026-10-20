@@ -1040,8 +1040,11 @@ def test_coach_load_goes_through_coach_get():
 
 def test_coach_list_does_not_refetch_load_on_every_render():
     js = APP_JS.read_text(encoding="utf-8")
-    badges = _fn(js, "coachLoadBadges")
-    assert "COACH_LOAD_TTL_MS" in badges and "COACH.loads[athlete.sub]" in badges
+    assert "coachCachedLoad(athlete.sub)" in _fn(js, "coachLoadBadges")
+    cached = _fn(js, "coachCachedLoad")
+    assert "COACH_LOAD_TTL_MS" in cached and "return cached.promise" in cached
+    # промис в кэше сразу, а упавший запрос из кэша убирается
+    assert "COACH.loads[sub] = entry;" in cached and "COACH.loads[sub] = null" in cached
     assert js.count("coachFetchLoad(") == 2                 # определение и один вызов
     assert js.count("coachLoadBadges();") == 1              # только при загрузке списка
     assert "coachLoadBadges();" in _fn(js, "loadCoachAthletes")
@@ -1063,6 +1066,7 @@ def test_threshold_pace_field_is_wired():
     js = APP_JS.read_text(encoding="utf-8")
     assert 'id="pr-threshold-pace"' in html and 'id="pr-threshold-hint"' in html
     assert "body.threshold_pace_sec = " in _fn(js, "collectProfileForm")
-    assert "paceSecText(profile.threshold_pace_sec)" in _fn(js, "fillProfileForm")
+    fill = _fn(js, "fillProfileForm")
+    assert "profile.threshold_pace_sec" in fill and "secondsToTime(pace)" in fill
     assert "renderThresholdHint();" in _fn(js, "applyProfileResponse")
     assert "threshold_pace_sec: 'Пороговый темп'" in js

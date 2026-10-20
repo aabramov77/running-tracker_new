@@ -659,15 +659,6 @@ def _fmt_pace(sec_per_km):
     return f"{int(sec_per_km) // 60}:{int(sec_per_km) % 60:02d}"
 
 
-def _fmt_duration(sec):
-    if not sec or sec <= 0:
-        return None
-    sec = int(sec)
-    if sec >= 3600:
-        return f"{sec // 3600}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
-    return f"{sec // 60}:{sec % 60:02d}"
-
-
 def parse_fit_file(fit_bytes):
     """Парсит FIT и возвращает {date, summary, laps, samples}."""
     fit = FitFile(io.BytesIO(fit_bytes))
@@ -1768,7 +1759,7 @@ def build_training_load(bucket, sub, runs=None, profile=None, races=None,
     threshold = ctx["threshold_pace_sec"]
     result["internal"] = {"method": ctx["internal"], "zones_source": ctx["zones_source"]}
     result["external"] = {"method": "rtss" if threshold else None,
-                          "threshold_pace": format_duration(threshold) if threshold else None,
+                          "threshold_pace": format_duration(threshold),
                           "threshold_source": ctx["threshold_source"],
                           "threshold_basis": ctx["threshold_basis"]}
     result["pending"] = pending
