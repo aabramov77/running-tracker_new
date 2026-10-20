@@ -994,3 +994,19 @@ def test_load_failure_reaches_the_client_without_details(api, patched_api, monke
         body, code, _ = api(FakeRequest("GET", "/load"))
     assert (code, json.loads(body)) == (500, {"error": "internal_error"})
     assert "run_hist" not in body and secret in caplog.text
+
+
+def test_profile_from_a_client_before_66_keeps_the_threshold(api):
+    """POST заменяет профиль целиком. Вкладка, открытая до деплоя, поля порога
+    не знает — сохранение веса из неё не должно молча стереть порог."""
+    assert _json(_post(api, "/profile", {"profile": {"threshold_pace_sec": "4:35"}})
+                 )["profile"]["threshold_pace_sec"] == 275
+    old_client = _json(_post(api, "/profile", {"profile": {"weight_kg": 62}}))
+    assert old_client["profile"]["threshold_pace_sec"] == 275
+    assert old_client["profile"]["weight_kg"] == 62
+    flat = _json(_post(api, "/profile", {"weight_kg": 63}))       # плоское тело — так же
+    assert flat["profile"]["threshold_pace_sec"] == 275
+    for cleared in (None, ""):                                     # явный сброс работает
+        _post(api, "/profile", {"profile": {"threshold_pace_sec": "4:35"}})
+        reset = _json(_post(api, "/profile", {"profile": {"threshold_pace_sec": cleared}}))
+        assert reset["profile"]["threshold_pace_sec"] is None

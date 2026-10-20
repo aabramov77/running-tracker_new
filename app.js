@@ -2104,6 +2104,9 @@ const LOAD_VIEWS = {
   coach: { body: 'coach-load-body', canvas: 'coachLoadChart', axis: null, chart: null },
 };
 const LOAD_REFILL_TRIES = 3;    // сколько раз подряд дочитывать историю, пока сервер считает
+// Номер последнего запроса /load: запросы идут и после пробежек, и после
+// профиля, и после забегов, а ответ на более ранний не должен затереть свежий.
+let LOAD_SEQ = 0;
 
 function readLoadCache() {
   try { return JSON.parse(localStorage.getItem(ck('running_tracker_load')) || 'null'); }
@@ -2113,18 +2116,26 @@ function readLoadCache() {
 // Сервер за вызов дочитывает не больше 60 пробежек. Осталось ещё — просим
 // снова, чтобы история посчиталась за один заход, а не за несколько.
 async function loadTrainingLoad(attempt = 0) {
+  const seq = ++LOAD_SEQ;
+  let fresh = false;
   try {
     const res = await fetch(API_URL + 'load', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    LOAD = await res.json();
+    const data = await res.json();
+    if (seq !== LOAD_SEQ) return;           // пока шёл запрос, ушёл более свежий
+    LOAD = data;
+    fresh = true;
     try { localStorage.setItem(ck('running_tracker_load'), JSON.stringify(LOAD)); } catch (e) {}
   } catch (e) {
+    if (seq !== LOAD_SEQ) return;
     // Нет связи — остаётся прошлый ответ из кэша.
   }
   renderToday();
   if (document.getElementById('tab-stats').classList.contains('active')) renderLoadCard('athlete');
-  if (LOAD && LOAD.pending > 0 && attempt < LOAD_REFILL_TRIES) loadTrainingLoad(attempt + 1);
+  // Дочитываем историю, только пока сервер отвечает и говорит, что ещё считает:
+  // pending из кэша без связи — не повод слать запросы подряд.
+  if (fresh && LOAD.pending > 0 && attempt < LOAD_REFILL_TRIES) loadTrainingLoad(attempt + 1);
 }
 
 function loadViewData(view) { return view === 'coach' ? COACH.load : LOAD; }
@@ -2197,28 +2208,32 @@ function loadNotes(load, coach) {
   return notes;
 }
 
+// Описываются только те оси, что есть. Порог спортсмену называется, тренеру — нет.
 function loadHowHtml(load, coach) {
-  const ext = load.external || {};
-  let threshold = 'Порог — пороговый темп спортсмена; сам он здесь не показывается.';
-  if (!coach && ext.threshold_pace) {
-    const basis = ext.threshold_basis;
-    const source = ext.threshold_source === 'manual' ? 'задан в профиле'
-      : basis ? `оценка по забегу ${escapeHtml(PB_LABELS[basis.dist_label] || basis.dist_label || '')} `
-                + `${escapeHtml(basis.time || '')} от ${escapeHtml(basis.date || '')}`
-                + (basis.stale ? ' — забег старше года, порог лучше указать в профиле' : '')
-      : 'оценка';
-    threshold = `Порог ${escapeHtml(ext.threshold_pace)}/км — ${source}.`;
+  const axes = loadAxesOf(load);
+  const lines = [];
+  if (axes.includes('ext')) {
+    const ext = load.external || {};
+    let threshold = 'Порог — пороговый темп спортсмена; сам он здесь не показывается.';
+    if (!coach) {
+      const basis = ext.threshold_basis;
+      const source = ext.threshold_source === 'manual' ? 'задан в профиле'
+        : basis ? `оценка по забегу ${escapeHtml(PB_LABELS[basis.dist_label] || basis.dist_label || '')} `
+                  + `${escapeHtml(basis.time || '')} от ${escapeHtml(basis.date || '')}`
+                  + (basis.stale ? ' — забег старше года, порог лучше указать в профиле' : '')
+        : 'оценка';
+      threshold = `Порог ${escapeHtml(ext.threshold_pace || '')}/км — ${source}.`;
+    }
+    lines.push(`rTSS — нагрузка по темпу с поправкой на уклон: 100 = час на пороговом темпе. ${threshold}`);
   }
-  const method = (load.internal || {}).method === 'banister'
+  if (axes.includes('int')) lines.push((load.internal || {}).method === 'banister'
     ? 'TRIMP — по пульсу, метод Банистера: учитывает резерв пульса от покоя до максимума.'
-    : 'TRIMP — по пульсовым зонам (метод Эдвардса): минуты в зоне × номер зоны.';
-  return `<details class="load-how"><summary>Как считается</summary><div>
-      rTSS — нагрузка по темпу с поправкой на уклон: 100 = час на пороговом темпе. ${threshold}<br>
-      ${method}<br>
-      «К обычной» — неделя против среднего за 4 предыдущие: 0,8–1,3 — в норме, выше 1,5 — резкий рост.
-      Цена работы — пульсовая нагрузка на единицу темповой на лёгких и длительных пробежках:
-      растёт при усталости, жаре, болезни. Это ориентир, а не диагноз.
-    </div></details>`;
+    : 'TRIMP — по пульсовым зонам (метод Эдвардса): минуты в зоне × номер зоны.');
+  lines.push('«К обычной» — неделя против среднего за 4 предыдущие: 0,8–1,3 — в норме, выше 1,5 — резкий рост.');
+  if (axes.length === 2) lines.push('Цена работы — пульсовая нагрузка на единицу темповой на лёгких и '
+    + 'длительных пробежках: растёт при усталости, жаре, болезни.');
+  lines.push('Это ориентир, а не диагноз.');
+  return `<details class="load-how"><summary>Как считается</summary><div>${lines.join('<br>')}</div></details>`;
 }
 
 function loadTooltipLines(week, key) {
@@ -2259,12 +2274,16 @@ function loadChartConfig(load, key) {
       interaction: { mode: 'index', intersect: false },
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: {
-          title: items => { const w = weeks[items[0].dataIndex]; return `${isoDdmm(w.start)}–${isoDdmm(w.end)}`; },
-          label: ctx => ctx.dataset.type === 'line'
-            ? (ctx.parsed.y ? `обычная ${Math.round(ctx.parsed.y)} ${unit}` : '')
-            : loadTooltipLines(weeks[ctx.dataIndex], key),
-        } },
+        tooltip: {
+          // Неделя без обычной нагрузки — без пустой строки «обычная» в подсказке.
+          filter: item => item.dataset.type !== 'line' || !!item.parsed.y,
+          callbacks: {
+            title: items => { const w = weeks[items[0].dataIndex]; return `${isoDdmm(w.start)}–${isoDdmm(w.end)}`; },
+            label: ctx => ctx.dataset.type === 'line'
+              ? `обычная ${Math.round(ctx.parsed.y)} ${unit}`
+              : loadTooltipLines(weeks[ctx.dataIndex], key),
+          },
+        },
       },
       scales: { x: { ticks: { font: { size: 10 }, autoSkip: false, maxRotation: 45 } },
                 y: { beginAtZero: true } },

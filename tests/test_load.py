@@ -116,6 +116,17 @@ def test_gps_spike_above_7_mps_is_dropped():
     assert sum(hist.values()) == 60 * 5 - 5                    # отрезок выброса не считается
 
 
+def test_standing_with_gps_drift_is_not_moving_time():
+    """Полчаса у светофора с часами (дрейф 0,2 м/с) не добавляют часов в rTSS:
+    иначе час на пороге выглядел бы как 122."""
+    details = steady(n=720, pace=250)                       # час на пороге 4:10
+    details["samples"]["t_offset_sec"] += [3600 + 5 * i for i in range(360)]
+    details["samples"]["pace_sec_per_km"] += [5000] * 360   # 0,2 м/с — стоим
+    hist = L.speed_histogram(details)
+    assert sum(hist.values()) == 3600
+    assert L.external_load(hist, 250) == pytest.approx(100)
+
+
 def test_uphill_counts_faster_and_downhill_slower():
     # 3 м/с, 15 м за сэмпл: ±0,75 м — уклон 5 %
     flat = L.speed_histogram(steady(pace=333, alt=100))
@@ -353,10 +364,24 @@ def test_rolling_week_compares_to_the_28_days_before():
     assert (rolling["int"]["ratio"], rolling["int"]["band"]) == (1.5, "high")
 
 
-def test_today_is_never_before_the_latest_run():
+def test_run_logged_after_local_midnight_moves_today():
     assert weekly([run(date(2026, 10, 21))])["today"] == "2026-10-21"
-    assert weekly([run(date(2026, 10, 30))])["today"] == "2026-10-21"     # не дальше +1 дня
     assert weekly([run(date(2026, 10, 1))])["today"] == "2026-10-20"
+
+
+def test_far_future_run_does_not_move_today():
+    """Опечатка в дате (год не тот) не сдвигает окно у спортсмена навсегда."""
+    assert weekly([run(date(2026, 10, 30))])["today"] == "2026-10-20"
+    assert weekly([run(date(2027, 10, 19)), run(date(2026, 10, 18))])["today"] == "2026-10-20"
+
+
+def test_band_follows_the_ratio_shown():
+    """1 ч 18 мин 10 с при обычных 120 / 100: отношение 1,3028 показывается как
+    ×1,30 — и оценка «в норме», как обещано в «Как считается»."""
+    start = monday(1)
+    week = weekly(base_runs(start) + [run(start, time="1:18:10")])["weeks"][-2]
+    for key in ("int", "ext"):
+        assert (week[key]["ratio"], week[key]["band"]) == (1.3, "ok"), key
 
 
 def test_intensity_split_by_zone_groups():

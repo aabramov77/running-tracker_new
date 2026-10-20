@@ -29,7 +29,8 @@ from compliance import to_date
 from domain import DIST_LABEL_KM, parse_time_to_sec
 
 # Правила построения гистограмм. Поменялись — кэш собирается заново.
-HIST_VERSION = 1
+# 2 — скорость ниже SPEED_MIN_MPS больше не считается движением.
+HIST_VERSION = 2
 
 # Сэмпл «держит» время до следующего. Разрыв длиннее — часы стояли на паузе,
 # и записывать его в зону последнего пульса нельзя.
@@ -44,6 +45,9 @@ HR_OVER_MAX = 10
 
 SPEED_BIN_CM = 5           # корзина скорости, см/с
 SPEED_MAX_MPS = 7.0        # быстрее 2:23/км бегом не бывает — это выброс GPS
+# Медленнее 16:40/км — не бег и не ходьба, а стоянка с часами или дрейф GPS.
+# Такое время в rTSS не идёт: оно добавляло бы часы без работы.
+SPEED_MIN_MPS = 1.0
 ADJUSTED_MAX_MPS = 14.0    # потолок скорости с поправкой на крутой подъём
 SMOOTH_SEC = 30            # сглаживание скорости перед четвёртой степенью, как у NGP
 GRADE_WINDOW_SEC = 30      # уклон считается на отрезке не короче этого
@@ -143,8 +147,8 @@ def _speed_key(speed):
 def speed_histogram(details):
     """{см/с: секунды} скорости с поправкой на уклон, сглаженной за 30 с.
 
-    Время считается только в движении: остановка (темпа нет) и выброс GPS
-    в гистограмму не попадают. {} — скорости в сэмплах нет (дорожка без
+    Время считается только в движении: остановка (темпа нет), стоянка с
+    дрейфом GPS и выброс в гистограмму не попадают. {} — скорости в сэмплах нет (дорожка без
     датчика, старые файлы).
     """
     columns = _columns(details, "t_offset_sec", "pace_sec_per_km")
@@ -161,7 +165,7 @@ def speed_histogram(details):
         if moment is None:
             continue
         speed = 1000 / pace if pace and pace > 0 else None
-        if speed is not None and speed > SPEED_MAX_MPS:
+        if speed is not None and not SPEED_MIN_MPS <= speed <= SPEED_MAX_MPS:
             speed = None
         points.append((moment, speed, _num(height)))
 
@@ -485,10 +489,11 @@ def weekly_load(runs, entries, ctx, today, weeks=WEEKS):
             "ext_est": load["ext_est"],
         }
 
-    latest = max((day for day, _ in loads), default=None)
-    if latest and latest > today:
-        # Пробежка, записанная после местной полуночи, не выпадает из окна.
-        today = min(latest, today + timedelta(days=1))
+    # Пробежка, записанная после местной полуночи, датирована «завтра» по UTC —
+    # тогда сегодня и есть завтра. Дальше в будущем — опечатка в дате: окно из-за
+    # неё не сдвигается.
+    if any(day == today + timedelta(days=1) for day, _ in loads):
+        today += timedelta(days=1)
     first = min((day for day, _ in loads), default=None)
     has = {"int": ctx.get("internal") is not None,
            "ext": bool(ctx.get("threshold_pace_sec"))}
@@ -501,11 +506,12 @@ def weekly_load(runs, entries, ctx, today, weeks=WEEKS):
         if (first is not None and first <= start - timedelta(days=HISTORY_DAYS)
                 and base[key + "_known"] >= MIN_BASE_RUNS and base[key] > 0):
             chronic = base[key] / BASE_WEEKS
-        ratio = cur[key] / chronic if chronic and rated else None
+        # Оценка — по тому же округлённому отношению, что видит человек: иначе
+        # «×1,30 · выше обычного» спорит с объявленным «0,8–1,3 — в норме».
+        ratio = round(cur[key] / chronic, 2) if chronic and rated else None
         return {"load": round(cur[key]), "unknown": cur[key + "_unknown"],
                 "chronic": round(chronic) if chronic else None,
-                "ratio": round(ratio, 2) if ratio is not None else None,
-                "band": load_band(ratio)}
+                "ratio": ratio, "band": load_band(ratio)}
 
     def cost(cur, base):
         if not (has["int"] and has["ext"]):

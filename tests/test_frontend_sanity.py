@@ -966,7 +966,35 @@ def test_load_card_is_shared_by_athlete_and_coach():
     assert 'id="load-body"' in html and 'id="coach-load-body"' in html
     # тренеру — подсказки от третьего лица, и порог он не видит
     how = _fn(js, "loadHowHtml")
-    assert "if (!coach && ext.threshold_pace)" in how
+    assert "if (!coach) {" in how and "escapeHtml(ext.threshold_pace" in how
+
+
+def test_load_help_describes_only_the_axes_that_exist():
+    """Без порога спортсмен не читает текст для тренера, без зон — про TRIMP."""
+    how = _fn(APP_JS.read_text(encoding="utf-8"), "loadHowHtml")
+    ext, rest = how.split("if (axes.includes('ext')) {", 1)[1].split("if (axes.includes('int'))", 1)
+    assert "rTSS —" in ext and "rTSS —" not in rest
+    assert "TRIMP —" in rest.split("lines.push('«К обычной»")[0]
+    assert "if (axes.length === 2) lines.push('Цена работы" in how
+
+
+def test_threshold_field_takes_a_colon_on_phones():
+    """inputmode=numeric на телефоне прячет «:» — «4:35» не набрать."""
+    html = INDEX.read_text(encoding="utf-8")
+    field = re.search(r'<input[^>]*id="pr-threshold-pace"[^>]*>', html).group(0)
+    assert "inputmode" not in field and 'type="text"' in field
+
+
+def test_load_requests_do_not_overwrite_fresher_ones():
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _fn(js, "loadTrainingLoad")
+    assert body.count("if (seq !== LOAD_SEQ) return;") == 2
+    assert "if (fresh && LOAD.pending > 0 && attempt < LOAD_REFILL_TRIES)" in body
+
+
+def test_load_tooltip_skips_weeks_without_usual_load():
+    config = _fn(APP_JS.read_text(encoding="utf-8"), "loadChartConfig")
+    assert "filter: item => item.dataset.type !== 'line' || !!item.parsed.y" in config
 
 
 def test_load_axis_buttons_call_an_existing_handler():

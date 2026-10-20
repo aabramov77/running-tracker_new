@@ -763,9 +763,16 @@ def h_profile_post(c):
     # Профиль приходит в поле profile либо плоским телом. Что-то кроме объекта
     # в profile — ошибка, а не повод взять вместо него тело.
     raw = body.get("profile")
-    profile, errors = clean_athlete_profile(body if raw is None else raw)
+    source = body if raw is None else raw
+    profile, errors = clean_athlete_profile(source)
     if errors:
         return validation_failed(errors)
+    # Клиент до #66 поля порога не знает, а POST заменяет профиль целиком:
+    # без этого сохранение из старой вкладки молча стёрло бы порог. Явный
+    # null или пустая строка по-прежнему его сбрасывают.
+    if isinstance(source, dict) and "threshold_pace_sec" not in source:
+        profile["threshold_pace_sec"] = \
+            read_athlete_profile(c.bucket, c.sub)[0].get("threshold_pace_sec")
     payload = write_athlete_version(
         c.bucket, c.sub, profile,
         change_reason=clean_change_reason(body.get("change_reason")),
