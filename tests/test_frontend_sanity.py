@@ -13,6 +13,7 @@ REPO = Path(__file__).resolve().parent.parent
 APP_JS = REPO / "app.js"
 INDEX = REPO / "index.html"
 STYLE = REPO / "style.css"
+LANDING = REPO / "landing.css"
 BACKEND_PY = sorted(REPO.glob("*.py"))   # main, api, storage, domain, llm_prompt, config
 
 
@@ -155,7 +156,7 @@ def test_strip_js_literals_ignores_brackets_inside_literals():
     assert strip_js_literals("function f() { return [1]; }").count("{") == 1
 
 
-@pytest.mark.parametrize("path", [APP_JS, INDEX, STYLE, *BACKEND_PY])
+@pytest.mark.parametrize("path", [APP_JS, INDEX, STYLE, LANDING, *BACKEND_PY])
 def test_no_merge_conflict_markers(path):
     text = path.read_text(encoding="utf-8")
     for marker in ("<<<<<<<", ">>>>>>>"):
@@ -173,8 +174,10 @@ def test_index_references_cachebusted_assets():
     html = INDEX.read_text(encoding="utf-8")
     js = re.search(r"app\.js\?v=(\d+)", html)
     css = re.search(r"style\.css\?v=(\d+)", html)
+    landing = re.search(r"landing\.css\?v=(\d+)", html)
     assert js, "index.html must reference app.js?v=<int>"
     assert css, "index.html must reference style.css?v=<int>"
+    assert landing, "index.html must reference landing.css?v=<int>"
     # versions are integers (sanity — they're parsed as such by the regex)
     assert int(js.group(1)) >= 1
     assert int(css.group(1)) >= 1
@@ -1070,3 +1073,108 @@ def test_threshold_pace_field_is_wired():
     assert "profile.threshold_pace_sec" in fill and "secondsToTime(pace)" in fill
     assert "renderThresholdHint();" in _fn(js, "applyProfileResponse")
     assert "threshold_pace_sec: 'Пороговый темп'" in js
+
+
+# ── Стартовая страница (#65) ─────────────────────────────────────────────────
+
+def _landing_html(html):
+    start = html.index('<div id="landing"')
+    return html[start:html.index('<div class="app">', start)]
+
+
+def test_landing_replaces_the_auto_prompting_login_screen():
+    """Новый посетитель сначала видит, что это за приложение: One Tap из
+    разметки всплывал сразу при открытии ссылки."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert 'id="landing"' in html
+    for leftover in ("g_id_onload", "g_id_signin", "data-auto_select", 'id="login-screen"'):
+        assert leftover not in html, leftover
+    assert "'login-screen'" not in js
+    assert "Полумарафон 09.08.2026" not in html, "заголовок одного забега на общей странице"
+
+
+def test_one_tap_is_offered_only_to_a_returning_user():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert js.count("google.accounts.id.prompt(") == 1
+    offer = _fn(js, "offerOneTap")
+    assert "localStorage.getItem(SIGNED_IN_BEFORE_KEY)" in offer
+    assert "google.accounts.id.prompt()" in offer
+    assert "localStorage.setItem(SIGNED_IN_BEFORE_KEY" in _fn(js, "handleCredentialResponse")
+    sign_out = _fn(js, "signOut")
+    assert "disableAutoSelect()" in sign_out
+    assert sign_out.index("localStorage.removeItem(SIGNED_IN_BEFORE_KEY)") < sign_out.index("showLanding()"), \
+        "вышедшему One Tap вход не предлагает"
+
+
+def test_one_tap_does_not_loop_after_a_fresh_sign_in():
+    """/me отказал не из-за истёкшего токена (сеть, сервер) — повторный One Tap
+    сразу дал бы тот же отказ, и так по кругу."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "lastCredentialAt = Date.now();" in _fn(js, "handleCredentialResponse")
+    assert "Date.now() - lastCredentialAt < ONE_TAP_PAUSE_MS" in _fn(js, "offerOneTap")
+    landing = _fn(js, "showLanding")
+    assert landing.index("if (shown) return;") < landing.index("offerOneTap()")
+
+
+def test_every_google_button_slot_has_a_config():
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    slots = re.findall(r'data-gsi-button="(\w+)"', html)
+    assert len(slots) == 3, "кнопка входа — в панели, в hero и внизу"
+    declared = re.search(r"const GSI_BUTTONS = \{(.*?)\n\};", js, re.S)
+    assert declared, "GSI_BUTTONS не найден"
+    assert set(slots) <= set(re.findall(r"^\s*(\w+):", declared.group(1), re.M))
+    init = _fn(js, "initGoogleAuth")
+    assert "renderButton(el, { ...GSI_BUTTONS[el.dataset.gsiButton]" in init
+    assert "callback: handleCredentialResponse" in init
+    # скрипт GIS async: грузится и до app.js, и после
+    assert "window.onGoogleLibraryLoad = initGoogleAuth;" in js
+    assert js.count("\ninitGoogleAuth();") == 1
+
+
+def test_frontend_client_id_matches_the_backend():
+    import config
+
+    assert f"const GOOGLE_CLIENT_ID = '{config.CLIENT_ID}';" in APP_JS.read_text(encoding="utf-8")
+
+
+def test_signed_in_user_does_not_see_the_landing_while_me_loads():
+    js = APP_JS.read_text(encoding="utf-8")
+    start = js[js.index("// ── Запуск с авторизацией ──"):]
+    assert start.index("tokenFresh(idToken)") < start.index("showAccessScreen('splash-screen')") \
+        < start.index("checkAccessAndInit()")
+    credential = _fn(js, "handleCredentialResponse")
+    assert credential.index("showAccessScreen('splash-screen')") < credential.index("checkAccessAndInit()")
+    assert "payload.exp * 1000" in _fn(js, "tokenFresh")
+
+
+def test_access_screens_are_switched_in_one_place():
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    declared = re.search(r"const ACCESS_SCREENS = \[(.*?)\];", js)
+    assert declared, "ACCESS_SCREENS не найден"
+    for screen in re.findall(r"'([\w-]+)'", declared.group(1)):
+        assert f'id="{screen}"' in html, screen
+    assert "classList.remove('landing-mode')" in _fn(js, "hideAccessScreens")
+    assert "classList.add('landing-mode')" in _fn(js, "showLanding")
+    for name in ("signOut", "handleAuthError"):
+        assert "showLanding()" in _fn(js, name), name
+    css = LANDING.read_text(encoding="utf-8")
+    assert "body.landing-mode > .app" in css and "body.landing-mode > .tabbar" in css
+    assert html.index('<div id="landing"') < html.index('<div class="app">')
+
+
+def test_landing_anchors_lead_to_existing_sections():
+    html = INDEX.read_text(encoding="utf-8")
+    targets = re.findall(r'href="#([\w-]+)"', _landing_html(html))
+    assert {"l-features", "l-coaches", "l-start"} <= set(targets)
+    for target in targets:
+        assert f'id="{target}"' in html, target
+
+
+def test_landing_mockups_are_hidden_from_screen_readers():
+    """Мокапы — картинка из текста: скринридер читал бы выдуманные пробежки."""
+    landing = _landing_html(INDEX.read_text(encoding="utf-8"))
+    for mock in ("l-phone", "l-chart", "l-chat"):
+        assert re.search(rf'class="{mock}" aria-hidden="true"', landing), mock

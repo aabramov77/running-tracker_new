@@ -30,13 +30,23 @@ let ACTIVE_PLAN = null;     // активный план — от него за�
 let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
 let LOAD = null;            // #66: нагрузка по темпу и пульсу — ответ GET /load
 
-// Google sub из JWT — только для namespace кэша (не для безопасности; сервер
-// сам проверяет подпись). Декодируем payload без верификации.
-function jwtSub(token) {
+// Payload JWT — только для namespace кэша и выбора стартового экрана (не для
+// безопасности; сервер сам проверяет подпись). Декодируем без верификации.
+function jwtPayload(token) {
   try {
     const p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    return JSON.parse(decodeURIComponent(escape(atob(p)))).sub || null;
+    return JSON.parse(decodeURIComponent(escape(atob(p))));
   } catch (e) { return null; }
+}
+function jwtSub(token) {
+  const payload = jwtPayload(token);
+  return (payload && payload.sub) || null;
+}
+// Токен ещё не истёк, с запасом на расхождение часов (#65). Решает только,
+// показать ли вошедшему заставку вместо стартовой страницы: доступ — за сервером.
+function tokenFresh(token) {
+  const payload = jwtPayload(token);
+  return !!(payload && payload.exp && payload.exp * 1000 > Date.now() + 60 * 1000);
 }
 let userSub = idToken ? jwtSub(idToken) : null;
 // Ключ кэша с namespace по пользователю (на общем браузере данные не смешиваются)
@@ -46,15 +56,68 @@ function authHeaders(extra = {}) {
   return idToken ? { ...extra, 'Authorization': `Bearer ${idToken}` } : extra;
 }
 
+// ── Вход (#65): стартовая страница и Google Identity Services ──
+// client_id тот же, что config.CLIENT_ID: бэкенд принимает токены только для него
+const GOOGLE_CLIENT_ID = '463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com';
+// «На этом устройстве уже входили». Только таким One Tap предлагает вход сам —
+// новый посетитель сначала видит стартовую страницу. Выход флаг снимает.
+const SIGNED_IN_BEFORE_KEY = 'rt_signed_in_before';
+// Кнопки Google на стартовой странице: в панели — компактная, в hero и внизу —
+// крупная. Ключ — значение data-gsi-button в index.html.
+const GSI_BUTTONS = {
+  compact: { type: 'standard', theme: 'outline', size: 'medium', shape: 'pill', text: 'signin' },
+  large:   { type: 'standard', theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 300 },
+};
+// Повторный вход сразу после свежего токена значит, что токен не истёк, а
+// что-то другое (сеть, сервер). One Tap тогда не предлагаем — иначе вход по
+// кругу; остаются кнопки.
+const ONE_TAP_PAUSE_MS = 5 * 60 * 1000;
+let gsiReady = false;
+let lastCredentialAt = 0;
+
+function initGoogleAuth() {
+  if (gsiReady || !(window.google && google.accounts && google.accounts.id)) return;
+  gsiReady = true;
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleCredentialResponse,
+    auto_select: true,
+    use_fedcm_for_prompt: true,
+  });
+  document.querySelectorAll('[data-gsi-button]').forEach(el =>
+    google.accounts.id.renderButton(el, { ...GSI_BUTTONS[el.dataset.gsiButton], locale: 'ru' }));
+  if (document.getElementById('landing').classList.contains('active')) offerOneTap();
+}
+// Скрипт GIS async: может загрузиться и до app.js, и после. Отсюда — второй
+// случай, первый закрывает вызов initGoogleAuth() при запуске.
+window.onGoogleLibraryLoad = initGoogleAuth;
+
+function offerOneTap() {
+  if (!gsiReady || !localStorage.getItem(SIGNED_IN_BEFORE_KEY)) return;
+  if (Date.now() - lastCredentialAt < ONE_TAP_PAUSE_MS) return;
+  google.accounts.id.prompt();
+}
+
 // ── Экраны доступа ──
+const ACCESS_SCREENS = ['landing', 'splash-screen', 'pending-screen', 'rejected-screen'];
 function hideAccessScreens() {
-  ['login-screen', 'pending-screen', 'rejected-screen'].forEach(id =>
-    document.getElementById(id).classList.remove('active'));
+  ACCESS_SCREENS.forEach(id => document.getElementById(id).classList.remove('active'));
+  document.body.classList.remove('landing-mode');
 }
 function showAccessScreen(id) {
   hideAccessScreens();
   document.getElementById(id).classList.add('active');
   document.getElementById('signout-btn').style.display = 'none';
+}
+// Стартовая страница вместо приложения: новому посетителю, после выхода и
+// когда сессия истекла. Вернувшемуся One Tap предлагает войти сразу.
+function showLanding() {
+  const shown = document.getElementById('landing').classList.contains('active');
+  showAccessScreen('landing');
+  document.body.classList.add('landing-mode');
+  if (shown) return;            // параллельные 401 — один показ и один One Tap
+  window.scrollTo(0, 0);
+  offerOneTap();
 }
 
 function applyRole(role) {
@@ -100,7 +163,10 @@ async function checkAccessAndInit() {
 function handleCredentialResponse(response) {
   idToken = response.credential;
   userSub = jwtSub(idToken);
+  lastCredentialAt = Date.now();
   localStorage.setItem('g_id_token', idToken);
+  localStorage.setItem(SIGNED_IN_BEFORE_KEY, '1');
+  showAccessScreen('splash-screen');   // #65: не стартовая страница, пока идёт /me
   checkAccessAndInit();
 }
 
@@ -109,18 +175,15 @@ function signOut() {
   aiReset();                  // #46: разборы прежнего пользователя — не следующему
   LOAD = null;                // #66: и его нагрузка тоже
   localStorage.removeItem('g_id_token');
-  hideAccessScreens();
-  document.getElementById('login-screen').classList.add('active');
-  document.getElementById('signout-btn').style.display = 'none';
+  localStorage.removeItem(SIGNED_IN_BEFORE_KEY);   // #65: вышел сам — One Tap не навязываем
   if (window.google) google.accounts.id.disableAutoSelect();
+  showLanding();
 }
 
 function handleAuthError() {
   idToken = null; currentRole = null;
   localStorage.removeItem('g_id_token');
-  hideAccessScreens();
-  document.getElementById('login-screen').classList.add('active');
-  document.getElementById('signout-btn').style.display = 'none';
+  showLanding();
 }
 
 let runs = JSON.parse(localStorage.getItem(ck('running_tracker_runs')) || '[]');
@@ -4535,11 +4598,15 @@ function initApp() {
 }
 
 // ── Запуск с авторизацией ──
-document.getElementById('login-screen').classList.add('active');
-if (idToken) {
-  // Токен есть — проверяем статус через /me (approved/pending/rejected)
+// Свежий токен — заставка и статус через /me (approved/pending/rejected), без
+// мелькания стартовой страницы (#65). Нет токена или истёк — стартовая страница.
+if (idToken && tokenFresh(idToken)) {
+  showAccessScreen('splash-screen');
   checkAccessAndInit();
+} else {
+  handleAuthError();
 }
+initGoogleAuth();
 
 // ====================================================
 // КАЛЬКУЛЯТОР

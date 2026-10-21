@@ -5,37 +5,224 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="theme-color" content="#f8f7f4" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1a1a18" media="(prefers-color-scheme: dark)">
-<title>Running Tracker — Полумарафон 09.08.2026</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<title>Running Tracker — план, журнал и ИИ-тренер для бегуна</title>
+<meta name="description" content="Подготовка к забегу: план тренировок с отметками план/факт, журнал пробежек из Garmin (.FIT, CSV), нагрузка по темпу и пульсу, ИИ-тренер и работа с тренером.">
+<meta name="author" content="Abgus Software">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
+<meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css?v=31">
+<link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 
-<!-- Экран входа -->
-<div id="login-screen" class="login-screen">
+<!-- Знак приложения (#65): один на стартовую страницу и экраны доступа -->
+<svg class="rt-sprite" aria-hidden="true">
+  <symbol id="rt-mark" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="6" fill="#1D9E75"/>
+    <path d="M4 13h3.5l2.5-6 4 10 2.5-5H20" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+</svg>
+
+<!-- Стартовая страница (#65): видна, пока пользователь не вошёл. Кнопки
+     Google рисует initGoogleAuth в каждый [data-gsi-button]; мокапы —
+     иллюстрации, скрытые от скринридеров -->
+<div id="landing" class="landing">
+  <header class="l-top">
+    <div class="l-wrap l-top-row">
+      <a class="l-logo" href="#l-hero"><svg class="l-mark" aria-hidden="true"><use href="#rt-mark"/></svg>Running Tracker</a>
+      <nav class="l-nav" aria-label="Разделы страницы">
+        <a href="#l-features">Возможности</a>
+        <a href="#l-coaches">Тренерам</a>
+        <a href="#l-start">Как начать</a>
+      </nav>
+      <div class="l-gsi l-gsi-compact" data-gsi-button="compact"></div>
+    </div>
+  </header>
+
+  <main>
+    <section id="l-hero" class="l-hero l-dark">
+      <svg class="l-track" viewBox="0 0 1200 600" preserveAspectRatio="none" aria-hidden="true">
+        <path d="M-40 560 C 320 470, 560 230, 1240 170"/>
+        <path d="M-40 640 C 360 540, 620 300, 1240 250"/>
+        <path class="l-track-lane" d="M-40 505 C 300 410, 520 175, 1240 100"/>
+      </svg>
+      <div class="l-wrap l-hero-grid">
+        <div>
+          <p class="l-eyebrow">Подготовка к старту</p>
+          <h1 class="l-display">Беги по плану.<br><span class="l-accent">Видь прогресс.</span></h1>
+          <p class="l-lead">План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.</p>
+          <div class="l-gsi l-gsi-large" data-gsi-button="large"></div>
+          <p class="l-note">Доступ по заявке: после первого входа администратор одобрит аккаунт.</p>
+        </div>
+        <div class="l-phone" aria-hidden="true">
+          <div class="l-app">
+            <div class="l-app-head"><b>Сегодня</b><span>пятница · неделя 9 из 13</span></div>
+            <div class="l-app-hero"><span>Темповая</span><b>10 км, 3×2 км в темпе 4:50</b></div>
+            <div class="l-week">
+              <span class="done">Пн</span><span class="done">Вт</span><span class="missed">Ср</span><span class="done">Чт</span><span class="today">Пт</span><span>Сб</span><span>Вс</span>
+            </div>
+            <div class="l-app-row"><span>Нагрузка за 7 дней</span><b>в норме</b></div>
+            <p class="l-app-label">Последние пробежки</p>
+            <p class="l-app-run">чт · 12,1 км · 5:24 /км · 142</p>
+            <p class="l-app-run">вт · 8,0 км · 5:58 /км · 131</p>
+            <p class="l-app-run">пн · 6,2 км · 6:05 /км · 128</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="l-facts">
+      <ul class="l-wrap l-facts-grid">
+        <li><b>План ↔ факт</b><span>по каждому дню</span></li>
+        <li><b>rTSS + TRIMP</b><span>нагрузка недели</span></li>
+        <li><b>ИИ-тренер</b><span>диалог и правки плана</span></li>
+        <li><b>.FIT · CSV</b><span>импорт из Garmin</span></li>
+      </ul>
+    </div>
+
+    <section id="l-features" class="l-section">
+      <div class="l-wrap">
+        <p class="l-eyebrow">Возможности</p>
+        <h2 class="l-display l-h2">Всё для подготовки в одном месте</h2>
+        <div class="l-cards">
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+            <h3>Планы и календарь</h3>
+            <p>Несколько планов под разные старты, недели по типам, конструктор, импорт и экспорт CSV/JSON.</p>
+          </article>
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 13l4 4L16 7M12 15l2 2 8-8"/></svg>
+            <h3>План против факта</h3>
+            <p>Плановый и фактический объём недели, отметки дней: выполнено, пропущено, вне плана.</p>
+          </article>
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4M7 9l5-5 5 5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg>
+            <h3>Импорт из Garmin</h3>
+            <p>Файлы .FIT и выгрузки CSV: круги, графики пульса и темпа по дистанции.</p>
+          </article>
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+            <h3>Недельная нагрузка</h3>
+            <p>По темпу и по пульсу, сравнение с обычной неделей и цена работы.</p>
+          </article>
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4zM9 10.5h.01M15 10.5h.01"/></svg>
+            <h3>ИИ-тренер</h3>
+            <p>Разбирает тренировки по вашим данным и предлагает правки плана — применяете вы.</p>
+          </article>
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/></svg>
+            <h3>Ваш тренер</h3>
+            <p>Видит план и журнал, пишет вам в диалог и правит планы, если вы разрешили.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="l-section l-dark">
+      <div class="l-wrap l-split">
+        <div>
+          <p class="l-eyebrow">Нагрузка</p>
+          <h2 class="l-display l-h2">Знай, когда прибавить, а когда отдохнуть</h2>
+          <p class="l-lead">Нагрузка считается по темпу (rTSS) и по пульсу (TRIMP). Неделя сравнивается с обычной — средним за четыре предыдущие. Цена работы — пульсовая нагрузка на единицу темповой — растёт при усталости, жаре и болезни.</p>
+        </div>
+        <div class="l-chart" aria-hidden="true">
+          <div class="l-chart-head"><span>rTSS по неделям</span><span class="l-pill">эта неделя: в норме</span></div>
+          <div class="l-bars">
+            <i style="--h:46%"></i><i style="--h:54%"></i><i style="--h:63%"></i><i style="--h:50%"></i><i style="--h:68%"></i><i class="high" style="--h:92%"></i><i class="now" style="--h:62%"></i>
+            <span class="l-usual" style="--u:60%"></span>
+          </div>
+          <div class="l-chart-foot"><span>неделя 3</span><span>пунктир — обычная неделя</span><span>неделя 9</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="l-section">
+      <div class="l-wrap l-split l-split-rev">
+        <div class="l-split-text">
+          <p class="l-eyebrow">ИИ-тренер</p>
+          <h2 class="l-display l-h2">Тренер, который видит ваш план</h2>
+          <p class="l-lead">Разговор по вашим данным: профиль, план и его выполнение, нагрузка, последние тренировки и забеги. Разбор тренировки — по кругам, пульсу и зонам. Правку плана применяете вы, прежняя версия остаётся.</p>
+        </div>
+        <div class="l-chat" aria-hidden="true">
+          <div class="l-msg mine">Разбери вчерашнюю темповую</div>
+          <div class="l-msg"><b>Вывод.</b> Отрезки ровные, но на третьем пульс вырос на 7 уд/мин — восстановление не успевает.</div>
+          <div class="l-proposal">
+            <span class="l-proposal-title">Корректировка плана · четверг</span>
+            <span><s>Интервалы 6×800</s> → <b>Лёгкий бег 8 км</b></span>
+            <span class="l-proposal-btn">Применить</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="l-coaches" class="l-section l-dark">
+      <div class="l-wrap">
+        <p class="l-eyebrow">Тренерам</p>
+        <h2 class="l-display l-h2">Работайте со спортсменом в одном плане</h2>
+        <div class="l-two">
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+            <h3>Тренер видит и делает</h3>
+            <p>План с отметками план/факт, журнал пробежек с кругами и пульсом, недельную нагрузку и историю плана. Правит недели, если спортсмен разрешил, — и с телефона тоже. Пишет спортсмену в общий диалог.</p>
+          </article>
+          <article class="l-card">
+            <svg class="l-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg>
+            <h3>Остаётся за спортсменом</h3>
+            <p>Профиль, старты и разборы с ИИ-тренером тренер не видит. Какой план активный и что в архиве, решает спортсмен. Доступ он даёт и снимает сам.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="l-start" class="l-section">
+      <div class="l-wrap">
+        <p class="l-eyebrow">Как начать</p>
+        <h2 class="l-display l-h2">Три шага до старта</h2>
+        <ol class="l-steps">
+          <li><b>Войдите через Google</b><span>Без паролей и отдельной регистрации.</span></li>
+          <li><b>Дождитесь одобрения</b><span>Администратор откроет доступ к приложению.</span></li>
+          <li><b>Загрузите план и пробежку</b><span>План — из CSV или JSON, пробежки — .FIT или CSV из Garmin либо вручную.</span></li>
+        </ol>
+        <ul class="l-trust">
+          <li>Данные каждого пользователя изолированы</li>
+          <li>Каждая правка — новая версия</li>
+          <li>Ничего не удаляется насовсем</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="l-cta l-dark">
+      <div class="l-wrap">
+        <h2 class="l-display">Готовы к <span class="l-accent">старту?</span></h2>
+        <p class="l-lead">Работает в браузере — на компьютере и телефоне, без установки.</p>
+        <div class="l-gsi l-gsi-large" data-gsi-button="large"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="l-foot">
+    <div class="l-wrap"><span class="l-logo"><svg class="l-mark" aria-hidden="true"><use href="#rt-mark"/></svg>Running Tracker</span><span>Разработано компанией Abgus Software</span></div>
+  </footer>
+</div>
+
+<!-- Заставка (#65): вошедшему, пока сервер подтверждает доступ -->
+<div id="splash-screen" class="login-screen">
   <div class="login-card">
+    <svg class="rt-mark" aria-hidden="true"><use href="#rt-mark"/></svg>
     <h2>Running Tracker</h2>
-    <p>Полумарафон 09.08.2026</p>
-    <div id="g_id_onload"
-         data-client_id="463368957110-f1649h2mjd1hbkj5307jllcv3e0hslbc.apps.googleusercontent.com"
-         data-callback="handleCredentialResponse"
-         data-auto_select="true"
-         data-use_fedcm_for_prompt="true">
-    </div>
-    <div class="g_id_signin"
-         data-type="standard"
-         data-shape="pill"
-         data-theme="outline"
-         data-text="sign_in_with"
-         data-size="large">
-    </div>
+    <p>Загрузка…</p>
   </div>
 </div>
 
 <!-- Экран: заявка на рассмотрении -->
 <div id="pending-screen" class="login-screen">
   <div class="login-card">
+    <svg class="rt-mark" aria-hidden="true"><use href="#rt-mark"/></svg>
     <h2>⏳ Заявка на рассмотрении</h2>
     <p>Ваш доступ ожидает одобрения администратором. Загляните позже.</p>
     <button class="btn-sm" onclick="signOut()">Выйти</button>
@@ -45,6 +232,7 @@
 <!-- Экран: доступ отклонён -->
 <div id="rejected-screen" class="login-screen">
   <div class="login-card">
+    <svg class="rt-mark" aria-hidden="true"><use href="#rt-mark"/></svg>
     <h2>⛔ Доступ отклонён</h2>
     <p>Администратор отклонил вашу заявку. Если это ошибка — свяжитесь с ним.</p>
     <button class="btn-sm" onclick="signOut()">Выйти</button>
@@ -919,6 +1107,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=49"></script>
+<script src="app.js?v=50"></script>
 </body>
 </html>
