@@ -15,6 +15,16 @@
 
 ## Возможности
 
+### Стартовая страница
+- Новый посетитель видит описание возможностей и кнопку «Войти через Google»;
+  приложение открывается после входа. Новый пользователь попадает «на
+  рассмотрение» — страница предупреждает об этом заранее.
+- **One Tap** сам предлагает вход только тому, кто уже входил на этом
+  устройстве: истёк часовой токен — вход возвращается без лишних кликов.
+  После «Выйти» окно не всплывает.
+- Вошедший со свежим токеном видит заставку, пока сервер подтверждает доступ,
+  а не стартовую страницу.
+
 ### Планы тренировок
 - **Несколько планов на пользователя** — переключатель на вкладке «План»,
   архивирование, отдельная гонка (название, дата, целевое время, старт плана)
@@ -185,7 +195,7 @@
 
 ```
 GitHub Pages (prod) / Cloudflare Pages (dev)
-        index.html + app.js + style.css
+        index.html + app.js + style.css + landing.css
                     ↓  REST + Bearer <Google ID token>
         Cloud Run Function (Python 3.11)
              runs-api          runs-api-dev
@@ -209,8 +219,11 @@ main.py         точка входа Cloud Run Function
 ```
 
 - Фронтенд — vanilla JS без сборки; выбор API-эндпоинта по hostname.
-- Авторизация — Google Identity Services, бэкенд проверяет ID-токен и
+- Авторизация — Google Identity Services (JS-API: кнопки рисуются в
+  `[data-gsi-button]` стартовой страницы), бэкенд проверяет ID-токен и
   разграничивает данные по `sub` из токена.
+- Стартовая страница живёт в том же `index.html`; её стили — в `landing.css`,
+  чтобы `style.css` оставался стилями приложения.
 - Оффлайн — последние данные кэшируются в `localStorage`.
 
 ### Структура данных в GCS
@@ -269,7 +282,7 @@ config/llm/…                      конфиг и ключ LLM (только �
 
 ```bash
 git checkout Dev        # весь код пишется в Dev, в main — только merge
-python -m pytest -q     # 1160 тестов
+python -m pytest -q     # 1173 теста
 ```
 
 - Тесты не требуют доступа к GCP: `tests/conftest.py` подменяет
@@ -279,7 +292,7 @@ python -m pytest -q     # 1160 тестов
   (`.claude/agents/deep-tester.md`).
 - Фронтенд проверяется статически (баланс скобок, отсутствие
   конфликт-маркеров, cache-buster'ы) — Node в окружении нет.
-- При изменении `app.js` / `style.css` поднимайте `?v=N` в `index.html`,
+- При изменении `app.js` / `style.css` / `landing.css` поднимайте `?v=N` в `index.html`,
   иначе браузер отдаст старую версию из кэша.
 
 ### Деплой
@@ -327,6 +340,7 @@ Push в `Dev` → `runs-api-dev` + dev-bucket; push в `main` → `runs-api` +
 | [docs/tickets/46-ai-coach-chat.md](docs/tickets/46-ai-coach-chat.md) | ИИ-тренер: диалог, разбор тренировки, правки плана кнопкой |
 | [docs/tickets/60-coach-plan-editing.md](docs/tickets/60-coach-plan-editing.md) | Тренер создаёт и правит планы спортсмена: доступ, версии, уведомления |
 | [docs/tickets/66-weekly-load.md](docs/tickets/66-weekly-load.md) | Недельная нагрузка по темпу и пульсу: формулы, кэш, доступ тренера |
+| [docs/tickets/65-landing-page.md](docs/tickets/65-landing-page.md) | Стартовая страница: вход, One Tap для вернувшихся, состояния экранов |
 | [docs/garmin-csv-import-plan.md](docs/garmin-csv-import-plan.md) | Поддержка двух форматов Garmin CSV |
 | [docs/fit-upload-fixes.md](docs/fit-upload-fixes.md), [docs/fit-upload-two-step.md](docs/fit-upload-two-step.md) | Загрузка FIT: исправления и двухшаговый сценарий |
 | [docs/plan-import-format.md](docs/plan-import-format.md) | Формат файла плана (CSV/JSON) |
