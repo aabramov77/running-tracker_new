@@ -28,6 +28,7 @@ let myCoachPlanEdit = true; // #60: разрешено ли тренеру пр�
 let PLANS = [];             // все планы пользователя (#25)
 let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
 let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
+let LOAD = null;            // #66: нагрузка по темпу и пульсу — ответ GET /load
 
 // Google sub из JWT — только для namespace кэша (не для безопасности; сервер
 // сам проверяет подпись). Декодируем payload без верификации.
@@ -106,6 +107,7 @@ function handleCredentialResponse(response) {
 function signOut() {
   idToken = null; userSub = null; currentRole = null;
   aiReset();                  // #46: разборы прежнего пользователя — не следующему
+  LOAD = null;                // #66: и его нагрузка тоже
   localStorage.removeItem('g_id_token');
   hideAccessScreens();
   document.getElementById('login-screen').classList.add('active');
@@ -682,6 +684,7 @@ async function loadRunsFromCloud() {
     setStatus('✓ Синхронизировано с GCS');
     renderAll();
     loadCompliance();   // пробежки изменились — факт в таблице плана устарел
+    loadTrainingLoad(); // и нагрузка (#66)
   } catch (e) {
     isOnline = false;
     // Из кэша тоже фильтруем — на случай если кэш старый (до soft delete)
@@ -1146,9 +1149,10 @@ function renderToday() {
     </div>`;
   const recordBtn = `<button class="btn-primary" onclick="openAddSheet()">Записать</button>`;
   const planBtn = `<button class="btn-sm" onclick="showTab('plan')">Открыть план</button>`;
+  const loadHtml = todayLoadHtml();       // #66: и без плана тоже
 
   if (!PLAN?.length) {
-    el.innerHTML = hero(when, 'Плана пока нет', '', recordBtn + planBtn) + recentHtml;
+    el.innerHTML = hero(when, 'Плана пока нет', '', recordBtn + planBtn) + loadHtml + recentHtml;
     return;
   }
   // Недели, размеченные наугад, на «сегодня» не переводим: получилась бы
@@ -1156,7 +1160,7 @@ function renderToday() {
   if (!planIsDated()) {
     el.innerHTML = hero(when, 'У плана нет дат',
       'Заполните «Старт плана» в карточке гонки — здесь появится тренировка на сегодня.',
-      recordBtn + planBtn) + recentHtml;
+      recordBtn + planBtn) + loadHtml + recentHtml;
     return;
   }
 
@@ -1167,7 +1171,7 @@ function renderToday() {
     // После окна строки, но не последней: день попал в разрыв между неделями
     const title = date < start ? `План начнётся ${ddmm(start)}`
       : cw === PLAN.length - 1 ? 'План завершён' : 'На сегодня в плане нет недели';
-    el.innerHTML = hero(when, title, '', recordBtn + planBtn) + recentHtml;
+    el.innerHTML = hero(when, title, '', recordBtn + planBtn) + loadHtml + recentHtml;
     return;
   }
 
@@ -1202,7 +1206,7 @@ function renderToday() {
         <div class="week-strip">${dots}</div>
       </div>`;
   }
-  el.innerHTML = heroHtml + stripHtml + recentHtml;
+  el.innerHTML = heroHtml + stripHtml + loadHtml + recentHtml;
 }
 
 function togglePlanEdit() {
@@ -1766,6 +1770,7 @@ async function saveRace() {
   try {
     await apiPostRace(race);
     await loadRacesFromCloud();
+    loadTrainingLoad();     // по забегам оценивается пороговый темп (#66)
     const msg = document.getElementById('race-save-msg');
     msg.style.display = 'inline';
     setTimeout(() => msg.style.display = 'none', 2500);
@@ -1792,6 +1797,7 @@ async function deleteRace(id) {
   try {
     await apiDeleteRace(id);
     await loadRacesFromCloud();
+    loadTrainingLoad();     // забег мог быть основанием порога (#66)
   } catch (e) {
     races = races.filter(r => r.id !== id);
     localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
@@ -1840,19 +1846,21 @@ function showRunDetail(id) {
     detailsUrl: `${API_URL}runs/${id}/details`,
     onDelete: () => { closeRunDetail(); deleteRun(id); },
     onAiReview: () => aiReviewRun(id),
+    load: LOAD && LOAD.runs ? LOAD.runs[String(id)] : null,    // #66
   });
 }
 
 // Карточка пробежки. Источник задаётся снаружи: своя пробежка или пробежка
 // спортсмена на экране тренера (#44) — там без onDelete и onAiReview, кнопки
 // скрыты: тренер чужую пробежку не скрывает и со своим ИИ её не разбирает.
-function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null }) {
+function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null, load = null }) {
   const typeLabels = {easy:'Лёгкий бег',interval:'Интервалы',tempo:'Темповый',
                       long:'Длительный',race:'Соревнование',recovery:'Восстановительный'};
   const feelLabels = {great:'Отлично 😊',good:'Хорошо 🙂',ok:'Нормально 😐',
                       hard:'Тяжело 😓',bad:'Плохо 😔'};
   const pace = parsePace(run.pace);
   const pc = pace ? (pace<4.8?'pace-good':pace<5.3?'pace-ok':'pace-off') : '';
+  const loadText = runLoadText(load);
   document.getElementById('rd-title').textContent =
     `${typeLabels[run.type] || run.type} · ${run.date}`;
   const rows = [
@@ -1861,6 +1869,7 @@ function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null }) 
     run.time  ? ['Время',        escapeHtml(run.time)]  : null,
     run.pace  ? ['Темп',         `<span class="${pc}">${escapeHtml(run.pace)}/км</span>`] : null,
     run.hr    ? ['Пульс',        `${escapeHtml(run.hr)} уд/мин`]   : null,
+    loadText  ? ['Нагрузка',     loadText] : null,               // #66
     ['Самочувствие', feelLabels[run.feel] || escapeHtml(run.feel)],
     run.notes ? ['Заметки',      `<span style="font-style:italic">${escapeHtml(run.notes)}</span>`] : null,
   ].filter(Boolean);
@@ -2074,6 +2083,300 @@ function renderCharts() {
                    weekChartConfig(n, planned, exact, actual));
   if(pChart)pChart.destroy();
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>String(r.date).slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
+  renderLoadCard('athlete');
+}
+
+// ── Нагрузка (#66) ──
+// Две оси: по темпу (rTSS, 100 = час на пороге) и по пульсу (TRIMP). Считает
+// бэкенд, здесь только показ. Карточка одна на спортсмена и тренера — у
+// тренера тот же ответ, но без порога и параметров профиля, и подсказки от
+// третьего лица.
+
+const LOAD_BAND_LABELS = { low: 'ниже обычного', ok: 'в норме', high: 'выше обычного', spike: 'резкий рост' };
+const LOAD_BAND_COLORS = { low: '#85B7EB', ok: '#1D9E75', high: '#EF9F27', spike: '#E24B4A' };
+const LOAD_COST_LABELS = { usual: 'как обычно', higher: 'дороже обычного', lower: 'дешевле обычного' };
+const LOAD_COST_HINTS = { usual: 'пульс как обычно при той же работе',
+                          higher: 'пульс выше обычного при той же работе',
+                          lower: 'пульс ниже обычного при той же работе' };
+const LOAD_AXES = { ext: { unit: 'rTSS', label: 'По темпу' }, int: { unit: 'TRIMP', label: 'По пульсу' } };
+const LOAD_VIEWS = {
+  athlete: { body: 'load-body', canvas: 'loadChart', axis: null, chart: null },
+  coach: { body: 'coach-load-body', canvas: 'coachLoadChart', axis: null, chart: null },
+};
+const LOAD_REFILL_TRIES = 3;    // сколько раз подряд дочитывать историю, пока сервер считает
+// Номер последнего запроса /load: запросы идут и после пробежек, и после
+// профиля, и после забегов, а ответ на более ранний не должен затереть свежий.
+let LOAD_SEQ = 0;
+
+function readLoadCache() {
+  try { return JSON.parse(localStorage.getItem(ck('running_tracker_load')) || 'null'); }
+  catch (e) { return null; }
+}
+
+// Сервер за вызов дочитывает не больше 60 пробежек. Осталось ещё — просим
+// снова, чтобы история посчиталась за один заход, а не за несколько.
+async function loadTrainingLoad(attempt = 0) {
+  const seq = ++LOAD_SEQ;
+  let fresh = false;
+  try {
+    const res = await fetch(API_URL + 'load', { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (seq !== LOAD_SEQ) return;           // пока шёл запрос, ушёл более свежий
+    LOAD = data;
+    fresh = true;
+    try { localStorage.setItem(ck('running_tracker_load'), JSON.stringify(LOAD)); } catch (e) {}
+  } catch (e) {
+    if (seq !== LOAD_SEQ) return;
+    // Нет связи — остаётся прошлый ответ из кэша.
+  }
+  renderToday();
+  if (document.getElementById('tab-stats').classList.contains('active')) renderLoadCard('athlete');
+  // Дочитываем историю, только пока сервер отвечает и говорит, что ещё считает:
+  // pending из кэша без связи — не повод слать запросы подряд.
+  if (fresh && LOAD.pending > 0 && attempt < LOAD_REFILL_TRIES) loadTrainingLoad(attempt + 1);
+}
+
+function loadViewData(view) { return view === 'coach' ? COACH.load : LOAD; }
+
+function loadRatioText(ratio) { return '×' + Number(ratio).toFixed(2).replace('.', ','); }
+
+function isoDdmm(iso) { return String(iso || '').slice(8, 10) + '.' + String(iso || '').slice(5, 7); }
+
+function loadAxesOf(load) {
+  return ['ext', 'int'].filter(a => ((a === 'ext' ? load.external : load.internal) || {}).method);
+}
+
+// Оценка периода по оси: «×1,31 · выше обычного» или «мало данных».
+function loadVerdictHtml(axis) {
+  if (!axis || !axis.band || !LOAD_BAND_LABELS[axis.band]) {
+    return '<span class="load-pill none">мало данных для сравнения</span>';
+  }
+  const band = axis.band;
+  const ratio = loadRatioText(axis.ratio);
+  return `<span class="load-pill ${band}">${ratio} · ${LOAD_BAND_LABELS[band]}</span>`;
+}
+
+function loadValueText(axis, unit) {
+  return `${axis.unknown ? 'не меньше ' : ''}${Number(axis.load)} ${unit}`;
+}
+
+function loadTileHtml(period, key) {
+  const axis = period && period[key];
+  if (!axis) return '';
+  const value = loadValueText(axis, LOAD_AXES[key].unit);
+  return `<div class="load-tile">
+      <div class="load-tile-label">${LOAD_AXES[key].label}, последние 7 дней</div>
+      <div class="load-tile-value">${value}</div>${loadVerdictHtml(axis)}
+    </div>`;
+}
+
+function loadCostTileHtml(load) {
+  if (!loadAxesOf(load).includes('ext') || !loadAxesOf(load).includes('int')) return '';
+  const cost = load.rolling && load.rolling.cost;
+  if (!cost || !LOAD_COST_LABELS[cost.band]) {
+    return `<div class="load-tile"><div class="load-tile-label">Цена работы</div>
+      <div class="load-tile-value">—</div>
+      <div class="load-tile-note">Нужны хотя бы 2 лёгкие или длительные пробежки за неделю и 4 за месяц до неё — с пульсом и темпом.</div></div>`;
+  }
+  const band = cost.band;
+  const pct = `${cost.dev_pct > 0 ? '+' : ''}${Number(cost.dev_pct)} %`;
+  return `<div class="load-tile"><div class="load-tile-label">Цена работы</div>
+      <div class="load-tile-value">${pct}</div>
+      <span class="load-pill cost-${band}">${LOAD_COST_LABELS[band]}</span>
+      <div class="load-tile-note">${LOAD_COST_HINTS[band]} — на лёгких и длительных</div></div>`;
+}
+
+// Чего не хватает и что ещё считается. Спортсмену — что заполнить, тренеру —
+// чего нет у спортсмена.
+function loadNotes(load, coach) {
+  const notes = [];
+  const axes = loadAxesOf(load);
+  if (!axes.includes('ext')) notes.push(coach
+    ? 'Нагрузки по темпу нет: спортсмен не указал пороговый темп, и результатов забегов нет.'
+    : 'Нагрузки по темпу нет: укажите пороговый темп в профиле или добавьте результат забега в «Стартах».');
+  if (!axes.includes('int')) notes.push(coach
+    ? 'Нагрузки по пульсу нет: у спортсмена не заполнены пульсовые данные.'
+    : 'Нагрузки по пульсу нет: укажите в профиле максимальный пульс или дату рождения.');
+  if (!coach && (load.internal || {}).method === 'edwards') {
+    notes.push('По пульсу считается по зонам. Укажите в профиле пульс покоя и пол — расчёт станет точнее.');
+  }
+  if (load.pending > 0) notes.push(coach
+    ? `Часть истории посчитается, когда спортсмен откроет приложение: ${Number(load.pending)} проб. пока по средним.`
+    : `Часть истории ещё считается: ${Number(load.pending)} проб. пока по средним — обновится сама.`);
+  return notes;
+}
+
+// Описываются только те оси, что есть. Порог спортсмену называется, тренеру — нет.
+function loadHowHtml(load, coach) {
+  const axes = loadAxesOf(load);
+  const lines = [];
+  if (axes.includes('ext')) {
+    const ext = load.external || {};
+    let threshold = 'Порог — пороговый темп спортсмена; сам он здесь не показывается.';
+    if (!coach) {
+      const basis = ext.threshold_basis;
+      const source = ext.threshold_source === 'manual' ? 'задан в профиле'
+        : basis ? `оценка по забегу ${escapeHtml(PB_LABELS[basis.dist_label] || basis.dist_label || '')} `
+                  + `${escapeHtml(basis.time || '')} от ${escapeHtml(basis.date || '')}`
+                  + (basis.stale ? ' — забег старше года, порог лучше указать в профиле' : '')
+        : 'оценка';
+      threshold = `Порог ${escapeHtml(ext.threshold_pace || '')}/км — ${source}.`;
+    }
+    lines.push(`rTSS — нагрузка по темпу с поправкой на уклон: 100 = час на пороговом темпе. ${threshold}`);
+  }
+  if (axes.includes('int')) lines.push((load.internal || {}).method === 'banister'
+    ? 'TRIMP — по пульсу, метод Банистера: учитывает резерв пульса от покоя до максимума.'
+    : 'TRIMP — по пульсовым зонам (метод Эдвардса): минуты в зоне × номер зоны.');
+  lines.push('«К обычной» — неделя против среднего за 4 предыдущие: 0,8–1,3 — в норме, выше 1,5 — резкий рост.');
+  if (axes.length === 2) lines.push('Цена работы — пульсовая нагрузка на единицу темповой на лёгких и '
+    + 'длительных пробежках: растёт при усталости, жаре, болезни.');
+  lines.push('Это ориентир, а не диагноз.');
+  return `<details class="load-how"><summary>Как считается</summary><div>${lines.join('<br>')}</div></details>`;
+}
+
+function loadTooltipLines(week, key) {
+  const axis = week[key];
+  if (!axis) return [];
+  const lines = [loadValueText(axis, LOAD_AXES[key].unit)];
+  if (week.partial) lines.push('неделя идёт — оценки пока нет');
+  else if (axis.band) lines.push(`${loadRatioText(axis.ratio)} к обычной (${axis.chronic}) — ${LOAD_BAND_LABELS[axis.band] || ''}`);
+  else lines.push('мало данных для сравнения');
+  if (axis.unknown) lines.push(`без данных: ${axis.unknown} проб. — не в счёт`);
+  const total = (week.easy || 0) + (week.moderate || 0) + (week.hard || 0);
+  if (week.easy !== null && week.easy !== undefined && total > 0) {
+    const pct = m => Math.round(m / total * 100);
+    lines.push(`лёгкая ${week.easy} мин (${pct(week.easy)} %) · средняя ${week.moderate} (${pct(week.moderate)} %) · высокая ${week.hard} (${pct(week.hard)} %)`);
+  }
+  return lines;
+}
+
+function loadChartConfig(load, key) {
+  const weeks = load.weeks || [];
+  const unit = LOAD_AXES[key].unit;
+  return {
+    type: 'bar',
+    data: {
+      labels: weeks.map(w => isoDdmm(w.start)),
+      datasets: [
+        { type: 'line', label: 'обычная', data: weeks.map(w => (w[key] && w[key].chronic) || null),
+          borderColor: '#888780', borderDash: [4, 3], borderWidth: 1.5, pointRadius: 0,
+          fill: false, spanGaps: false, order: 0 },
+        { label: unit, data: weeks.map(w => (w[key] ? w[key].load : 0)), borderRadius: 4, order: 1,
+          // Неделя идёт — бледнее; без оценки — серым.
+          backgroundColor: weeks.map(w => w.partial ? 'rgba(29,158,117,0.35)'
+            : (LOAD_BAND_COLORS[w[key] && w[key].band] || '#B4B2A9')) },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          // Неделя без обычной нагрузки — без пустой строки «обычная» в подсказке.
+          filter: item => item.dataset.type !== 'line' || !!item.parsed.y,
+          callbacks: {
+            title: items => { const w = weeks[items[0].dataIndex]; return `${isoDdmm(w.start)}–${isoDdmm(w.end)}`; },
+            label: ctx => ctx.dataset.type === 'line'
+              ? `обычная ${Math.round(ctx.parsed.y)} ${unit}`
+              : loadTooltipLines(weeks[ctx.dataIndex], key),
+          },
+        },
+      },
+      scales: { x: { ticks: { font: { size: 10 }, autoSkip: false, maxRotation: 45 } },
+                y: { beginAtZero: true } },
+    },
+  };
+}
+
+function setLoadAxis(view, key) {
+  LOAD_VIEWS[view].axis = key;
+  renderLoadCard(view);
+}
+
+function destroyLoadChart(view) {
+  const cfg = LOAD_VIEWS[view];
+  if (cfg.chart) { cfg.chart.destroy(); cfg.chart = null; }
+}
+
+function renderLoadCard(view) {
+  const cfg = LOAD_VIEWS[view];
+  const el = document.getElementById(cfg.body);
+  if (!el) return;
+  destroyLoadChart(view);
+  const coach = view === 'coach';
+  const load = loadViewData(view);
+  if (!load) {
+    el.innerHTML = `<div class="empty">${coach && COACH.loadError ? 'Не удалось загрузить нагрузку' : 'Загрузка…'}</div>`;
+    return;
+  }
+  const axes = loadAxesOf(load);
+  const notes = loadNotes(load, coach).map(n => `<p class="hint load-note">${escapeHtml(n)}</p>`).join('');
+  if (!axes.length) {
+    el.innerHTML = `<div class="empty">Нагрузку пока не из чего посчитать.</div>${notes}`;
+    return;
+  }
+  const key = axes.includes(cfg.axis) ? cfg.axis : axes[0];
+  cfg.axis = key;
+  const toggle = axes.length > 1 ? `<div class="load-axis">${axes.map(a =>
+      `<button class="btn-sm scope-btn${a === key ? ' active' : ''}" onclick="setLoadAxis('${view}', '${a}')">${LOAD_AXES[a].label} · ${LOAD_AXES[a].unit}</button>`).join('')}</div>` : '';
+  const canvasId = cfg.canvas;
+  const tiles = loadTileHtml(load.rolling, 'ext') + loadTileHtml(load.rolling, 'int') + loadCostTileHtml(load);
+  const legend = Object.entries(LOAD_BAND_LABELS).map(([band, label]) =>
+      `<span><i style="background:${LOAD_BAND_COLORS[band]}"></i>${label}</span>`).join('')
+    + '<span><i style="background:#B4B2A9"></i>мало данных</span>'
+    + '<span><i style="background:rgba(29,158,117,0.35)"></i>неделя идёт</span>'
+    + '<span>- - - обычная</span>';
+  el.innerHTML = `<div class="load-head">
+      <div class="load-sub">Все пробежки, недели пн–вс. Пунктир — обычная нагрузка: среднее за 4 предыдущие недели.</div>
+      ${toggle}
+    </div>
+    <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
+    <div class="load-legend">${legend}</div>
+    <div class="load-tiles">${tiles}</div>
+    ${notes}${loadHowHtml(load, coach)}`;
+  cfg.chart = new Chart(document.getElementById(cfg.canvas).getContext('2d'), loadChartConfig(load, key));
+}
+
+// Строка «Нагрузка» в карточке пробежки: «62 rTSS · ≈ 89 TRIMP».
+function runLoadText(load) {
+  if (!load) return '';
+  const parts = [];
+  if (load.ext !== null && load.ext !== undefined) parts.push(`${load.ext_est ? '≈ ' : ''}${Number(load.ext)} rTSS`);
+  if (load.int !== null && load.int !== undefined) parts.push(`${load.int_est ? '≈ ' : ''}${Number(load.int)} TRIMP`);
+  return parts.join(' · ');
+}
+
+// Основная ось нагрузки: темп, без порога — пульс; null — считать нечего.
+function loadMainAxis(period) {
+  if (!period) return null;
+  return period.ext ? 'ext' : (period.int ? 'int' : null);
+}
+
+// «Сегодня»: нагрузка за 7 дней. Основная ось — темп, без порога — пульс.
+// Цена работы — отдельной строкой и только когда она заметно отклонилась.
+function todayLoadHtml() {
+  const period = LOAD && LOAD.rolling;
+  const key = loadMainAxis(period);
+  if (!key) return '';
+  const axis = period[key];
+  const of = key === 'ext' ? 'по темпу' : 'по пульсу';
+  const value = loadValueText(axis, LOAD_AXES[key].unit);
+  const usual = axis.chronic ? ` · обычно около ${Number(axis.chronic)}` : '';
+  const cost = period.cost;
+  const costBand = cost && (cost.band === 'higher' || cost.band === 'lower') ? cost.band : null;
+  const costPct = costBand ? `${cost.dev_pct > 0 ? '+' : ''}${Number(cost.dev_pct)} %` : '';
+  const costLine = costBand
+    ? `<div class="load-cost-line ${costBand}">♥ ${LOAD_COST_HINTS[costBand]}: ${costPct}</div>` : '';
+  return `<div class="card load-today" onclick="showTab('stats')" style="cursor:pointer">
+      <div class="card-title" style="margin:0 0 6px">Нагрузка за 7 дней</div>
+      <div class="load-verdict">${loadVerdictHtml(axis)}</div>
+      <div class="hint" style="margin:4px 0 0">${of} ${value}${usual}</div>
+      ${costLine}
+      <div class="load-more">Подробнее в «Прогрессе» ›</div>
+    </div>`;
 }
 
 // ── LLM Settings ──────────────────────────────────────────────────────────────
@@ -2122,7 +2425,7 @@ const PROFILE_FIELD_LABELS = {
   weekly_km_typical: 'Обычный объём', sessions_per_week: 'Тренировок в неделю',
   long_run_day: 'День длительной', available_days: 'Доступные дни',
   injuries: 'Травмы и ограничения', notes: 'Заметки',
-  hr_zones_custom: 'Пульсовые зоны',
+  hr_zones_custom: 'Пульсовые зоны', threshold_pace_sec: 'Пороговый темп',
 };
 
 const PB_LABELS = {'4.2km':'4,2 км','5km':'5 км','10km':'10 км','HM':'Полумарафон','M':'Марафон'};
@@ -2154,6 +2457,21 @@ function fillProfileForm(profile) {
   const starts = profile.hr_zones_custom;
   PROFILE_ZONES_MANUAL = Array.isArray(starts) && starts.length === ZONE_INPUT_IDS.length;
   fillZoneInputs(PROFILE_ZONES_MANUAL ? starts : null);
+  // #66: хранится в секундах на км, вводится и показывается как «м:сс»
+  const pace = profile.threshold_pace_sec;
+  document.getElementById('pr-threshold-pace').value = pace > 0 ? secondsToTime(pace) : '';
+}
+
+// Подсказка у порогового темпа: оценка по «Стартам» — видна и при ручном пороге.
+function renderThresholdHint() {
+  const el = document.getElementById('pr-threshold-hint');
+  const auto = PROFILE_DERIVED && PROFILE_DERIVED.threshold_pace_auto;
+  const basis = auto && auto.basis;
+  el.textContent = basis
+    ? `Оценка ${secondsToTime(auto.pace_sec)}/км — по забегу ${PB_LABELS[basis.dist_label] || basis.dist_label} `
+      + `${basis.time} от ${basis.date}${basis.stale ? ' (забег старше года)' : ''}. `
+      + 'Оставьте поле пустым, чтобы нагрузка считалась по оценке.'
+    : 'Темп, который вы держите около часа. Не знаете — добавьте результат забега в «Стартах», и он оценится сам.';
 }
 
 function collectProfileForm() {
@@ -2164,6 +2482,7 @@ function collectProfileForm() {
   body.available_days = profileDayBoxes().filter(cb => cb.checked).map(cb => cb.value);
   // null — зоны считает сервер. Поле шлём всегда: POST заменяет профиль целиком.
   body.hr_zones_custom = PROFILE_ZONES_MANUAL ? zoneInputs().map(input => input.value.trim()) : null;
+  body.threshold_pace_sec = document.getElementById('pr-threshold-pace').value.trim();   // «м:сс» (#66)
   return body;
 }
 
@@ -2272,6 +2591,7 @@ function applyProfileResponse(data) {
   PROFILE_DERIVED = data.derived || null;
   renderProfileDerived();
   renderHrZones();
+  renderThresholdHint();
   renderPersonalBests(data.personal_bests);
   const label = document.getElementById('profile-version');
   label.textContent = data.version
@@ -2335,6 +2655,7 @@ async function saveProfile() {
     if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
     applyProfileResponse(data);
     flashProfileMsg('✓ Сохранено', true);
+    loadTrainingLoad();   // зоны, пульс покоя и порог меняют нагрузку (#66)
   } catch (e) {
     flashProfileMsg('⚠ ' + e.message, false);
   } finally {
@@ -3072,8 +3393,13 @@ const COACH = { athletes: [], athlete: null, plans: [], activePlanId: null, plan
                 raceForm: null,
                 // План неделей на телефоне (#62): показанная неделя (null — текущая),
                 // для какого плана она выбрана, и открытый в листе день.
-                weekIdx: null, weekPlanId: null, dayEdit: null };
+                weekIdx: null, weekPlanId: null, dayEdit: null,
+                // Нагрузка (#66): открытого спортсмена и отметки списка
+                // {sub: {at, data, promise}}, см. coachCachedLoad.
+                load: null, loadError: false, loads: {} };
 let coachChart = null;
+// Отметки нагрузки в списке живут столько, потом перечитываются (#66).
+const COACH_LOAD_TTL_MS = 5 * 60 * 1000;
 
 function coachUrl(tail) {
   return `${API_URL}coach/athletes/${encodeURIComponent(COACH.athlete.sub)}/${tail}`;
@@ -3602,13 +3928,68 @@ async function loadCoachAthletes() {
     el.innerHTML = COACH.athletes.length
       // В onclick идёт индекс, а не sub: так в разметку не попадает чужая строка.
       ? COACH.athletes.map((a, i) => `<div class="run-item" onclick="openCoachAthlete(${i})" style="cursor:pointer">
-          <div class="run-info"><div class="run-title">${escapeHtml(a.name)} ${a.unread ? `<span class="nav-badge" title="Непрочитанные сообщения">${Number(a.unread)}</span>` : ''}</div></div>
+          <div class="run-info"><div class="run-title">${escapeHtml(a.name)} ${a.unread ? `<span class="nav-badge" title="Непрочитанные сообщения">${Number(a.unread)}</span>` : ''}<span class="coach-load-badges" id="coach-load-${i}"></span></div></div>
           <span class="btn-sm" style="flex-shrink:0">Открыть →</span>
         </div>`).join('')
       : '<div class="empty">Пока никто не выбрал вас тренером. Спортсмен делает это в своём Профиле.</div>';
   } catch (e) {
     el.innerHTML = '<div class="empty">Ошибка загрузки</div>';
+    return;
   }
+  coachLoadBadges();
+}
+
+// Отметки нагрузки за 7 дней (#66). Список показывается сразу, отметки
+// догружаются по одной: ждать N запросов перед показом списка незачем.
+function coachLoadBadges() {
+  COACH.athletes.forEach((athlete, i) => {
+    coachCachedLoad(athlete.sub)
+      .then(data => coachShowLoadBadge(i, athlete, data))
+      .catch(() => {});      // нет отметки — список от этого не ломается
+  });
+}
+
+// Нагрузка спортсмена из COACH.loads, пока свежая, иначе — новый запрос.
+// Промис кладётся в кэш сразу: список, открытый повторно, пока запрос в пути,
+// ждёт его же. Упавший запрос из кэша убирается — следующий спросит заново.
+function coachCachedLoad(sub) {
+  const cached = COACH.loads[sub];
+  if (cached && Date.now() - cached.at < COACH_LOAD_TTL_MS) return cached.promise;
+  const entry = { at: Date.now(), data: null };
+  entry.promise = coachFetchLoad(sub).then(data => {
+    Object.assign(entry, { at: Date.now(), data });
+    return data;
+  }, e => {
+    if (COACH.loads[sub] === entry) COACH.loads[sub] = null;
+    throw e;
+  });
+  COACH.loads[sub] = entry;
+  return entry.promise;
+}
+
+// Нагрузка спортсмена из списка: без coachGet, потому что спортсмен ещё не
+// открыт, и без закрытия экрана при 403 — пропадёт только отметка.
+async function coachFetchLoad(sub) {
+  const res = await fetch(`${API_URL}coach/athletes/${encodeURIComponent(sub)}/load`, { headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function coachShowLoadBadge(i, athlete, data) {
+  const el = document.getElementById(`coach-load-${i}`);
+  if (el && COACH.athletes[i] === athlete) el.innerHTML = coachLoadBadgeHtml(data);
+}
+
+function coachLoadBadgeHtml(load) {
+  const period = load && load.rolling;
+  const key = loadMainAxis(period);
+  if (!key) return '';
+  const cost = period.cost;
+  const costBand = cost && (cost.band === 'higher' || cost.band === 'lower') ? cost.band : null;
+  const costPct = costBand ? `цена ${cost.dev_pct > 0 ? '+' : ''}${Number(cost.dev_pct)} %` : '';
+  return loadVerdictHtml(period[key])
+    + (costBand ? `<span class="load-pill cost-${costBand}">${costPct}</span>` : '');
 }
 
 // Что показывать на вкладке: спортсмену — диалог с тренером, тренеру — список
@@ -3639,14 +4020,17 @@ async function openCoachAthlete(index) {
   coachStopEdit();
   coachCloseRaceForm();
   coachFlash('');
+  const cachedLoad = COACH.loads[athlete.sub];
   Object.assign(COACH, { athlete, plans: [], activePlanId: null, planId: null, weeks: [],
                          base: null, compliance: null, runs: [], runScope: 'plan',
-                         weekIdx: null, weekPlanId: null, error: 'Загрузка…' });
+                         weekIdx: null, weekPlanId: null, error: 'Загрузка…',
+                         load: cachedLoad ? cachedLoad.data : null, loadError: false });
   chatClose('my');
   syncCoachTab();
   document.getElementById('coach-athlete-name').textContent = athlete.name;
   renderCoachAthlete();
   chatOpen('coach');
+  coachLoadOpen(athlete);     // #66: от плана не зависит — грузится отдельно
   try {
     const [index_, runs_] = await Promise.all([coachGet('plans'), coachGet('runs')]);
     if (COACH.athlete !== athlete) return;          // успели открыть другого
@@ -3697,12 +4081,29 @@ function coachPickPlan(planId) {
   selectCoachPlan(planId);
 }
 
+// Нагрузка открытого спортсмена (#66): из списка показана сразу, здесь — свежая.
+async function coachLoadOpen(athlete) {
+  try {
+    const data = await coachGet('load');
+    if (COACH.athlete !== athlete) return;              // успели открыть другого
+    COACH.load = data;
+    COACH.loads[athlete.sub] = { at: Date.now(), data, promise: Promise.resolve(data) };
+  } catch (e) {
+    if (e.accessLost || COACH.athlete !== athlete) return;
+    COACH.loadError = !COACH.load;
+  }
+  renderCoachHeader();
+  renderLoadCard('coach');
+}
+
 function closeCoachAthlete() {
   chatClose('coach');
   coachStopEdit();
   coachCloseRaceForm();
   coachCloseDay();
   COACH.athlete = null;
+  COACH.load = null;
+  destroyLoadChart('coach');
   if (coachChart) { coachChart.destroy(); coachChart = null; }
   openCoachTab();
 }
@@ -3717,10 +4118,23 @@ function setCoachRunScope(scope) {
   renderCoachRunLog();
 }
 
+// «нагрузка 7 дней: в норме ×1,12» — для сводки над планом (#66).
+function coachLoadSummary() {
+  const period = COACH.load && COACH.load.rolling;
+  const key = loadMainAxis(period);
+  const axis = key && period[key];
+  if (!axis || !LOAD_BAND_LABELS[axis.band]) return '';
+  return `нагрузка 7 дней: ${LOAD_BAND_LABELS[axis.band]} ${loadRatioText(axis.ratio)}`;
+}
+
 function coachSummaryText() {
   if (COACH.error) return COACH.error;
+  const loadPart = coachLoadSummary();
   const plan = COACH.plans.find(p => p.id === COACH.planId);
-  if (!plan) return COACH.plans.length ? '' : 'У спортсмена пока нет плана.';
+  if (!plan) {
+    const head = COACH.plans.length ? '' : 'У спортсмена пока нет плана.';
+    return [head, loadPart].filter(Boolean).join(' · ');
+  }
   const parts = [];
   if (plan.race_date) parts.push(`старт ${plan.race_date}`);
   if (plan.target_time) parts.push(`цель ${plan.target_time}`);
@@ -3738,6 +4152,7 @@ function coachSummaryText() {
       parts.push('у плана нет дат — сравнение с фактом недоступно');
     }
   }
+  if (loadPart) parts.push(loadPart);
   return parts.join(' · ');
 }
 
@@ -3747,6 +4162,7 @@ function renderCoachAthlete() {
   renderCoachPlanTable();
   renderCoachPlanWeek();
   renderCoachChart();
+  renderLoadCard('coach');
   renderCoachRunLog();
 }
 
@@ -3856,7 +4272,8 @@ function renderCoachRunLog() {
 function showCoachRunDetail(id) {
   const run = COACH.runs.find(r => r.id === id);
   if (!run || !COACH.athlete) return;
-  openRunDetail(run, { detailsUrl: coachUrl(`runs/${id}/details`) });
+  openRunDetail(run, { detailsUrl: coachUrl(`runs/${id}/details`),
+                       load: COACH.load && COACH.load.runs ? COACH.load.runs[String(id)] : null });
 }
 
 // ── Чат тренера и спортсмена (#44) ──
@@ -4105,6 +4522,7 @@ async function userAction(action, sub) {
 function renderAll(){renderMetrics();renderLog();renderPlan();}
 
 function initApp() {
+  LOAD = readLoadCache();     // #66: пока сервер считает — прошлый ответ этого пользователя
   showTab(homeTab());
   const today = new Date().toISOString().slice(0, 10);
   document.getElementById('f-date').value = today;

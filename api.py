@@ -19,7 +19,7 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      LLMTruncated, PlansIndexBusy, PlanStale, RegistrationClosed, UsageBusy,
-                     _fmt_duration, _fmt_pace,
+                     _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
@@ -30,7 +30,8 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      clean_effort, clean_plan_meta, clean_plan_weeks,
                      clean_proposal, clean_race, clean_run,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
-                     compute_athlete_derived, create_ai_thread, create_plan,
+                     athlete_derived, build_training_load, coach_load_view,
+                     create_ai_thread, create_plan,
                      current_coach, find_own_run, find_plan, get_active_plan,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
@@ -266,6 +267,14 @@ def h_coach_run_details(c):
                                  include_deleted=False)
 
 
+def h_coach_load(c):
+    """Нагрузка спортсмена (#66): хватает права на просмотр. Тренер кэш не
+    дозаполняет (fill_limit=0) и получает ответ без порога и параметров
+    профиля — его собирает белый список coach_load_view."""
+    athlete = _coached_athlete(c)
+    return jresp(coach_load_view(build_training_load(c.bucket, athlete, fill_limit=0)), 200)
+
+
 # ── Тренер (#60): правка планов спортсмена ────────────────────────────────────
 # Пишется то же, что пишет сам спортсмен: реестр планов и версии недель. Плюс
 # автор в каждой записи и сообщение спортсмену в общий чат. Активный план и
@@ -451,7 +460,7 @@ def h_parse_fit(c):
         "fit_token": token,
         "date": parsed.get("date"),
         "dist": summary.get("dist_km"),
-        "time": _fmt_duration(summary.get("duration_sec")),
+        "time": format_duration(summary.get("duration_sec")),
         "pace": _fmt_pace(summary.get("avg_pace_sec_per_km")),
         "hr": summary.get("avg_hr"),
         "max_hr": summary.get("max_hr"),
@@ -737,9 +746,10 @@ def h_profile_history(c):
 
 
 def profile_response(bucket, sub, profile, version, updated_at):
+    races = read_races(bucket, sub)
     return {"profile": profile,
-            "derived": compute_athlete_derived(profile),
-            "personal_bests": personal_bests(read_races(bucket, sub)),
+            "derived": athlete_derived(profile, races),
+            "personal_bests": personal_bests(races),
             "version": version,
             "updated_at": updated_at}
 
@@ -753,9 +763,16 @@ def h_profile_post(c):
     # Профиль приходит в поле profile либо плоским телом. Что-то кроме объекта
     # в profile — ошибка, а не повод взять вместо него тело.
     raw = body.get("profile")
-    profile, errors = clean_athlete_profile(body if raw is None else raw)
+    source = body if raw is None else raw
+    profile, errors = clean_athlete_profile(source)
     if errors:
         return validation_failed(errors)
+    # Клиент до #66 поля порога не знает, а POST заменяет профиль целиком:
+    # без этого сохранение из старой вкладки молча стёрло бы порог. Явный
+    # null или пустая строка по-прежнему его сбрасывают.
+    if isinstance(source, dict) and "threshold_pace_sec" not in source:
+        profile["threshold_pace_sec"] = \
+            read_athlete_profile(c.bucket, c.sub)[0].get("threshold_pace_sec")
     payload = write_athlete_version(
         c.bucket, c.sub, profile,
         change_reason=clean_change_reason(body.get("change_reason")),
@@ -937,6 +954,12 @@ def h_runs_get(c):
     return jresp(active, 200)
 
 
+def h_load(c):
+    # Нагрузка по двум осям (#66) — только своя: пользователь из токена,
+    # параметров, меняющих, чьи данные читать, у маршрута нет.
+    return jresp(build_training_load(c.bucket, c.sub), 200)
+
+
 def h_runs_post(c):
     body = c.body()
     if not body:
@@ -1024,12 +1047,14 @@ ROUTES = [
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/load$",                      h_coach_load,            False),
     ("GET",    r"^/coach/athletes/([\w-]+)/chat$",                      h_coach_chat_get,        False),
     ("POST",   r"^/coach/athletes/([\w-]+)/chat$",                      h_coach_chat_post,       False),
     ("POST",   r"^/coach/athletes/([\w-]+)/chat/read$",                 h_coach_chat_read,       False),
 
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
+    ("GET",    r"^/load$",                       h_load,                 False),
 
     ("GET",    r"^/config/llm$",                 h_llm_config_get,       True),
     ("POST",   r"^/config/llm$",                 h_llm_config_post,      True),

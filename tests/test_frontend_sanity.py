@@ -576,7 +576,7 @@ def test_coach_screen_keeps_out_of_own_data():
     assert "showCoachRunDetail" in section, "секция тренера найдена не целиком"
     assert "localStorage" not in section
     for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races",
-                "dayEdit", "planWeekIdx", "planWeekPlanId"):
+                "dayEdit", "planWeekIdx", "planWeekPlanId", "LOAD"):
         assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"
     # и чужой план не уходит в свои функции записи (#60) и свой лист дня (#62)
     for own_write in ("postPlanWeeks", "savePlanEdits", "rememberPlan", "loadPlan()",
@@ -946,3 +946,127 @@ def test_coach_day_edit_handles_a_stale_plan_and_a_revoked_permission():
     assert "coachPlanEditable()" in _js_section(js, "function coachOpenDay(", "\n}\n")
     assert "onDay ?" in _js_section(js, "function planWeekHtml(", "\n}\n")
     assert ".pw-day[onclick]" in STYLE.read_text(encoding="utf-8")
+
+
+# ── Нагрузка по темпу и пульсу (#66) ─────────────────────────────────────────
+
+def _fn(js, name):
+    return _js_section(js, f"function {name}(", "\n}\n")
+
+
+def test_load_card_is_shared_by_athlete_and_coach():
+    """Карточка одна: спортсмен и тренер видят одно и то же, а не две копии,
+    которые со временем разойдутся."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "renderLoadCard('athlete')" in _fn(js, "renderCharts")
+    assert "renderLoadCard('athlete')" in _fn(js, "loadTrainingLoad")
+    assert "renderLoadCard('coach')" in _fn(js, "renderCoachAthlete")
+    assert "renderLoadCard('coach')" in _fn(js, "coachLoadOpen")
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="load-body"' in html and 'id="coach-load-body"' in html
+    # тренеру — подсказки от третьего лица, и порог он не видит
+    how = _fn(js, "loadHowHtml")
+    assert "if (!coach) {" in how and "escapeHtml(ext.threshold_pace" in how
+
+
+def test_load_help_describes_only_the_axes_that_exist():
+    """Без порога спортсмен не читает текст для тренера, без зон — про TRIMP."""
+    how = _fn(APP_JS.read_text(encoding="utf-8"), "loadHowHtml")
+    ext, rest = how.split("if (axes.includes('ext')) {", 1)[1].split("if (axes.includes('int'))", 1)
+    assert "rTSS —" in ext and "rTSS —" not in rest
+    assert "TRIMP —" in rest.split("lines.push('«К обычной»")[0]
+    assert "if (axes.length === 2) lines.push('Цена работы" in how
+
+
+def test_threshold_field_takes_a_colon_on_phones():
+    """inputmode=numeric на телефоне прячет «:» — «4:35» не набрать."""
+    html = INDEX.read_text(encoding="utf-8")
+    field = re.search(r'<input[^>]*id="pr-threshold-pace"[^>]*>', html).group(0)
+    assert "inputmode" not in field and 'type="text"' in field
+
+
+def test_load_requests_do_not_overwrite_fresher_ones():
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _fn(js, "loadTrainingLoad")
+    assert body.count("if (seq !== LOAD_SEQ) return;") == 2
+    assert "if (fresh && LOAD.pending > 0 && attempt < LOAD_REFILL_TRIES)" in body
+
+
+def test_load_tooltip_skips_weeks_without_usual_load():
+    config = _fn(APP_JS.read_text(encoding="utf-8"), "loadChartConfig")
+    assert "filter: item => item.dataset.type !== 'line' || !!item.parsed.y" in config
+
+
+def test_load_axis_buttons_call_an_existing_handler():
+    js = APP_JS.read_text(encoding="utf-8")
+    card = _fn(js, "renderLoadCard")
+    assert "onclick=\"setLoadAxis('${view}', '${a}')\"" in card
+    assert re.search(r"^function setLoadAxis\(view, key\)", js, re.M)
+
+
+def test_run_card_takes_load_as_a_parameter():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null, load = null })" in js
+    assert "['Нагрузка',     loadText]" in _fn(js, "openRunDetail")
+    assert "load: LOAD && LOAD.runs ? LOAD.runs[String(id)] : null" in _fn(js, "showRunDetail")
+    assert "load: COACH.load && COACH.load.runs ? COACH.load.runs[String(id)] : null" in \
+        _fn(js, "showCoachRunDetail")
+
+
+def test_load_is_reloaded_after_runs_and_profile_change():
+    """Пробежки, профиль (зоны, пульс покоя, порог) и забеги меняют нагрузку."""
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("loadRunsFromCloud", "saveProfile", "saveRace", "deleteRace"):
+        assert "loadTrainingLoad();" in _fn(js, name), name
+    assert "LOAD = null;" in _fn(js, "signOut")
+    assert "LOAD = readLoadCache();" in _fn(js, "initApp")
+
+
+def test_load_cache_key_is_per_user():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "ck('running_tracker_load')" in _fn(js, "readLoadCache")
+    assert "ck('running_tracker_load')" in _fn(js, "loadTrainingLoad")
+    assert js.count("running_tracker_load") == 2
+
+
+def test_coach_load_goes_through_coach_get():
+    """Открытый спортсмен — через coachGet: при снятом доступе экран закроется,
+    как у остальных данных. Список — отдельным запросом без закрытия экрана."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "await coachGet('load')" in _fn(js, "coachLoadOpen")
+    assert "coach/athletes/${encodeURIComponent(sub)}/load" in _fn(js, "coachFetchLoad")
+    assert "API_URL + 'load'" not in _coach_section(js)
+
+
+def test_coach_list_does_not_refetch_load_on_every_render():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "coachCachedLoad(athlete.sub)" in _fn(js, "coachLoadBadges")
+    cached = _fn(js, "coachCachedLoad")
+    assert "COACH_LOAD_TTL_MS" in cached and "return cached.promise" in cached
+    # промис в кэше сразу, а упавший запрос из кэша убирается
+    assert "COACH.loads[sub] = entry;" in cached and "COACH.loads[sub] = null" in cached
+    assert js.count("coachFetchLoad(") == 2                 # определение и один вызов
+    assert js.count("coachLoadBadges();") == 1              # только при загрузке списка
+    assert "coachLoadBadges();" in _fn(js, "loadCoachAthletes")
+    for render in ("renderCoachAthlete", "renderCoachHeader", "renderLoadCard"):
+        assert "coachFetchLoad" not in _fn(js, render) and "coachGet('load')" not in _fn(js, render)
+
+
+def test_today_shows_load_with_and_without_a_plan():
+    js = APP_JS.read_text(encoding="utf-8")
+    today = _fn(js, "renderToday")
+    assert today.count("+ loadHtml + recentHtml") == 4
+    assert "showTab('stats')" in _fn(js, "todayLoadHtml")
+    # цена работы — только при заметном отклонении
+    assert "cost.band === 'higher' || cost.band === 'lower'" in _fn(js, "todayLoadHtml")
+
+
+def test_threshold_pace_field_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert 'id="pr-threshold-pace"' in html and 'id="pr-threshold-hint"' in html
+    assert "body.threshold_pace_sec = " in _fn(js, "collectProfileForm")
+    fill = _fn(js, "fillProfileForm")
+    assert "profile.threshold_pace_sec" in fill and "secondsToTime(pace)" in fill
+    assert "renderThresholdHint();" in _fn(js, "applyProfileResponse")
+    assert "threshold_pace_sec: 'Пороговый темп'" in js

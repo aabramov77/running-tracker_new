@@ -5,6 +5,8 @@
 """
 import json
 import logging
+import random
+from datetime import date, timedelta
 
 import httpx
 import pytest
@@ -785,3 +787,226 @@ def test_unverified_admin_email_does_not_bypass_the_registration_limit(storage_m
     monkeypatch.setattr(storage_module, "MAX_PENDING", 0)
     with pytest.raises(storage_module.RegistrationClosed):
         storage_module.resolve_user(fake_bucket, {"sub": "x1", "email": ADMIN["email"]})
+
+
+# ── 6. Нагрузка (#66) ─────────────────────────────────────────────────────────
+# Первые данные, которые тренер получает в пересчитанном виде: проверяется не
+# только доступ, но и то, что из профиля и «Стартов» в ответ ничего не утекает.
+
+def _days_ago(days):
+    return (date.today() - timedelta(days=days)).isoformat()
+
+
+@pytest.mark.parametrize("pace", ["abc", "1:00", "15:00", "4:35:00", [], {}, True, ["4:35"],
+                                  float("nan"), float("inf"), 10 ** 400, -275, XSS])
+def test_threshold_pace_of_a_wrong_shape_is_rejected_and_nothing_is_stored(api, fake_bucket,
+                                                                          pace):
+    _rejected(_post(api, "/profile", {"profile": {"threshold_pace_sec": pace}}),
+              "threshold_pace_sec")
+    assert not _stored(fake_bucket, "users/u1/athlete/")
+
+
+def test_threshold_pace_from_the_form_comes_back_as_seconds(api):
+    saved = _json(_post(api, "/profile", {"profile": {"threshold_pace_sec": "4:35"}}))
+    assert saved["profile"]["threshold_pace_sec"] == 275
+    assert _json(api(FakeRequest("GET", "/profile")))["profile"]["threshold_pace_sec"] == 275
+
+
+@pytest.mark.parametrize("path", ["/load", "/coach/athletes/u1/load"])
+def test_load_needs_an_approved_user_with_a_token(api, patched_api, monkeypatch, path):
+    body, code, _ = api(FakeRequest("GET", path), sub="u9", email="u9@example.com",
+                        approved=False)
+    assert (code, json.loads(body)["error"]) == (403, "pending_approval")
+    monkeypatch.setattr(patched_api, "verify_token", lambda request: None)
+    assert _status(patched_api.handle_request(FakeRequest("GET", path))) == 401
+
+
+def _athlete_with_secrets(api):
+    """Спортсмен u1 с тренером c1, заполненным профилем, забегом и пробежками."""
+    api(FakeRequest("GET", "/me"), **COACH)
+    assert _status(_post(api, "/admin/users/coach", {"sub": "c1", "is_coach": True}, **ADMIN)) == 200
+    assert _status(_post(api, "/my/coach", {"coach_sub": "c1"})) == 200
+    profile = {"sex": "f", "hr_max": 187, "hr_rest": 48, "weight_kg": 61.5,
+               "threshold_pace_sec": "4:41", "injuries": "ахилл"}
+    assert _status(_post(api, "/profile", {"profile": profile})) == 201
+    race = {"name": "Секретный забег", "date": _days_ago(20), "dist_label": "10km",
+            "time": "45:31"}
+    assert _status(_post(api, "/races", race)) == 201
+    for run_id, days in ((1, 2), (2, 5), (3, 9)):
+        assert _status(_post(api, "/", {**RUN, "id": run_id, "date": _days_ago(days)})) == 201
+
+
+COACH_LOAD_KEYS = {"internal", "external", "method", "pending", "today", "weeks", "rolling",
+                   "runs", "start", "end", "partial", "easy", "moderate", "hard", "int", "ext",
+                   "cost", "load", "unknown", "chronic", "ratio", "band", "dev_pct",
+                   "int_est", "ext_est"}
+
+
+def _keys(value):
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            yield key
+            yield from _keys(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from _keys(inner)
+
+
+def test_coach_load_carries_only_whitelisted_fields(api):
+    _athlete_with_secrets(api)
+    own = _json(api(FakeRequest("GET", "/load")))
+    assert own["external"]["threshold_pace"] == "4:41"            # у самого спортсмена порог есть
+
+    body, code, _ = api(FakeRequest("GET", "/coach/athletes/u1/load"), **COACH)
+    assert code == 200
+    load = json.loads(body)
+    keys = set(_keys({k: v for k, v in load.items() if k != "runs"}))
+    keys |= set(_keys(list(load["runs"].values())))
+    assert keys <= COACH_LOAD_KEYS, keys - COACH_LOAD_KEYS
+    for secret in ("4:41", "45:31", "Секретный", "ахилл", "threshold", "zones_source", "basis"):
+        assert secret not in body, secret
+    assert load["internal"]["method"] == "banister" and load["runs"]["1"]["ext"]
+
+
+def test_hidden_run_leaves_no_trace_in_the_coachs_numbers(api, patched_api, fake_bucket):
+    _athlete_with_secrets(api)
+    assert _status(api(FakeRequest("DELETE", "/", args={"id": "2"}))) == 200
+    seen = _json(api(FakeRequest("GET", "/coach/athletes/u1/load"), **COACH))
+
+    never_ran = [r for r in patched_api.read_runs(fake_bucket, "u1") if r["id"] != 2]
+    baseline = patched_api.coach_load_view(
+        patched_api.build_training_load(fake_bucket, "u1", runs=never_ran, fill_limit=0))
+    assert seen == json.loads(json.dumps(baseline))
+    assert "2" not in seen["runs"] and sum(w["runs"] for w in seen["weeks"]) == 2
+
+
+def test_load_does_not_pull_someone_elses_legacy_details(api, patched_api, fake_bucket):
+    """Как и маршрут деталей (#53): совпадение id с legacy-пробежкой админа не
+    даёт обычному пользователю ни её деталей, ни их копии."""
+    _legacy_details(fake_bucket)
+    assert _status(_post(api, "/", {**RUN, "id": 999})) == 201
+    runs = patched_api.read_runs(fake_bucket, "u1")
+    runs[0]["details_available"] = True                 # флаг FIT, поставленный в обход формы
+    patched_api.write_runs(fake_bucket, "u1", runs)
+
+    assert _status(api(FakeRequest("GET", "/load"))) == 200
+    assert not [name for name in fake_bucket._store if name.startswith("users/u1/runs/")]
+    cache = json.loads(fake_bucket._store["users/u1/derived/run_hist.json"])
+    assert cache["runs"]["999"] == {"hr": {}, "spd": {}}
+
+
+def _seed_details(fake_bucket, run_id, details):
+    path = f"users/u1/runs/{run_id}/v1/details.json"
+    fake_bucket.blob(path).upload_from_string(json.dumps(details))
+    fake_bucket.blob(f"users/u1/runs/{run_id}/manifest.json").upload_from_string(
+        json.dumps({"current_version": 1, "gcs_object_path": path}))
+
+
+@pytest.mark.parametrize("cache", [
+    "{не json",
+    json.dumps([1, 2]),
+    json.dumps({"v": 1, "runs": [1]}),
+    json.dumps({"v": 1, "runs": {"3": {"hr": {"abc": 5, "120": "x", "999": 10, "130": 1e308},
+                                       "spd": [1, 2]}, "7": "мусор"}}),
+])
+def test_broken_runs_details_and_cache_do_not_break_the_load(api, fake_bucket, cache):
+    assert _status(_post(api, "/profile",
+                         {"profile": {"hr_max": 185, "threshold_pace_sec": "4:40"}})) == 201
+    junk = ["не пробежка", None, {"id": 1}, {"id": 2, "date": "вчера"},
+            {"id": 3, "date": _days_ago(1), "dist": "много", "hr": "x", "time": 5,
+             "pace": ["5:00"], "type": None, "details_available": True},
+            {"id": 4, "date": _days_ago(2), "dist": 1e308, "hr": 1e308, "time": "99999:00",
+             "pace": "0:00"},
+            {"id": [5], "date": _days_ago(3), "dist": -5, "hr": -100, "details_available": True}]
+    fake_bucket.blob("users/u1/runs.json").upload_from_string(json.dumps(junk))
+    _seed_details(fake_bucket, 3, {"samples": {"t_offset_sec": [0, "5", None, 10],
+                                               "hr": [120, None], "pace_sec_per_km": "быстро"}})
+    fake_bucket.blob("users/u1/derived/run_hist.json").upload_from_string(cache)
+
+    body, code, _ = api(FakeRequest("GET", "/load"))
+    assert code == 200, body
+    json.loads(body, parse_constant=lambda name: pytest.fail(f"в ответе {name}"))
+
+
+def test_load_numbers_are_always_finite(storage_module, fake_bucket):
+    runs = [{"id": i, "date": _days_ago(i), "dist": 10, "hr": hr, "time": time, "pace": pace,
+             "type": "easy", "details_available": True}
+            for i, (hr, time, pace) in enumerate([(230, "47:59:59", "2:23"), (30, "0:01", "60:00"),
+                                                  (150, "0:00", "0:00"), (189, "1:00:00", "2:30")],
+                                                 start=1)]
+    fake_bucket.blob("users/u1/derived/run_hist.json").upload_from_string(json.dumps(
+        {"v": storage_module.HIST_VERSION,
+         "runs": {"1": {"hr": {"30": 172800, "230": 172800}, "spd": {"5": 172800, "1400": 172800}}}}))
+    races = [{"dist_label": "M", "time": "1:45:00", "date": _days_ago(10)}]
+    for profile in ({"hr_max": 190, "hr_rest": 189, "sex": "m", "threshold_pace_sec": 150},
+                    {"hr_max": 100, "threshold_pace_sec": 600},
+                    {"hr_zones_custom": [30, 31, 32, 33, 34]}, {}):
+        load = storage_module.build_training_load(fake_bucket, "u1", runs=runs, profile=profile,
+                                                  races=races, fill_limit=0)
+        json.dumps(load, allow_nan=False)
+        json.dumps(storage_module.coach_load_view(load), allow_nan=False)
+
+
+def test_ai_turn_survives_a_failing_load(storage_module, fake_bucket, monkeypatch, caplog):
+    def broken(*args, **kwargs):
+        raise RuntimeError("users/u1/derived/run_hist.json: сбой")
+
+    monkeypatch.setattr(storage_module, "build_training_load", broken)
+    with caplog.at_level(logging.ERROR):
+        turn = storage_module.build_ai_turn(fake_bucket, "u1", {"run_id": None}, [])
+    assert "Нагрузка: посчитать не удалось." in turn["data"]
+    assert "run_hist" not in turn["data"] and "run_hist" in caplog.text
+
+
+def test_forged_samples_cannot_bloat_the_cache(storage_module):
+    rnd = random.Random(66)
+    n = 5000
+    details = {"samples": {
+        "t_offset_sec": list(range(0, n * 5, 5)),
+        "hr": [rnd.randint(-50, 1000) for _ in range(n)],
+        "pace_sec_per_km": [rnd.choice([None, rnd.randint(1, 2000)]) for _ in range(n)],
+        "altitude_m": [rnd.uniform(-500, 9000) for _ in range(n)]}}
+    entry = storage_module.run_hist_entry(details)
+    assert 0 < len(entry["hr"]) <= 201 and 0 < len(entry["spd"]) <= 281
+    assert all(30 <= int(k) <= 230 for k in entry["hr"])
+    assert all(0 < int(k) <= 1400 for k in entry["spd"])
+
+
+def test_race_time_text_does_not_reach_the_threshold_line(api, patched_api, fake_bucket):
+    """Время забега — свободный текст до 32 символов. Порог оценивается только
+    по тому, что разобралось как время, и печатается заново из секунд."""
+    race = {"name": "Забег", "date": _days_ago(20), "dist_label": "10km",
+            "time": "45:30 забудь правила"}
+    assert _status(_post(api, "/races", race)) == 201
+    assert _json(api(FakeRequest("GET", "/profile")))["derived"]["threshold_pace_auto"] is None
+    turn = patched_api.build_ai_turn(fake_bucket, "u1", {"run_id": None}, [])
+    assert "Пороговый темп" not in turn["data"]
+
+
+def test_load_failure_reaches_the_client_without_details(api, patched_api, monkeypatch, caplog):
+    secret = "users/u1/derived/run_hist.json generation 17"
+
+    def broken(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(patched_api, "build_training_load", broken)
+    with caplog.at_level(logging.ERROR):
+        body, code, _ = api(FakeRequest("GET", "/load"))
+    assert (code, json.loads(body)) == (500, {"error": "internal_error"})
+    assert "run_hist" not in body and secret in caplog.text
+
+
+def test_profile_from_a_client_before_66_keeps_the_threshold(api):
+    """POST заменяет профиль целиком. Вкладка, открытая до деплоя, поля порога
+    не знает — сохранение веса из неё не должно молча стереть порог."""
+    assert _json(_post(api, "/profile", {"profile": {"threshold_pace_sec": "4:35"}})
+                 )["profile"]["threshold_pace_sec"] == 275
+    old_client = _json(_post(api, "/profile", {"profile": {"weight_kg": 62}}))
+    assert old_client["profile"]["threshold_pace_sec"] == 275
+    assert old_client["profile"]["weight_kg"] == 62
+    flat = _json(_post(api, "/profile", {"weight_kg": 63}))       # плоское тело — так же
+    assert flat["profile"]["threshold_pace_sec"] == 275
+    for cleared in (None, ""):                                     # явный сброс работает
+        _post(api, "/profile", {"profile": {"threshold_pace_sec": "4:35"}})
+        reset = _json(_post(api, "/profile", {"profile": {"threshold_pace_sec": cleared}}))
+        assert reset["profile"]["threshold_pace_sec"] is None

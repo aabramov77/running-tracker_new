@@ -5,6 +5,7 @@
 данные, и её можно проверять напрямую.
 """
 import json
+from datetime import date, timedelta
 
 import pytest
 
@@ -68,6 +69,7 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/plan",                  "h_active_plan_weeks_get"),
     ("POST",   "/runs/parse-fit",        "h_parse_fit"),
     ("GET",    "/runs/12345/details",    "h_run_details"),
+    ("GET",    "/load",                  "h_load"),
     ("GET",    "/admin/users",           "h_admin_users"),
     ("POST",   "/admin/users/approve",   "h_admin_user_status"),
     ("POST",   "/admin/users/coach",     "h_admin_user_coach"),
@@ -629,7 +631,7 @@ def _athlete_paths(plan_id, sub="u1"):
     base = f"/coach/athletes/{sub}"
     return [f"{base}/plans", f"{base}/plans/{plan_id}/weeks",
             f"{base}/plans/{plan_id}/compliance", f"{base}/runs",
-            f"{base}/runs/1/details"]
+            f"{base}/runs/1/details", f"{base}/load"]
 
 
 def _assert_all_forbidden(api, plan_id, who, athlete="u1"):
@@ -652,6 +654,7 @@ def _seed_run_details(fake_bucket, sub="u1", run_id=1):
     ("GET", "/coach/athletes/u-1/plans/abc-1/compliance", "h_coach_plan_compliance"),
     ("GET", "/coach/athletes/u-1/runs",                   "h_coach_runs"),
     ("GET", "/coach/athletes/u-1/runs/42/details",        "h_coach_run_details"),
+    ("GET", "/coach/athletes/u-1/load",                   "h_coach_load"),
 ])
 def test_coach_paths_resolve(api_module, method, path, handler_name):
     route, _, allow = api_module.match_route(path, method)
@@ -1360,3 +1363,96 @@ def test_own_writes_are_signed_by_the_athlete(api, patched_api, fake_bucket):
     assert _manifest(fake_bucket, plan_id)["author"] == {"role": "athlete", "sub": "u1"}
     created = json.loads(api(FakeRequest("POST", "/plans", {"race_name": "Свой"}))[0])
     assert (created["created_by_role"], created["created_by_sub"]) == ("athlete", "u1")
+
+
+# ── Нагрузка (#66) ────────────────────────────────────────────────────────────
+
+def _recent(days_ago):
+    return (date.today() - timedelta(days=days_ago)).isoformat()
+
+
+def _post_run(api, run_id, days_ago, **who):
+    body = {"id": run_id, "date": _recent(days_ago), "dist": 8.0, "time": "40:00",
+            "pace": "5:00", "hr": 140, "type": "easy"}
+    assert _status(api(FakeRequest("POST", "/", json_body=body), **who)) == 201
+
+
+def test_load_counts_only_own_runs(api):
+    other = {"sub": "u2", "email": "u2@example.com"}
+    _post_run(api, 1, 3)
+    _post_run(api, 2, 10, **other)
+    mine = json.loads(api(FakeRequest("GET", "/load"))[0])
+    theirs = json.loads(api(FakeRequest("GET", "/load"), **other)[0])
+    assert list(mine["runs"]) == ["1"] and list(theirs["runs"]) == ["2"]
+
+
+def test_load_without_profile_says_what_is_missing(api):
+    _post_run(api, 1, 3)
+    load = json.loads(api(FakeRequest("GET", "/load"))[0])
+    assert load["internal"]["method"] is None and load["external"]["method"] is None
+    assert all(w["int"] is None and w["ext"] is None for w in load["weeks"])
+    assert load["runs"]["1"] == {"int": None, "int_est": False, "ext": None, "ext_est": False}
+
+
+def test_profile_get_returns_the_threshold_estimate(api):
+    race = {"name": "Осенний 10К", "date": _recent(20), "dist_label": "10km", "time": "45:30"}
+    assert _status(api(FakeRequest("POST", "/races", race))) == 201
+    derived = json.loads(api(FakeRequest("GET", "/profile"))[0])["derived"]
+    assert derived["threshold_pace_auto"]["pace_sec"] == 277
+    assert (derived["threshold_pace_sec"], derived["threshold_source"]) == (277, "races")
+
+    saved = json.loads(api(FakeRequest("POST", "/profile",
+                                       {"profile": {"threshold_pace_sec": "4:20"}}))[0])
+    assert saved["profile"]["threshold_pace_sec"] == 260
+    assert (saved["derived"]["threshold_pace_sec"], saved["derived"]["threshold_source"]) == \
+           (260, "manual")
+    assert saved["derived"]["threshold_pace_auto"]["pace_sec"] == 277       # подсказка у поля
+
+
+def _coached_with_load(api, patched_api, fake_bucket):
+    """Спортсмен u1 с тренером c1, профилем и четырьмя свежими пробежками."""
+    _coached(api, patched_api, fake_bucket)
+    profile = {"hr_max": 190, "threshold_pace_sec": "4:40"}
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": profile}))) == 201
+    for run_id, days_ago in ((10, 2), (11, 4), (12, 9), (13, 11)):
+        _post_run(api, run_id, days_ago)
+
+
+def test_coach_sees_the_athletes_load(api, patched_api, fake_bucket):
+    _coached_with_load(api, patched_api, fake_bucket)
+    own = json.loads(api(FakeRequest("GET", "/load"))[0])
+    body, code, _ = api(FakeRequest("GET", "/coach/athletes/u1/load"), **COACH)
+    assert code == 200
+    assert json.loads(body) == json.loads(json.dumps(patched_api.coach_load_view(own)))
+    assert own["runs"]["10"]["int"] and own["runs"]["10"]["ext"]
+
+
+def test_view_only_coach_sees_the_load(api, patched_api, fake_bucket):
+    _coached_with_load(api, patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/my/coach/plan-edit", {"allow": False}))) == 200
+    assert _status(api(FakeRequest("GET", "/coach/athletes/u1/load"), **COACH)) == 200
+
+
+def test_hidden_runs_are_not_in_the_coachs_load(api, patched_api, fake_bucket):
+    _coached_with_load(api, patched_api, fake_bucket)
+    assert _status(api(FakeRequest("DELETE", "/", args={"id": "10"}))) == 200
+    load = json.loads(api(FakeRequest("GET", "/coach/athletes/u1/load"), **COACH)[0])
+    assert "10" not in load["runs"] and "11" in load["runs"]
+
+
+def test_coach_request_writes_nothing_to_the_athlete(api, patched_api, fake_bucket):
+    _coached_with_load(api, patched_api, fake_bucket)
+    runs = patched_api.read_runs(fake_bucket, "u1")
+    runs[0]["details_available"] = True
+    patched_api.write_runs(fake_bucket, "u1", runs)
+    _seed_run_details(fake_bucket, run_id=runs[0]["id"])
+
+    def athlete_data():
+        return {k: v for k, v in fake_bucket._store.items() if k.startswith("users/u1/")}
+
+    before = athlete_data()
+    body, code, _ = api(FakeRequest("GET", "/coach/athletes/u1/load"), **COACH)
+    assert code == 200 and json.loads(body)["pending"] == 1
+    assert athlete_data() == before
+    api(FakeRequest("GET", "/load"))                       # а сам спортсмен кэш дописывает
+    assert fake_bucket.blob("users/u1/derived/run_hist.json").exists()
