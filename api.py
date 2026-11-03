@@ -836,6 +836,17 @@ def h_races_delete(c):
     return jresp({"soft_deleted": race_id, "deleted_at": target["deleted_at"]}, 200)
 
 
+def _hidden(entries):
+    """Скрытые записи индекса, последние скрытые сверху (#76). Чтение по
+    умолчанию их не отдаёт — это явный запрос, как и история."""
+    hidden = [e for e in entries if isinstance(e, dict) and e.get("deleted")]
+    return sorted(hidden, key=lambda e: str(e.get("deleted_at") or ""), reverse=True)
+
+
+def h_races_hidden(c):
+    return jresp(_hidden(read_races(c.bucket, c.sub)), 200)
+
+
 def h_race_restore(c):
     race = restore_race(c.bucket, c.sub, int(c.args[0]), restored_by=c.email)
     if not race:
@@ -1037,6 +1048,10 @@ def h_runs_delete(c):
     return jresp({"soft_deleted": run_id, "deleted_at": target["deleted_at"]}, 200)
 
 
+def h_runs_hidden(c):
+    return jresp(_hidden(read_runs(c.bucket, c.sub)), 200)
+
+
 def h_run_restore(c):
     run = restore_run(c.bucket, c.sub, int(c.args[0]), restored_by=c.email)
     if not run:
@@ -1090,6 +1105,7 @@ ROUTES = [
 
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
+    ("GET",    r"^/runs/hidden$",                h_runs_hidden,          False),
     ("GET",    r"^/runs/(\d+)/history$",         h_run_history,          False),
     ("POST",   r"^/runs/(\d+)/restore$",         h_run_restore,          False),
     ("GET",    r"^/load$",                       h_load,                 False),
@@ -1114,6 +1130,7 @@ ROUTES = [
     ("GET",    r"^/races$",                      h_races_get,            False),
     ("POST",   r"^/races$",                      h_races_post,           False),
     ("DELETE", r"^/races$",                      h_races_delete,         False),
+    ("GET",    r"^/races/hidden$",               h_races_hidden,         False),
     ("GET",    r"^/races/(\d+)/history$",        h_race_history,         False),
     ("POST",   r"^/races/(\d+)/restore$",        h_race_restore,         False),
 

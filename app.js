@@ -174,6 +174,8 @@ function signOut() {
   idToken = null; userSub = null; currentRole = null;
   aiReset();                  // #46: разборы прежнего пользователя — не следующему
   LOAD = null;                // #66: и его нагрузка тоже
+  endRunEdit(); endRaceEdit();  // #76: и его незаконченная правка
+  resetHidden();                //       и его скрытые записи
   localStorage.removeItem('g_id_token');
   localStorage.removeItem(SIGNED_IN_BEFORE_KEY);   // #65: вышел сам — One Tap не навязываем
   if (window.google) google.accounts.id.disableAutoSelect();
@@ -502,6 +504,15 @@ function escapeHtml(s) {
     .replace(/'/g, '&#39;');
 }
 
+// Правка пробежки или старта (#76) сделана поверх версии, которую уже
+// сменили, или поверх скрытой записи. code — чтобы вызывающий решил, что дальше.
+const ENTITY_CONFLICT_TEXT = {
+  run_stale: 'Пробежку успели изменить на другом устройстве.',
+  race_stale: 'Забег успели изменить на другом устройстве.',
+  run_deleted: 'Пробежку скрыли — восстановите её, чтобы править.',
+  race_deleted: 'Забег скрыли — восстановите его, чтобы править.',
+};
+
 // Ошибка неудачного ответа API. Отказ в проверке полей (#53) приходит с их
 // перечнем — показываем его, а не голый код ответа.
 async function apiError(res) {
@@ -510,6 +521,8 @@ async function apiError(res) {
   if (data.error === 'plans_busy') return new Error('Планы сейчас меняют с другого устройства — попробуйте ещё раз');
   // Те же данные сохраняют параллельно (#35) — повтор поможет.
   if (data.error === 'storage_busy') return new Error('Данные сейчас меняют с другого устройства — попробуйте ещё раз');
+  if (ENTITY_CONFLICT_TEXT[data.error])
+    return Object.assign(new Error(ENTITY_CONFLICT_TEXT[data.error]), { code: data.error });
   if (data.error !== 'validation_failed' || !data.fields) return new Error(`HTTP ${res.status}`);
   const text = Object.entries(data.fields).map(([field, why]) => `${field} — ${why}`).join('; ');
   return Object.assign(new Error('Проверьте данные: ' + text), { code: 'validation_failed' });
@@ -810,17 +823,27 @@ async function saveRun() {
     feel: document.getElementById('f-feel').value,
     notes: document.getElementById('f-notes').value,
   };
+  // Правка (#76): тот же id и версия, поверх которой правим, — сервер её сверит.
+  const edit = runEdit;
+  if (edit) {
+    run.id = edit.id;
+    if (edit.version != null) run.base_version = edit.version;
+    const reason = document.getElementById('f-reason').value.trim();
+    if (reason) run.change_reason = reason;
+  }
   if (_pendingFitToken) run.fit_token = _pendingFitToken;
   const planSel = document.getElementById('f-plan');
   if (planSel && planSel.value) run.plan_id = planSel.value;   // #25
 
-  const btn = document.querySelector('#tab-add .btn-primary');
+  const btn = document.getElementById('run-save-btn');
   btn.disabled = true; btn.textContent = 'Сохраняем…';
   try {
     if (isOnline) {
       await apiPost(run);
       await loadRunsFromCloud();
     } else {
+      // Правку офлайн не копим: локальная запись с тем же id стала бы дублем.
+      if (edit) { alert(RUN_EDIT_OFFLINE_TEXT); return; }
       if (_pendingFitToken) {
         alert('FIT-данные нельзя сохранить офлайн — нужно подключение к серверу');
         return;
@@ -834,12 +857,87 @@ async function saveRun() {
     const msg = document.getElementById('save-msg');
     msg.style.display = 'inline';
     setTimeout(() => msg.style.display = 'none', 2500);
-    ['f-dist','f-time','f-pace','f-hr','f-notes'].forEach(id => document.getElementById(id).value = '');
+    clearRunForm();
+    if (edit) { endRunEdit(); showTab('log'); }
   } catch (e) {
+    if (e.code === 'run_stale') { await runEditStale(e.message); return; }
+    if (e.code === 'run_deleted') { alert(e.message); endRunEdit(); await loadRunsFromCloud(); return; }
     alert('Ошибка сохранения: ' + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = 'Сохранить пробежку';
+    btn.disabled = false;
+    renderRunEditMode();      // подпись кнопки — по режиму формы
   }
+}
+
+function clearRunForm() {
+  ['f-dist','f-time','f-pace','f-hr','f-notes','f-reason'].forEach(id => document.getElementById(id).value = '');
+}
+
+// ── Правка пробежки (#76) ──
+// Та же форма, что и запись: в ней уже есть все поля, план, импорт FIT и CSV.
+// runEdit — id и версия правки; null — форма записывает новую пробежку.
+let runEdit = null;
+const RUN_EDIT_OFFLINE_TEXT = 'Править пробежку можно только при связи с сервером';
+
+function startRunEdit(id) {
+  const run = runs.find(r => r.id === id);
+  if (!run) return;
+  if (!isOnline) { alert(RUN_EDIT_OFFLINE_TEXT); return; }
+  closeRunDetail();
+  fillRunForm(run);
+  showTab('add');
+  document.getElementById('run-form-card').scrollIntoView({ block: 'start' });
+}
+
+function fillRunForm(run) {
+  const set = (id, v) => { document.getElementById(id).value = v ?? ''; };
+  set('f-date', run.date); set('f-type', run.type || 'easy'); set('f-dist', run.dist);
+  set('f-time', run.time); set('f-pace', run.pace); set('f-hr', run.hr);
+  set('f-feel', run.feel || 'good'); set('f-notes', run.notes); set('f-reason', '');
+  const planSel = document.getElementById('f-plan');
+  if (planSel && [...planSel.options].some(o => o.value === run.plan_id)) planSel.value = run.plan_id;
+  // FIT, разобранный до правки, к этой пробежке не относится
+  _pendingFitToken = null;
+  document.getElementById('garmin-msg').style.display = 'none';
+  runEdit = { id: run.id, version: run.version ?? null, date: run.date };
+  renderRunEditMode();
+}
+
+function renderRunEditMode() {
+  const editing = !!runEdit;
+  document.getElementById('run-edit-banner').style.display = editing ? '' : 'none';
+  document.getElementById('run-edit-title').textContent =
+    editing ? `Правка пробежки от ${shortDate(runEdit.date)}` : '';
+  document.getElementById('f-reason-group').style.display = editing ? '' : 'none';
+  document.getElementById('run-form-title').textContent = editing ? 'Изменить пробежку' : 'Записать пробежку';
+  document.getElementById('run-save-btn').textContent = editing ? 'Сохранить изменения' : 'Сохранить пробежку';
+}
+
+// Выход из правки: отмена, сохранение, лист «+» и выход из аккаунта. Иначе
+// «Ввести вручную» после брошенной правки молча переписал бы старую пробежку.
+function endRunEdit() {
+  if (!runEdit) return;
+  runEdit = null;
+  _pendingFitToken = null;
+  clearRunForm();
+  renderRunEditMode();
+}
+
+// Пробежку изменили на другом устройстве: форма — со свежими данными, правка
+// продолжается. Так же поступает конструктор плана при plan_stale.
+async function runEditStale(message) {
+  const id = runEdit.id;
+  await loadRunsFromCloud();
+  const fresh = runs.find(r => r.id === id);
+  if (!fresh) { endRunEdit(); alert(message + ' В журнале её больше нет.'); return; }
+  fillRunForm(fresh);
+  alert(message + ' В форме — её текущие данные, внесите правку заново.');
+}
+
+// «03.11» из «2026-11-03»; что-то другое — как есть.
+function shortDate(s) {
+  const d = localDate(s);
+  return d ? ddmm(d) : String(s ?? '');
 }
 
 async function deleteRun(id) {
@@ -847,7 +945,9 @@ async function deleteRun(id) {
   try {
     if (isOnline) {
       await apiDelete(id); // бэкенд ставит deleted=true, не удаляет физически
+      if (runEdit && runEdit.id === id) endRunEdit();
       await loadRunsFromCloud();
+      if (HIDDEN.run.open) loadHidden('run');
     } else {
       // Оффлайн: помечаем локально, синхронизируется при следующем подключении
       runs = runs.map(r => r.id === id ? {...r, deleted: true} : r);
@@ -1702,7 +1802,13 @@ function planHistoryHtml(data) {
     (data.has_more ? '<p class="hint" style="margin:10px 0 0">Показаны последние правки.</p>' : '');
 }
 
-async function showPlanHistory(url, title) {
+function showPlanHistory(url, title) {
+  return showHistory(url, title, planHistoryHtml);
+}
+
+// Окно истории — общее для плана (#60), пробежки и старта (#76): отличаются
+// адрес и то, как строки рисуются (render).
+async function showHistory(url, title, render) {
   const session = ++planHistorySession;
   const body = document.getElementById('plan-history-body');
   document.getElementById('plan-history-title').textContent = title;
@@ -1713,7 +1819,7 @@ async function showPlanHistory(url, title) {
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    if (session === planHistorySession) body.innerHTML = planHistoryHtml(data);
+    if (session === planHistorySession) body.innerHTML = render(data);
   } catch (e) {
     if (session === planHistorySession)
       body.innerHTML = `<div class="empty">Не удалось загрузить историю: ${escapeHtml(e.message)}</div>`;
@@ -1830,7 +1936,15 @@ async function saveRace() {
   if (!time)  { alert('Введите финишное время'); return; }
 
   const race = { id: Date.now(), name, date, dist_label, time };
-  const btn = document.querySelector('#tab-races .btn-primary');
+  // Правка (#76): тот же id и версия, поверх которой правим.
+  const edit = raceEdit;
+  if (edit) {
+    race.id = edit.id;
+    if (edit.version != null) race.base_version = edit.version;
+    const reason = document.getElementById('r-reason').value.trim();
+    if (reason) race.change_reason = reason;
+  }
+  const btn = document.getElementById('r-save-btn');
   btn.disabled = true; btn.textContent = 'Сохраняем…';
   try {
     await apiPostRace(race);
@@ -1839,10 +1953,14 @@ async function saveRace() {
     const msg = document.getElementById('race-save-msg');
     msg.style.display = 'inline';
     setTimeout(() => msg.style.display = 'none', 2500);
-    document.getElementById('r-name').value = '';
-    document.getElementById('r-time').value = '';
+    clearRaceForm();
+    if (edit) endRaceEdit();
   } catch (e) {
     if (e.code === 'validation_failed') { alert(e.message); return; }
+    if (e.code === 'race_stale') { await raceEditStale(e.message); return; }
+    if (e.code === 'race_deleted') { alert(e.message); endRaceEdit(); await loadRacesFromCloud(); return; }
+    // Правку офлайн не копим: локальная запись с тем же id стала бы дублем.
+    if (edit) { alert('Ошибка сохранения: ' + e.message); return; }
     // Офлайн: сохраняем локально
     races.unshift(race);
     localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
@@ -1850,19 +1968,76 @@ async function saveRace() {
     const msg = document.getElementById('race-save-msg');
     msg.style.display = 'inline';
     setTimeout(() => msg.style.display = 'none', 2500);
-    document.getElementById('r-name').value = '';
-    document.getElementById('r-time').value = '';
+    clearRaceForm();
   } finally {
-    btn.disabled = false; btn.textContent = 'Сохранить результат';
+    btn.disabled = false;
+    renderRaceEditMode();
   }
+}
+
+function clearRaceForm() {
+  ['r-name', 'r-time', 'r-reason'].forEach(id => document.getElementById(id).value = '');
+}
+
+// ── Правка старта (#76): форма над списком, как у пробежки ──
+let raceEdit = null;
+
+function startRaceEdit(id) {
+  const race = races.find(r => r.id === id);
+  if (!race) return;
+  if (!isOnline) { alert('Править забег можно только при связи с сервером'); return; }
+  fillRaceEditForm(race);
+  document.getElementById('r-card').scrollIntoView({ block: 'start' });
+}
+
+// Форма результата забега — не путать с fillRaceForm, карточкой гонки плана.
+function fillRaceEditForm(race) {
+  const set = (id, v) => { document.getElementById(id).value = v ?? ''; };
+  set('r-name', race.name); set('r-date', race.date); set('r-time', race.time); set('r-reason', '');
+  const distSel = document.getElementById('r-dist');
+  if ([...distSel.options].some(o => o.value === race.dist_label)) distSel.value = race.dist_label;
+  raceEdit = { id: race.id, version: race.version ?? null, date: race.date };
+  renderRaceEditMode();
+}
+
+function renderRaceEditMode() {
+  const editing = !!raceEdit;
+  document.getElementById('r-edit-banner').style.display = editing ? '' : 'none';
+  document.getElementById('r-edit-title').textContent =
+    editing ? `Правка забега от ${shortDate(raceEdit.date)}` : '';
+  document.getElementById('r-reason-group').style.display = editing ? '' : 'none';
+  document.getElementById('r-title').textContent = editing ? 'Изменить результат забега' : 'Записать результат забега';
+  document.getElementById('r-save-btn').textContent = editing ? 'Сохранить изменения' : 'Сохранить результат';
+}
+
+function endRaceEdit() {
+  if (!raceEdit) return;
+  raceEdit = null;
+  clearRaceForm();
+  renderRaceEditMode();
+}
+
+function showEditedRaceHistory() {
+  if (raceEdit) showRaceHistory(raceEdit.id);
+}
+
+async function raceEditStale(message) {
+  const id = raceEdit.id;
+  await loadRacesFromCloud();
+  const fresh = races.find(r => r.id === id);
+  if (!fresh) { endRaceEdit(); alert(message + ' В списке его больше нет.'); return; }
+  fillRaceEditForm(fresh);
+  alert(message + ' В форме — его текущие данные, внесите правку заново.');
 }
 
 async function deleteRace(id) {
   if (!confirm('Скрыть этот забег? Данные останутся в хранилище.')) return;
   try {
     await apiDeleteRace(id);
+    if (raceEdit && raceEdit.id === id) endRaceEdit();
     await loadRacesFromCloud();
     loadTrainingLoad();     // забег мог быть основанием порога (#66)
+    if (HIDDEN.race.open) loadHidden('race');
   } catch (e) {
     races = races.filter(r => r.id !== id);
     localStorage.setItem(ck('running_tracker_races'), JSON.stringify(races));
@@ -1899,6 +2074,7 @@ function renderRaces() {
           ${escapeHtml(r.time)}${pace ? ` · ${escapeHtml(pace)}/км` : ''}
         </div>
       </div>
+      <button class="btn-sm" title="Изменить" onclick="startRaceEdit(${Number(r.id)})" style="flex-shrink:0">✎</button>
       <button class="btn-sm" onclick="deleteRace(${Number(r.id)})" style="flex-shrink:0;color:var(--c-danger)">✕</button>
     </div>`;
   }).join('');
@@ -1911,14 +2087,18 @@ function showRunDetail(id) {
     detailsUrl: `${API_URL}runs/${id}/details`,
     onDelete: () => { closeRunDetail(); deleteRun(id); },
     onAiReview: () => aiReviewRun(id),
+    onEdit: () => startRunEdit(id),                             // #76
+    onHistory: () => showRunHistory(id),
     load: LOAD && LOAD.runs ? LOAD.runs[String(id)] : null,    // #66
   });
 }
 
 // Карточка пробежки. Источник задаётся снаружи: своя пробежка или пробежка
-// спортсмена на экране тренера (#44) — там без onDelete и onAiReview, кнопки
-// скрыты: тренер чужую пробежку не скрывает и со своим ИИ её не разбирает.
-function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null, load = null }) {
+// спортсмена на экране тренера (#44) — там без onDelete, onAiReview, onEdit и
+// onHistory, кнопки скрыты: тренер чужую пробежку не скрывает, не правит, её
+// историю не читает и со своим ИИ её не разбирает.
+function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null,
+                              onEdit = null, onHistory = null, load = null }) {
   const typeLabels = {easy:'Лёгкий бег',interval:'Интервалы',tempo:'Темповый',
                       long:'Длительный',race:'Соревнование',recovery:'Восстановительный'};
   const feelLabels = {great:'Отлично 😊',good:'Хорошо 🙂',ok:'Нормально 😐',
@@ -1951,6 +2131,11 @@ function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null, lo
   const aiBtn = document.getElementById('rd-ai-btn');
   aiBtn.style.display = onAiReview ? '' : 'none';
   aiBtn.onclick = onAiReview;
+  for (const [btnId, handler] of [['rd-edit-btn', onEdit], ['rd-history-btn', onHistory]]) {
+    const btn = document.getElementById(btnId);
+    btn.style.display = handler ? '' : 'none';
+    btn.onclick = handler;
+  }
   document.getElementById('run-detail-overlay').classList.add('active');
 
   // Графики из FIT-данных (если есть)
@@ -2085,6 +2270,171 @@ function closeRunDetail(event) {
   if (event && event.target !== document.getElementById('run-detail-overlay')) return;
   document.getElementById('run-detail-overlay').classList.remove('active');
   destroyDetailCharts();
+}
+
+// ── История правок, скрытые и восстановление (#76) ──
+// Версии пробежки и старта пишет сервер (#75). Здесь — их показ: что
+// поменялось от версии к версии, список скрытых и возврат скрытой записи.
+const RUN_HISTORY_FIELDS = [['date', 'Дата'], ['dist', 'Дистанция'], ['type', 'Тип'],
+  ['time', 'Время'], ['pace', 'Темп'], ['hr', 'Пульс'], ['feel', 'Самочувствие'],
+  ['plan_id', 'План'], ['notes', 'Заметки']];
+const RACE_HISTORY_FIELDS = [['name', 'Название'], ['date', 'Дата'],
+  ['dist_label', 'Дистанция'], ['time', 'Время']];
+const FEEL_LABEL = { great: 'Отлично', good: 'Хорошо', ok: 'Нормально', hard: 'Тяжело', bad: 'Плохо' };
+const ENTITY_AUTHOR_LABEL = { athlete: 'Вы', migration: 'Перенос данных' };
+
+// Значение поля в истории — текстом, подписью вместо кода. В разметку оно
+// попадает только через escapeHtml.
+function historyValue(field, value) {
+  if (value == null || value === '') return '—';
+  if (field === 'type') return RUN_TYPE_LABELS[value] || String(value);
+  if (field === 'feel') return FEEL_LABEL[value] || String(value);
+  if (field === 'dist_label') return DIST_LABEL[value] || String(value);
+  if (field === 'dist') return `${value} км`;
+  if (field === 'plan_id') {
+    const plan = PLANS.find(p => p.id === value);
+    return plan ? planLabel(plan) : 'другой план';
+  }
+  return String(value);
+}
+
+// «Дистанция: 10 км → 10.5 км» — поля, которые версия поменяла.
+function historyChanges(kind, before, after) {
+  const fields = kind === 'run' ? RUN_HISTORY_FIELDS : RACE_HISTORY_FIELDS;
+  return fields
+    .filter(([f]) => String(before[f] ?? '') !== String(after[f] ?? ''))
+    .map(([f, label]) => `${label}: ${historyValue(f, before[f])} → ${historyValue(f, after[f])}`);
+}
+
+function entityHistoryHtml(kind, data) {
+  const versions = (data && data.versions) || [];
+  if (!versions.length) return '<div class="empty">Правок ещё не было</div>';
+  return versions.map((v, i) => {
+    const snap = v[kind];
+    // Сравниваем с ближайшей более старой версией, у которой есть снимок
+    // полей: у версии до #75 (только детали FIT) его нет.
+    const older = versions.slice(i + 1).find(o => o[kind]);
+    const changes = snap && older ? historyChanges(kind, older[kind], snap) : [];
+    return `<div class="history-row">
+      <div class="history-head">
+        <span class="history-who">${escapeHtml(ENTITY_AUTHOR_LABEL[v.author] || 'Вы')}</span>
+        <span class="chat-time">${chatTime(v.created_at)} · версия ${Number(v.version)}</span>
+      </div>
+      ${v.change_reason ? `<div class="history-why">${escapeHtml(v.change_reason)}</div>` : ''}
+      ${v.fit_attached && snap ? '<div class="history-why">приложен FIT</div>' : ''}
+      ${changes.length ? `<ul class="history-diff">${changes.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul>` : ''}
+    </div>`;
+  }).join('') +
+    (data.has_more ? '<p class="hint" style="margin:10px 0 0">Показаны последние правки.</p>' : '');
+}
+
+// Пробежка — из журнала или из списка скрытых: историю открывают оттуда и оттуда.
+function knownEntity(kind, id) {
+  const list = kind === 'run' ? runs : races;
+  return list.find(r => r.id === id) || HIDDEN[kind].items.find(r => r.id === id) || null;
+}
+
+function showRunHistory(id) {
+  const run = knownEntity('run', id);
+  showHistory(`${API_URL}runs/${Number(id)}/history`,
+              run ? `История пробежки от ${shortDate(run.date)}` : 'История пробежки',
+              data => entityHistoryHtml('run', data));
+}
+
+function showRaceHistory(id) {
+  const race = knownEntity('race', id);
+  showHistory(`${API_URL}races/${Number(id)}/history`,
+              race ? `История забега «${race.name || ''}»` : 'История забега',
+              data => entityHistoryHtml('race', data));
+}
+
+// Скрытые грузятся по кнопке: обычный список их не отдаёт (#75), и тянуть
+// их при каждом запуске приложения незачем.
+const HIDDEN = { run: { open: false, items: [] }, race: { open: false, items: [] } };
+const HIDDEN_TITLE = { run: 'Скрытые пробежки', race: 'Скрытые забеги' };
+
+function resetHidden() {
+  for (const kind of Object.keys(HIDDEN)) {
+    HIDDEN[kind] = { open: false, items: [] };
+    const el = document.getElementById(`hidden-${kind}s`);
+    el.style.display = 'none'; el.innerHTML = '';
+    document.getElementById(`hidden-${kind}s-btn`).textContent = HIDDEN_TITLE[kind];
+  }
+}
+
+function toggleHidden(kind) {
+  const state = HIDDEN[kind];
+  state.open = !state.open;
+  document.getElementById(`hidden-${kind}s`).style.display = state.open ? '' : 'none';
+  document.getElementById(`hidden-${kind}s-btn`).textContent =
+    state.open ? 'Свернуть скрытые' : HIDDEN_TITLE[kind];
+  if (state.open) loadHidden(kind);
+}
+
+async function loadHidden(kind) {
+  const el = document.getElementById(`hidden-${kind}s`);
+  el.innerHTML = '<div class="empty">Загрузка…</div>';
+  try {
+    const res = await fetch(`${API_URL}${kind}s/hidden`, { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    if (!res.ok) throw await apiError(res);
+    HIDDEN[kind].items = await res.json();
+    renderHidden(kind);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Не удалось загрузить: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderHidden(kind) {
+  const el = document.getElementById(`hidden-${kind}s`);
+  const items = HIDDEN[kind].items;
+  el.innerHTML = items.length ? items.map(r => hiddenItemHtml(kind, r)).join('')
+    : `<div class="empty">${kind === 'run' ? 'Скрытых пробежек нет' : 'Скрытых забегов нет'}</div>`;
+}
+
+// Строка скрытой записи. id в обработчики — только числом.
+function hiddenItemHtml(kind, r) {
+  const id = Number(r.id);
+  const date = String(r.date ?? '');
+  const title = kind === 'run'
+    ? `${RUN_TYPE_LABELS[r.type] || r.type || 'Пробежка'} — ${r.dist} км`
+    : `${r.name || 'Забег'} · ${DIST_LABEL[r.dist_label] || r.dist_label || ''}`;
+  const historyCall = kind === 'run' ? `showRunHistory(${id})` : `showRaceHistory(${id})`;
+  const restoreCall = kind === 'run' ? `restoreRun(${id})` : `restoreRace(${id})`;
+  return `<div class="run-item">
+      <div class="run-date">${escapeHtml(date.slice(5))}<br><span style="opacity:.6">${escapeHtml(date.slice(0, 4))}</span></div>
+      <div class="run-info">
+        <div class="run-title">${escapeHtml(title)}</div>
+        <div class="run-meta">${r.deleted_at ? `скрыто ${chatTime(r.deleted_at)}` : 'скрыто'}</div>
+      </div>
+      <button class="btn-sm" title="История правок" onclick="${historyCall}" style="flex-shrink:0">🕘</button>
+      <button class="btn-sm" onclick="${restoreCall}" style="flex-shrink:0">Восстановить</button>
+    </div>`;
+}
+
+async function apiRestore(kind, id) {
+  const res = await fetch(`${API_URL}${kind}/${Number(id)}/restore`,
+                          { method: 'POST', headers: authHeaders() });
+  if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw await apiError(res);
+  return res.json();
+}
+
+async function restoreRun(id) {
+  try {
+    await apiRestore('runs', id);
+    await loadRunsFromCloud();       // и выполнение плана, и нагрузку (#66)
+    if (HIDDEN.run.open) loadHidden('run');
+  } catch (e) { alert('Не удалось восстановить: ' + e.message); }
+}
+
+async function restoreRace(id) {
+  try {
+    await apiRestore('races', id);
+    await loadRacesFromCloud();
+    loadTrainingLoad();              // забег мог стать основой порога (#66)
+    if (HIDDEN.race.open) loadHidden('race');
+  } catch (e) { alert('Не удалось восстановить: ' + e.message); }
 }
 
 // Раскладка пробежек по неделям плана — по тем же окнам, что и в таблице
@@ -3224,6 +3574,7 @@ function closeAddSheet(event) {
 // жеста пользователя браузер окно выбора не покажет.
 function addSheetGo(kind) {
   closeAddSheet();
+  endRunEdit(); endRaceEdit();       // лист «+» — новая запись, не правка старой (#76)
   if (kind === 'race') { showTab('races'); return; }
   showTab('add');
   if (kind === 'fit') document.getElementById('garmin-fit-file').click();
@@ -3668,7 +4019,7 @@ async function coachSavePlan() {
     return;
   }
   const athlete = COACH.athlete, planId = plan.id;
-  const btn = document.getElementById('coach-save-btn');
+  const btn = document.getElementById('coach-plan-save-btn');
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Сохранение…';
   try {
@@ -4254,9 +4605,9 @@ function renderCoachHeader() {
   // Бэкенд до #60 поля can_edit не знает — тогда и отказа не показываем.
   show('coach-edit-note', COACH.athlete.can_edit === false);
   show('coach-save-bar', COACH.editing);
-  show('coach-save-btn', COACH.editing && editable);
+  show('coach-plan-save-btn', COACH.editing && editable);
   show('coach-save-new-btn', COACH.editing && !!COACH.importInfo && canEdit);
-  document.getElementById('coach-save-btn').textContent =
+  document.getElementById('coach-plan-save-btn').textContent =
     COACH.importInfo ? 'Сохранить в этот план' : 'Сохранить изменения';
 }
 

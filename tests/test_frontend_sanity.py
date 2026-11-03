@@ -537,13 +537,15 @@ def test_run_and_race_ids_reach_inline_handlers_only_as_numbers():
     """Внутри onclick escapeHtml не спасает: строка там исполняется как код.
     Поэтому id пробежки и старта попадает в обработчик только через Number()."""
     js = APP_JS.read_text(encoding="utf-8")
-    calls = re.findall(r"(?:showRunDetail|showCoachRunDetail|deleteRun|deleteRace|aiReviewRun)"
+    calls = re.findall(r"(?:showRunDetail|showCoachRunDetail|deleteRun|deleteRace|aiReviewRun"
+                       r"|startRaceEdit|showRunHistory|showRaceHistory|restoreRun|restoreRace)"
                        r"\(\$\{([^}]*)\}\)", js)
-    assert len(calls) >= 7, "обработчики с id найдены не все — проверка устарела"
+    assert len(calls) >= 12, "обработчики с id найдены не все — проверка устарела"
     for arg in calls:
         assert arg == "id" or re.fullmatch(r"Number\((?:r\.id|runId)\)", arg), arg
-    # «id» — локальная переменная строки журнала, уже приведённая к числу
+    # «id» — локальная переменная строки, уже приведённая к числу
     assert "const id = Number(r.id);" in _js_section(js, "function runItemHtml(", "\n}\n")
+    assert "const id = Number(r.id);" in _js_section(js, "function hiddenItemHtml(", "\n}\n")
     assert not re.search(r"\$\{\s*r\.id\s*\}", js)
 
 
@@ -1007,9 +1009,15 @@ def test_load_axis_buttons_call_an_existing_handler():
     assert re.search(r"^function setLoadAxis\(view, key\)", js, re.M)
 
 
+def _run_card_params(js):
+    params = re.search(r"function openRunDetail\(run, \{([^}]*)\}\)", js)
+    assert params, "сигнатура openRunDetail не найдена"
+    return {p.strip() for p in params.group(1).split(",")}
+
+
 def test_run_card_takes_load_as_a_parameter():
     js = APP_JS.read_text(encoding="utf-8")
-    assert "function openRunDetail(run, { detailsUrl, onDelete = null, onAiReview = null, load = null })" in js
+    assert {"detailsUrl", "onDelete = null", "onAiReview = null", "load = null"} <= _run_card_params(js)
     assert "['Нагрузка',     loadText]" in _fn(js, "openRunDetail")
     assert "load: LOAD && LOAD.runs ? LOAD.runs[String(id)] : null" in _fn(js, "showRunDetail")
     assert "load: COACH.load && COACH.load.runs ? COACH.load.runs[String(id)] : null" in \
@@ -1019,7 +1027,7 @@ def test_run_card_takes_load_as_a_parameter():
 def test_load_is_reloaded_after_runs_and_profile_change():
     """Пробежки, профиль (зоны, пульс покоя, порог) и забеги меняют нагрузку."""
     js = APP_JS.read_text(encoding="utf-8")
-    for name in ("loadRunsFromCloud", "saveProfile", "saveRace", "deleteRace"):
+    for name in ("loadRunsFromCloud", "saveProfile", "saveRace", "deleteRace", "restoreRace"):
         assert "loadTrainingLoad();" in _fn(js, name), name
     assert "LOAD = null;" in _fn(js, "signOut")
     assert "LOAD = readLoadCache();" in _fn(js, "initApp")
@@ -1178,3 +1186,146 @@ def test_landing_mockups_are_hidden_from_screen_readers():
     landing = _landing_html(INDEX.read_text(encoding="utf-8"))
     for mock in ("l-phone", "l-chart", "l-chat"):
         assert re.search(rf'class="{mock}" aria-hidden="true"', landing), mock
+
+
+# ── Правка, история и скрытые пробежки и старты (#76) ────────────────────────
+
+def test_element_ids_are_unique():
+    """getElementById отдаёт первый элемент с id: второй такой же молча
+    получает чужие правки. Так форма результата забега (#76) переписывала
+    заголовок и кнопку карточки гонки плана, а кнопка конструктора тренера
+    делила id с кнопкой «Мой тренер»."""
+    ids = re.findall(r'\bid="([^"]+)"', INDEX.read_text(encoding="utf-8"))
+    duplicates = {i for i in ids if ids.count(i) > 1}
+    assert duplicates == set(), sorted(duplicates)
+
+
+def _history_section(js):
+    return _js_section(js, "// ── История правок, скрытые и восстановление (#76)",
+                       "// Раскладка пробежек по неделям плана")
+
+
+def test_frontend_knows_the_conflicts_the_backend_returns():
+    """409 правки — контракт с api.py: переименование кода на сервере без
+    правки фронта превратило бы «пробежку успели изменить» в «HTTP 409»."""
+    js = APP_JS.read_text(encoding="utf-8")
+    api = (REPO / "api.py").read_text(encoding="utf-8")
+    declared = re.search(r"const ENTITY_CONFLICT_TEXT = \{(.*?)\};", js, re.S)
+    assert declared, "ENTITY_CONFLICT_TEXT не найден"
+    codes = set(re.findall(r"^\s*(\w+):", declared.group(1), re.M))
+    assert codes == {"run_stale", "race_stale", "run_deleted", "race_deleted"}
+    for code in codes:
+        assert f'"{code}"' in api, code
+    assert "ENTITY_CONFLICT_TEXT[data.error]" in _fn(js, "apiError")
+
+
+def test_run_card_offers_edit_and_history_only_for_own_runs():
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="rd-edit-btn"' in html and 'id="rd-history-btn"' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    assert {"onEdit = null", "onHistory = null"} <= _run_card_params(js)
+    card = _fn(js, "openRunDetail")
+    assert "['rd-edit-btn', onEdit], ['rd-history-btn', onHistory]" in card
+    own = _fn(js, "showRunDetail")
+    assert "onEdit: () => startRunEdit(id)" in own and "onHistory: () => showRunHistory(id)" in own
+    coach = _fn(js, "showCoachRunDetail")
+    assert "onEdit" not in coach and "onHistory" not in coach
+    for leak in ("startRunEdit", "startRaceEdit", "showRunHistory", "showRaceHistory",
+                 "restoreRun", "restoreRace", "toggleHidden", "/restore", "/hidden"):
+        assert leak not in _coach_section(js), leak
+
+
+def test_edits_carry_the_version_and_the_reason():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name, kind, prefix in (("saveRun", "run", "f"), ("saveRace", "race", "r")):
+        body = _fn(js, name)
+        assert f"{kind}.id = edit.id;" in body, name
+        assert f"{kind}.base_version = edit.version" in body, name
+        assert f"getElementById('{prefix}-reason')" in body and f"{kind}.change_reason = reason" in body
+        # устаревшая правка — данные перечитываются до нового заполнения формы
+        assert f"e.code === '{kind}_stale'" in body and f"e.code === '{kind}_deleted'" in body
+    for name, reload, fill in (("runEditStale", "await loadRunsFromCloud();", "fillRunForm(fresh)"),
+                               ("raceEditStale", "await loadRacesFromCloud();", "fillRaceEditForm(fresh)")):
+        body = _fn(js, name)
+        assert body.index(reload) < body.index(fill), name
+
+
+def test_an_edit_is_never_kept_offline_as_a_copy():
+    """Офлайн-запись кладёт пробежку в начало списка: правка с тем же id
+    стала бы её дублем, а на сервер ушла бы как новая запись."""
+    js = APP_JS.read_text(encoding="utf-8")
+    run = _fn(js, "saveRun")
+    assert run.index("if (edit) { alert(RUN_EDIT_OFFLINE_TEXT); return; }") < run.index("runs.unshift(run)")
+    race = _fn(js, "saveRace")
+    assert race.index("if (edit) { alert(") < race.index("races.unshift(race)")
+    for name in ("startRunEdit", "startRaceEdit"):
+        assert "if (!isOnline)" in _fn(js, name), name
+
+
+def test_edit_mode_ends_where_a_new_record_starts():
+    """После брошенной правки «+ → Ввести вручную» иначе переписал бы старую
+    пробежку, а следующий вошедший — чужую."""
+    js = APP_JS.read_text(encoding="utf-8")
+    sheet = _fn(js, "addSheetGo")
+    assert sheet.index("endRunEdit(); endRaceEdit();") < sheet.index("showTab(")
+    sign_out = _fn(js, "signOut")
+    assert "endRunEdit(); endRaceEdit();" in sign_out and "resetHidden();" in sign_out
+    for name in ("endRunEdit", "endRaceEdit"):
+        body = _fn(js, name)
+        assert "Edit = null;" in body and "EditMode();" in body, name
+    assert "_pendingFitToken = null;" in _fn(js, "endRunEdit"), "FIT правки не прилипает к новой пробежке"
+    html = INDEX.read_text(encoding="utf-8")
+    for piece in ('id="run-edit-banner"', 'onclick="endRunEdit()"', 'id="f-reason"',
+                  'id="run-save-btn"', 'id="r-edit-banner"', 'onclick="endRaceEdit()"',
+                  'id="r-reason"', 'id="r-save-btn"', 'onclick="showEditedRaceHistory()"'):
+        assert piece in html, piece
+
+
+def test_history_window_is_shared_and_opens_above_the_run_card():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "showHistory(url, title, planHistoryHtml)" in _fn(js, "showPlanHistory")
+    assert "body.innerHTML = render(data)" in _fn(js, "showHistory")
+    for name, kind in (("showRunHistory", "run"), ("showRaceHistory", "race")):
+        body = _fn(js, name)
+        assert f"entityHistoryHtml('{kind}', data)" in body and "/history`" in body, name
+    css = STYLE.read_text(encoding="utf-8")
+    overlay = re.search(r"\.run-detail-overlay \{[^}]*z-index: (\d+)", css)
+    history = re.search(r"#plan-history-overlay \{ z-index: (\d+); \}", css)
+    assert overlay and history and int(history.group(1)) > int(overlay.group(1))
+
+
+def test_history_compares_a_version_with_the_previous_snapshot():
+    """У версии до #75 снимка полей нет — сравнение идёт с ближайшей старой
+    версией, где он есть, а подписи берутся из словарей, а не из кодов."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _fn(js, "entityHistoryHtml")
+    assert "versions.slice(i + 1).find(o => o[kind])" in body
+    assert "historyChanges(kind, older[kind], snap)" in body
+    value = _fn(js, "historyValue")
+    for table in ("RUN_TYPE_LABELS[value]", "FEEL_LABEL[value]", "DIST_LABEL[value]", "planLabel(plan)"):
+        assert table in value, table
+
+
+def test_hidden_lists_load_on_demand_and_restore_refreshes_the_rest():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "s/hidden`" in _fn(js, "loadHidden")
+    for name in ("initApp", "loadRunsFromCloud", "loadRacesFromCloud"):
+        assert "loadHidden(" not in _fn(js, name), name
+    assert "await loadRunsFromCloud();" in _fn(js, "restoreRun")
+    assert "await loadRacesFromCloud();" in _fn(js, "restoreRace")
+    item = _fn(js, "hiddenItemHtml")
+    for handler in ("showRunHistory(${id})", "showRaceHistory(${id})",
+                    "restoreRun(${id})", "restoreRace(${id})"):
+        assert handler in item, handler
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    assert {"showRunHistory", "showRaceHistory", "restoreRun", "restoreRace",
+            "startRaceEdit", "toggleHidden"} <= defined
+    assert "startRaceEdit(${Number(r.id)})" in _fn(js, "renderRaces")
+    html = INDEX.read_text(encoding="utf-8")
+    for kind in ("run", "race"):
+        assert f'onclick="toggleHidden(\'{kind}\')"' in html, kind
+        assert f'id="hidden-{kind}s-btn"' in html and f'id="hidden-{kind}s"' in html, kind
+    # скрытие обновляет открытый список скрытых
+    assert "if (HIDDEN.run.open) loadHidden('run');" in _fn(js, "deleteRun")
+    assert "if (HIDDEN.race.open) loadHidden('race');" in _fn(js, "deleteRace")
+    assert "loadHidden" in _history_section(js)

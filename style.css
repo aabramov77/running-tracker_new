@@ -224,6 +224,20 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .history-who { font-size: 13px; font-weight: 500; }
 .history-coach { color: var(--c-blue); }
 .history-why { font-size: 13px; color: var(--text-muted); margin-top: 2px; overflow-wrap: anywhere; }
+/* Что поменяла версия пробежки или старта (#76) */
+.history-diff { margin: 4px 0 0; padding-left: 18px; font-size: 13px; overflow-wrap: anywhere; }
+/* Историю открывают из карточки пробежки — окно встаёт поверх неё */
+#plan-history-overlay { z-index: 110; }
+
+/* Правка пробежки и старта (#76) */
+.edit-banner {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 10px 12px; border-radius: 8px;
+  background: var(--c-accent-light); color: var(--c-accent-dark); font-size: 13px; font-weight: 500;
+}
+.edit-banner-hint { font-weight: 400; margin-top: 2px; opacity: .85; }
+.hidden-block { margin-top: 12px; }
+.hidden-block > .btn-sm { color: var(--text-muted); }
 
 /* Переключатель области данных: текущий план / все (#25) */
 .scope-btn.active {

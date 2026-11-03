@@ -386,6 +386,40 @@ def test_someone_elses_history_is_not_found(api):
     assert _call(api, "POST", "/runs/1/restore")[1] == 404
 
 
+@pytest.mark.parametrize("kind,root,hidden", [("run", "/", "/runs/hidden"),
+                                              ("race", "/races", "/races/hidden")])
+def test_hidden_list_shows_only_own_hidden_ones(api, kind, root, hidden):
+    """Список скрытых (#76) — явное чтение: обычный список их не отдаёт."""
+    body = {k: v for k, v in FIELDS[kind].items() if v is not None}
+    for eid in (1, 2, 3):
+        _call(api, "POST", root, {**body, "id": eid})
+    for eid in (2, 1):
+        _call(api, "DELETE", root, args={"id": str(eid)})
+    _call(api, "POST", root, {**body, "id": 9}, sub="u2", email="u2@example.com")
+    _call(api, "DELETE", root, args={"id": "9"}, sub="u2", email="u2@example.com")
+
+    listed, code = _call(api, "GET", hidden)
+    assert code == 200 and sorted(e["id"] for e in listed) == [1, 2]
+    assert all(e["deleted"] and e["deleted_at"] for e in listed)
+    assert [e["id"] for e in _call(api, "GET", root)[0]] == [3]
+
+    _call(api, "POST", f"/{kind}s/1/restore")
+    assert [e["id"] for e in _call(api, "GET", hidden)[0]] == [2]
+
+
+def test_hidden_list_puts_the_latest_hidden_first(api, fake_bucket):
+    """Порядок — по deleted_at, а не по месту в индексе. Время задано явно:
+    два скрытия подряд на Windows могут получить одну и ту же отметку."""
+    _call(api, "GET", "/")                                    # регистрирует u1
+    put_json(fake_bucket, "users/u1/runs.json", [
+        {**RUN, "id": 1, "deleted": True, "deleted_at": "2026-11-01T10:00:00Z"},
+        {**RUN, "id": 2, "deleted": True, "deleted_at": "2026-11-03T10:00:00Z"},
+        {**RUN, "id": 3, "deleted": False},
+        {**RUN, "id": 4, "deleted": True},                    # скрыта до отметок времени
+    ])
+    assert [e["id"] for e in _call(api, "GET", "/runs/hidden")[0]] == [2, 1, 4]
+
+
 def test_migrate_history_is_for_the_admin(api, patched_api, fake_bucket):
     _call(api, "GET", "/")                                    # регистрирует u1
     put_json(fake_bucket, "users/u1/runs.json", [{**RUN, "deleted": False}])
