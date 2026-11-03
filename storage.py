@@ -61,9 +61,16 @@ def p_advice_usage(sub):       return f"{upfx(sub)}advice/usage.json"
 def p_profile(sub):            return f"{upfx(sub)}profile.json"   # legacy: гонка до #25
 def p_athlete_manifest(sub):   return f"{upfx(sub)}athlete/manifest.json"
 def p_athlete_ver(sub, v):     return f"{upfx(sub)}athlete/v{v}/profile.json"
-def p_run_manifest(sub, rid):  return f"{upfx(sub)}runs/{rid}/manifest.json"
-def p_run_fit(sub, rid, v=1):     return f"{upfx(sub)}runs/{rid}/v{v}/activity.fit"
-def p_run_details(sub, rid, v=1): return f"{upfx(sub)}runs/{rid}/v{v}/details.json"
+# Пробежка и старт — сущности с версиями (#75); runs.json и races.json —
+# производный индекс их текущих версий. Манифест пробежки общий с деталями FIT.
+def p_runs_dir(sub):           return f"{upfx(sub)}runs/"
+def p_run_manifest(sub, rid):  return f"{p_runs_dir(sub)}{rid}/manifest.json"
+def p_run_ver(sub, rid, v):    return f"{p_runs_dir(sub)}{rid}/v{v}/run.json"
+def p_run_fit(sub, rid, v=1):     return f"{p_runs_dir(sub)}{rid}/v{v}/activity.fit"
+def p_run_details(sub, rid, v=1): return f"{p_runs_dir(sub)}{rid}/v{v}/details.json"
+def p_races_dir(sub):          return f"{upfx(sub)}races/"
+def p_race_manifest(sub, rid): return f"{p_races_dir(sub)}{rid}/manifest.json"
+def p_race_ver(sub, rid, v):   return f"{p_races_dir(sub)}{rid}/v{v}/race.json"
 # Кэш гистограмм пульса и скорости по пробежкам (#66): производное от FIT,
 # не бизнес-запись — восстанавливается целиком, поэтому перезаписывается.
 def p_run_hist(sub):           return f"{upfx(sub)}derived/run_hist.json"
@@ -247,46 +254,11 @@ def version_chain(payloads, current):
 # ── Runs helpers ──────────────────────────────────────────────────────────────
 
 def read_runs(bucket, sub):
+    """Индекс пробежек (#75): текущие версии, скрытые — с deleted."""
     blob = bucket.blob(p_runs(sub))
     if not blob.exists():
         return []
     return json.loads(blob.download_as_text())
-
-
-def _upsert_entry(bucket, path, entry):
-    """Добавляет запись в начало списка или заменяет запись с тем же id."""
-    def put(entries):
-        entries[:] = [e for e in entries if e.get("id") != entry["id"]]
-        entries.insert(0, entry)
-        return entry
-
-    return update_json(bucket, path, put, list)
-
-
-def _soft_delete_entry(bucket, path, entry_id):
-    """Логическое удаление записи списка: deleted и deleted_at. None — записи
-    с таким id нет. Уже удалённая возвращается как есть."""
-    def mark(entries):
-        target = next((e for e in entries if e.get("id") == entry_id), None)
-        if target is None:
-            return None
-        if target.get("deleted"):
-            found.append(target)
-            return None
-        target["deleted"] = True
-        target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
-        return target
-
-    found = []
-    return update_json(bucket, path, mark, list) or (found[-1] if found else None)
-
-
-def upsert_run(bucket, sub, run):
-    return _upsert_entry(bucket, p_runs(sub), run)
-
-
-def soft_delete_run(bucket, sub, run_id):
-    return _soft_delete_entry(bucket, p_runs(sub), run_id)
 
 
 # ── Проверка входных данных (#53) ─────────────────────────────────────────────
@@ -805,18 +777,11 @@ def read_athlete_history(bucket, sub, limit=ATHLETE_HISTORY_LIMIT):
 # ── Races helpers ─────────────────────────────────────────────────────────────
 
 def read_races(bucket, sub):
+    """Индекс стартов (#75), как read_runs."""
     blob = bucket.blob(p_races(sub))
     if not blob.exists():
         return []
     return json.loads(blob.download_as_text())
-
-
-def upsert_race(bucket, sub, race):
-    return _upsert_entry(bucket, p_races(sub), race)
-
-
-def soft_delete_race(bucket, sub, race_id):
-    return _soft_delete_entry(bucket, p_races(sub), race_id)
 
 
 # ── FIT parsing + run details helpers ────────────────────────────────────────
@@ -926,6 +891,15 @@ def parse_fit_file(fit_bytes):
     }
 
 
+def run_details_path(manifest):
+    """Путь к деталям FIT текущей версии пробежки; None — FIT нет. До #75
+    манифест указывал на сами детали, с #75 — на run.json, а детали —
+    отдельным полем (они могут лежать в более ранней версии)."""
+    if "details_object_path" in manifest:
+        return manifest["details_object_path"]
+    return manifest.get("gcs_object_path")
+
+
 def read_run_details(bucket, sub, run_id):
     """Читает детали пробежки из namespace пользователя (sub — владелец данных).
     Ленивый fallback: если в per-user namespace деталей нет, но есть legacy
@@ -935,10 +909,17 @@ def read_run_details(bucket, sub, run_id):
     """
     man_blob = bucket.blob(p_run_manifest(sub, run_id))
     if man_blob.exists():
-        manifest = json.loads(man_blob.download_as_text())
-        details_blob = bucket.blob(manifest["gcs_object_path"])
-        return json.loads(details_blob.download_as_text()) if details_blob.exists() else None
+        path = run_details_path(json.loads(man_blob.download_as_text()))
+        details_blob = bucket.blob(path) if path else None
+        if details_blob is None or not details_blob.exists():
+            return None
+        return json.loads(details_blob.download_as_text())
+    return _copy_legacy_run_details(bucket, sub, run_id)
 
+
+def _copy_legacy_run_details(bucket, sub, run_id):
+    """Детали из legacy (глобальных) runs/{id}/ — в namespace sub как v1 со
+    своим манифестом. None — переносить нечего или не положено."""
     # Ленивый перенос legacy — только владельцу этих данных, то есть админу
     # (#53). Проверки «run_id есть в runs.json» мало: id пробежки задаёт
     # клиент, и совпадение с чужим legacy-id отдало бы чужую тренировку.
@@ -1008,61 +989,513 @@ def write_parsed_fit_to_tmp(bucket, sub, fit_bytes, parsed):
     return token
 
 
-def attach_fit_details_to_run(bucket, sub, run, fit_token):
-    """Переносит tmp/{sub}/{token}/* → users/{sub}/runs/{id}/v{N}/* и обновляет run.
-    Бизнес-записи пишутся как иммутабельные версии (commit_version): FIT к той
-    же пробежке ещё раз — это v2, v1 остаётся. tmp — ephemeral cleanup.
+# ── Пробежки и старты: версии (#75) ──────────────────────────────────────────
+#
+# Пробежка и старт — сущности с версиями, как план: манифест и неизменяемые
+# v{N}/run.json (race.json). Создание, правка, скрытие и восстановление —
+# новая версия через commit_version, скрытие — status DELETED. Манифест
+# пробежки общий с деталями FIT: details.json и activity.fit лежат в той
+# версии, где FIT приложили, а run.json и манифест ссылаются на текущие.
+#
+# runs.json и races.json — производный индекс текущих версий: после каждой
+# версии в него ставится её запись, rebuild_index собирает его заново по
+# манифестам. Формат прежний, плюс version, поэтому читатели не меняются.
+# Записи, сделанные до #75, переносит в версии migrate_entity_history, а до
+# миграции — первая же запись этой сущности (_ensure_versioned).
+
+ACTIVE, DELETED = "ACTIVE", "DELETED"
+RUN_FIELDS = ("date", "dist", "type", "time", "pace", "hr", "feel", "notes", "plan_id")
+# Поля из FIT пишет сервер: правка пробежки их не трогает.
+RUN_FIT_FIELDS = ("details_available", "max_hr", "avg_cadence", "total_ascent_m", "calories")
+RACE_FIELDS = ("name", "date", "dist_label", "time")
+ENTITY_HISTORY_LIMIT = 50
+MIGRATION_AUTHOR = "auto-migrate"
+_INDEX_META = ("id", "deleted", "deleted_at", "version")
+_ENTITY_VER_RE = re.compile(r"/v(\d+)/(run|race|details)\.json$")
+
+
+class RunStale(VersionStale):
+    """Правка сделана поверх версии пробежки, которая уже не текущая."""
+
+
+class RaceStale(VersionStale):
+    """Правка сделана поверх версии старта, которая уже не текущая."""
+
+
+class EntityDeleted(Exception):
+    """Правка скрытой пробежки или старта: сначала её восстанавливают."""
+
+
+class FitTokenInvalid(ValueError):
+    """FIT по токену нет в tmp/: просрочен или не тот."""
+
+
+class _Unchanged(Exception):
+    """Новая версия ничего бы не поменяла: payload — текущая."""
+
+    def __init__(self, payload):
+        super().__init__()
+        self.payload = payload
+
+
+class EntityKind:
+    """Пробежка или старт: пути, поля и исключение устаревшей правки."""
+
+    def __init__(self, name, index, folder, manifest, version, fields, carried, links, stale):
+        self.name = name            # ключ снимка полей в payload: run / race
+        self.index = index
+        self.folder = folder
+        self.manifest = manifest
+        self.version = version
+        self.fields = fields        # поля, которые вводит пользователь
+        self.carried = carried      # поля сервера в снимке: переходят из версии в версию
+        self.links = links          # ссылки payload на объекты рядом (детали FIT)
+        self.stale = stale
+
+
+RUNS = EntityKind("run", p_runs, p_runs_dir, p_run_manifest, p_run_ver, RUN_FIELDS,
+                  RUN_FIT_FIELDS, ("details_object_path", "fit_object_path"), RunStale)
+RACES = EntityKind("race", p_races, p_races_dir, p_race_manifest, p_race_ver, RACE_FIELDS,
+                   (), (), RaceStale)
+
+
+def _read_json(bucket, path):
+    blob = bucket.blob(path)
+    return json.loads(blob.download_as_text()) if blob.exists() else None
+
+
+def _is_versioned(kind, sub, eid, manifest):
+    """Манифест указывает на версию сущности. До #75 манифест пробежки
+    указывал на детали FIT — такая пробежка ещё не перенесена."""
+    return isinstance(manifest, dict) and \
+        manifest.get("gcs_object_path") == kind.version(sub, eid, manifest.get("current_version"))
+
+
+def _links(kind, payload):
+    return {key: (payload or {}).get(key) for key in kind.links}
+
+
+def _index_entry(kind, payload):
+    """Запись индекса по версии: снимок полей, deleted, version."""
+    entry = {"id": payload["id"], **(payload.get(kind.name) or {}),
+             "deleted": payload.get("status") == DELETED, "version": payload["version"]}
+    if entry["deleted"]:
+        entry["deleted_at"] = payload.get("deleted_at")
+    return entry
+
+
+def _put_index(bucket, kind, sub, payload):
+    """Ставит в индекс запись версии и возвращает её. Монотонно: если в
+    индексе уже версия новее, ничего не пишется, поэтому две версии, чьи
+    записи пришли в обратном порядке, сходятся на текущей."""
+    entry = _index_entry(kind, payload)
+
+    def put(entries):
+        at = next((i for i, e in enumerate(entries) if e.get("id") == entry["id"]), None)
+        if at is None:
+            entries.insert(0, entry)
+        elif entries[at] == entry or (entries[at].get("version") or 0) > entry["version"]:
+            return None
+        else:
+            entries[at] = entry
+        return entry
+
+    update_json(bucket, kind.index(sub), put, list)
+    return entry
+
+
+def _commit(bucket, kind, sub, eid, build, base_version=None, created_by="api",
+            author="athlete", change_reason="", index=True):
+    """Новая версия сущности → её payload (или текущий, если писать нечего).
+
+    build(prev, version, current) по текущему payload (None — версий ещё
+    нет) возвращает состояние новой версии: status, deleted_at, deleted_by,
+    снимок полей под kind.name, ссылки kind.links и, по желанию,
+    change_reason. Объекты рядом с payload (детали FIT) build создаёт сам;
+    номер занят — None. Писать нечего — _Unchanged. build зовётся внутри
+    claim, то есть по версии, которую манифест подтвердит предусловием, а
+    при повторе — заново, на свежей.
     """
-    run_id = run["id"]
+    def claim(version, current):
+        prev = _read_json(bucket, kind.version(sub, eid, current)) if current else None
+        state = build(prev, version, current)
+        if state is None:
+            return None
+        now = datetime.utcnow().isoformat() + "Z"
+        path = kind.version(sub, eid, version)
+        payload = {"id": eid, "version": version, "is_current": True,
+                   "created_at": now, "created_by": created_by, "author": author,
+                   "change_reason": change_reason, "supersedes_version": current or None,
+                   **state}
+        # payload пишется последним: папка версии, где он есть, полная.
+        if not create_json(bucket, path, payload):
+            return None
+        manifest = {"current_version": version, "gcs_object_path": path,
+                    "status": payload["status"], "created_at": now, "created_by": created_by,
+                    "change_reason": payload["change_reason"],
+                    "checksum": hashlib.sha256(_dumps(payload).encode()).hexdigest()}
+        if "details_object_path" in kind.links:
+            manifest["details_object_path"] = payload["details_object_path"]
+        return manifest, payload
+
+    try:
+        payload = commit_version(bucket, kind.manifest(sub, eid), claim,
+                                 base_version=base_version, stale=kind.stale)
+    except _Unchanged as same:
+        payload = same.payload
+    if index:
+        _put_index(bucket, kind, sub, payload)
+    return payload
+
+
+def _sibling_fit(bucket, details_path):
+    """activity.fit рядом с деталями — если он там есть."""
+    if not details_path or not details_path.endswith("/details.json"):
+        return None
+    path = details_path[:-len("details.json")] + "activity.fit"
+    return path if bucket.blob(path).exists() else None
+
+
+def _details_before_versions(bucket, sub, run_id, manifest, legacy=True):
+    """(ссылки, манифест): детали FIT пробежки, у которой ещё нет версий, — из
+    манифеста деталей до #75, а если его нет — из legacy runs/{id}/ (только
+    у админа, _copy_legacy_run_details; тогда манифест появляется). manifest
+    — уже прочитанный или None."""
+    if manifest is None and legacy:
+        _copy_legacy_run_details(bucket, sub, run_id)
+        manifest = _read_json(bucket, p_run_manifest(sub, run_id))
+    details = run_details_path(manifest) if manifest else None
+    links = {"details_object_path": details, "fit_object_path": _sibling_fit(bucket, details)}
+    return links, manifest
+
+
+def _migrate_entity(bucket, kind, sub, entry, manifest):
+    """Базовая версия из записи индекса до #75 — снимок как есть. manifest —
+    уже прочитанный манифест (у пробежки до #75 — деталей FIT) или None.
+    False — базовую версию успел записать параллельный запрос."""
+    eid = entry["id"]
+    deleted = bool(entry.get("deleted"))
+    state = {"status": DELETED if deleted else ACTIVE,
+             "deleted_at": entry.get("deleted_at") if deleted else None, "deleted_by": None,
+             kind.name: {k: v for k, v in entry.items() if k not in _INDEX_META}}
+    if kind is RUNS:
+        links, manifest = _details_before_versions(bucket, sub, eid, manifest,
+                                                   legacy=bool(entry.get("details_available")))
+        state.update(links)
+    try:
+        # base_version — увиденная текущая: вторая базовая версия не пройдёт.
+        _commit(bucket, kind, sub, eid, lambda prev, version, current: state,
+                base_version=manifest.get("current_version", 0) if manifest else 0,
+                created_by=MIGRATION_AUTHOR, author="migration",
+                change_reason=f"перенос из {kind.index(sub).rsplit('/', 1)[-1]} (#75)",
+                index=False)
+    except VersionStale:
+        return False
+    return True
+
+
+def _ensure_versioned(bucket, kind, sub, eid):
+    """Есть ли у сущности версии; запись индекса без них сначала переносится
+    (_migrate_entity). Индекс тут не пишется: его поставит запись, ради
+    которой переносили."""
+    manifest = _read_json(bucket, kind.manifest(sub, eid))
+    if _is_versioned(kind, sub, eid, manifest):
+        return True
+    entry = next((e for e in _read_index(bucket, kind, sub)
+                  if isinstance(e, dict) and e.get("id") == eid), None)
+    if entry is None:
+        return False
+    _migrate_entity(bucket, kind, sub, entry, manifest)
+    return True
+
+
+def _read_index(bucket, kind, sub):
+    return _read_json(bucket, kind.index(sub)) or []
+
+
+def _snapshot(kind, fields, old):
+    """Снимок новой версии: поля пользователя — те, что пришли (из запроса
+    приходят все), поля сервера — из текущей версии."""
+    snapshot = {f: fields[f] for f in kind.fields if f in fields}
+    snapshot.update({f: old[f] for f in kind.carried if f in old})
+    return snapshot
+
+
+def _editable(prev):
+    if prev and prev.get("status") == DELETED:
+        raise EntityDeleted()
+
+
+def _active_state(kind, prev, snapshot, links, change_reason):
+    """Активная версия со снимком snapshot; совпала с текущей — _Unchanged."""
+    state = {"status": ACTIVE, "deleted_at": None, "deleted_by": None,
+             kind.name: snapshot, **links}
+    if prev and all(prev.get(k) == v for k, v in state.items()):
+        raise _Unchanged(prev)
+    if not change_reason:
+        state["change_reason"] = "правка" if prev else "создание"
+    return state
+
+
+def _staged_fit(bucket, sub, fit_token):
+    """FIT, разобранный в tmp/ (write_parsed_fit_to_tmp)."""
     tmp_fit = bucket.blob(p_tmp_fit(sub, fit_token))
     tmp_details = bucket.blob(p_tmp_details(sub, fit_token))
     if not tmp_fit.exists() or not tmp_details.exists():
-        raise ValueError(f"FIT token expired or invalid: {fit_token}")
+        raise FitTokenInvalid(f"FIT token expired or invalid: {fit_token}")
+    return {"fit": tmp_fit, "details": tmp_details,
+            "raw": json.loads(tmp_details.download_as_text())}
 
-    raw_details = json.loads(tmp_details.download_as_text())
-    summary = raw_details.get("summary", {}) or {}
 
-    def claim(version, current):
-        now = datetime.utcnow().isoformat() + "Z"
-        fit_path = p_run_fit(sub, run_id, version)
-        details_path = p_run_details(sub, run_id, version)
-        details = {
-            "version": version,
-            "is_current": True,
-            "created_at": now,
-            "supersedes_version": current or None,
-            "source": "garmin_fit",
-            "fit_object_path": fit_path,
-            "date": raw_details.get("date"),
-            "summary": summary,
-            "laps": raw_details.get("laps", []),
-            "samples": raw_details.get("samples", {}),
-        }
-        # Номер занимает details.json; FIT ложится рядом. Если FIT по этому
-        # номеру уже есть (след сбоя), номер считается занятым.
-        if not create_json(bucket, details_path, details) or not copy_once(bucket, tmp_fit, fit_path):
+def _place_fit(bucket, sub, run_id, version, current, staged):
+    """details.json и activity.fit из tmp/ — в папку версии; ссылки на них.
+    None — номер занят: объект уже есть (след сбоя или параллельной записи)."""
+    raw = staged["raw"]
+    fit_path, details_path = p_run_fit(sub, run_id, version), p_run_details(sub, run_id, version)
+    details = {
+        "version": version,
+        "is_current": True,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "supersedes_version": current or None,
+        "source": "garmin_fit",
+        "fit_object_path": fit_path,
+        "date": raw.get("date"),
+        "summary": raw.get("summary", {}) or {},
+        "laps": raw.get("laps", []),
+        "samples": raw.get("samples", {}),
+    }
+    if not create_json(bucket, details_path, details) or \
+            not copy_once(bucket, staged["fit"], fit_path):
+        return None
+    staged["placed"] = details
+    return {"details_object_path": details_path, "fit_object_path": fit_path}
+
+
+def _drop_tmp_fit(staged):
+    """tmp/ — временные данные (CLAUDE.md): после переноса удаляются."""
+    staged["fit"].delete()
+    staged["details"].delete()
+
+
+def save_run(bucket, sub, run, fit_token=None, base_version=None, change_reason="",
+             created_by="api", author="athlete", default_plan_id=None):
+    """Создание или правка пробежки → запись индекса.
+
+    run — id и поля пользователя (RUN_FIELDS). Поля из FIT и детали
+    переходят из текущей версии; с fit_token в новую версию ложатся свои
+    details.json и activity.fit из tmp/ — FIT к той же пробежке ещё раз
+    тоже новая версия. plan_id не пришёл: при правке остаётся прежний, у
+    новой пробежки — default_plan_id (активный план). base_version не
+    совпал с текущей → RunStale, скрытая пробежка → EntityDeleted.
+    """
+    run_id = run["id"]
+    staged = _staged_fit(bucket, sub, fit_token) if fit_token else None
+    inherited = {}
+    if not _ensure_versioned(bucket, RUNS, sub, run_id):
+        # Новая пробежка. Под её id уже могут быть детали без версий — legacy
+        # у админа или зафиксированные до #75 без записи в runs.json: версия
+        # ссылается на них.
+        inherited, _ = _details_before_versions(
+            bucket, sub, run_id, _read_json(bucket, p_run_manifest(sub, run_id)))
+
+    def build(prev, version, current):
+        _editable(prev)
+        old = (prev or {}).get("run") or {}
+        snapshot = _snapshot(RUNS, run, old)
+        if snapshot.get("plan_id") is None:
+            snapshot["plan_id"] = old.get("plan_id") if prev else default_plan_id
+        links = _links(RUNS, prev) if prev else {**_links(RUNS, None), **inherited}
+        if staged:
+            links = _place_fit(bucket, sub, run_id, version, current, staged)
+            if links is None:
+                return None
+            summary = staged["raw"].get("summary", {}) or {}
+            snapshot.update(details_available=True, max_hr=summary.get("max_hr"),
+                            avg_cadence=summary.get("avg_cadence"),
+                            total_ascent_m=summary.get("total_ascent_m"),
+                            calories=summary.get("calories"))
+        return _active_state(RUNS, prev, snapshot, links, change_reason)
+
+    payload = _commit(bucket, RUNS, sub, run_id, build, base_version=base_version,
+                      created_by=created_by, author=author, change_reason=change_reason)
+    if staged:
+        _drop_tmp_fit(staged)
+        # Гистограммы для нагрузки (#66) — сразу, чтобы новую пробежку не
+        # пришлось дочитывать. Не вышло — пробежка всё равно сохраняется, а
+        # гистограммы дочитает build_training_load.
+        try:
+            remember_run_hist(bucket, sub, run_id, staged["placed"])
+        except Exception:
+            logging.exception("run_hist: гистограммы пробежки %s не записаны", run_id)
+    return _index_entry(RUNS, payload)
+
+
+def save_race(bucket, sub, race, base_version=None, change_reason="", created_by="api"):
+    """Создание или правка старта → запись индекса. race — id и RACE_FIELDS."""
+    _ensure_versioned(bucket, RACES, sub, race["id"])
+
+    def build(prev, version, current):
+        _editable(prev)
+        snapshot = _snapshot(RACES, race, (prev or {}).get("race") or {})
+        return _active_state(RACES, prev, snapshot, {}, change_reason)
+
+    payload = _commit(bucket, RACES, sub, race["id"], build, base_version=base_version,
+                      created_by=created_by, change_reason=change_reason)
+    return _index_entry(RACES, payload)
+
+
+def _set_status(bucket, kind, sub, eid, status, by, change_reason):
+    """Скрытие или восстановление — новая версия с тем же снимком полей.
+    None — такой сущности нет. Уже в этом состоянии — без записи, поэтому
+    повторное скрытие не сдвигает deleted_at."""
+    if not _ensure_versioned(bucket, kind, sub, eid):
+        return None
+
+    def build(prev, version, current):
+        if prev.get("status", ACTIVE) == status:
+            raise _Unchanged(prev)
+        deleted = status == DELETED
+        return {"status": status,
+                "deleted_at": datetime.utcnow().isoformat() + "Z" if deleted else None,
+                "deleted_by": by if deleted else None,
+                kind.name: prev.get(kind.name) or {}, **_links(kind, prev)}
+
+    return _index_entry(kind, _commit(bucket, kind, sub, eid, build, created_by=by,
+                                      change_reason=change_reason))
+
+
+def delete_run(bucket, sub, run_id, deleted_by="api"):
+    return _set_status(bucket, RUNS, sub, run_id, DELETED, deleted_by, "скрытие")
+
+
+def restore_run(bucket, sub, run_id, restored_by="api"):
+    return _set_status(bucket, RUNS, sub, run_id, ACTIVE, restored_by, "восстановление")
+
+
+def delete_race(bucket, sub, race_id, deleted_by="api"):
+    return _set_status(bucket, RACES, sub, race_id, DELETED, deleted_by, "скрытие")
+
+
+def restore_race(bucket, sub, race_id, restored_by="api"):
+    return _set_status(bucket, RACES, sub, race_id, ACTIVE, restored_by, "восстановление")
+
+
+def _history_entry(kind, number, payload, path):
+    if path.endswith("/details.json"):      # версия до #75: только детали FIT
+        return {"version": number, "created_at": payload.get("created_at"),
+                "author": "athlete", "change_reason": "детали FIT", "status": ACTIVE,
+                "fit_attached": True, kind.name: None}
+    entry = {"version": number, "created_at": payload.get("created_at"),
+             "author": payload.get("author") or "athlete",
+             "change_reason": payload.get("change_reason") or "",
+             "status": payload.get("status") or ACTIVE, kind.name: payload.get(kind.name)}
+    if "details_object_path" in kind.links:
+        entry["fit_attached"] = (payload.get("details_object_path") or "").endswith(
+            f"/v{number}/details.json")
+    return entry
+
+
+def read_entity_history(bucket, kind, sub, eid, limit=ENTITY_HISTORY_LIMIT):
+    """Версии сущности от новых к старым; None — такой нет. Скрытая тоже
+    отдаётся: это явное историческое чтение. Почты автора в истории нет,
+    как и у плана, — только author (athlete / migration)."""
+    manifest = _read_json(bucket, kind.manifest(sub, eid))
+    if not isinstance(manifest, dict):
+        return None
+    current = manifest.get("current_version") or 0
+    files = {}
+    for blob in bucket.list_blobs(prefix=f"{kind.folder(sub)}{eid}/v"):
+        m = _ENTITY_VER_RE.search(blob.name)
+        if m and int(m.group(1)) <= current:
+            files.setdefault(int(m.group(1)), {})[m.group(2)] = blob.name
+    # У версии payload — run.json (race.json), у версии до #75 — details.json.
+    paths = {n: names.get(kind.name) or names.get("details") for n, names in files.items()}
+    numbers = sorted((n for n, path in paths.items() if path), reverse=True)
+    page = numbers[:limit]
+    payloads = dict(zip(page, _load_json_objects(
+        bucket, [paths[n] for n in page], skip_broken=True)))
+    versions = [_history_entry(kind, n, payloads[n], paths[n])
+                for n in version_chain(payloads, current) if isinstance(payloads[n], dict)]
+    return {f"{kind.name}_id": eid, "versions": versions, "has_more": len(numbers) > len(page)}
+
+
+def read_run_history(bucket, sub, run_id, limit=ENTITY_HISTORY_LIMIT):
+    return read_entity_history(bucket, RUNS, sub, run_id, limit)
+
+
+def read_race_history(bucket, sub, race_id, limit=ENTITY_HISTORY_LIMIT):
+    return read_entity_history(bucket, RACES, sub, race_id, limit)
+
+
+def _entity_id(name, folder):
+    """id сущности по имени манифеста folder/{id}/manifest.json; иначе None."""
+    head, _, tail = name[len(folder):].partition("/")
+    return int(head) if tail == "manifest.json" and head.isdigit() else None
+
+
+def rebuild_index(bucket, kind, sub):
+    """Индекс заново по манифестам → {"entries", "changed"}.
+
+    Запись индекса, у сущности которой версий ещё нет (до миграции),
+    остаётся как есть. Порядок — по id от новых к старым: id — время
+    создания. Индекс совпал с собранным — ничего не пишется.
+    """
+    folder = kind.folder(sub)
+    ids = sorted({eid for blob in bucket.list_blobs(prefix=folder)
+                  if (eid := _entity_id(blob.name, folder)) is not None})
+    manifests = _load_json_objects(bucket, [kind.manifest(sub, eid) for eid in ids],
+                                   skip_broken=True)
+    current = {eid: m for eid, m in zip(ids, manifests) if _is_versioned(kind, sub, eid, m)}
+    # Нечитаемая версия записи не даёт: в индексе остаётся то, что было.
+    payloads = _load_json_objects(bucket, [m["gcs_object_path"] for m in current.values()],
+                                  skip_broken=True)
+    built = {eid: _index_entry(kind, p) for eid, p in zip(current, payloads)
+             if isinstance(p, dict)}
+    seen = {}
+
+    def rebuild(entries):
+        merged = {**{e.get("id"): e for e in entries if isinstance(e, dict)}, **built}
+        fresh = sorted(merged.values(), reverse=True,
+                       key=lambda e: e.get("id") if isinstance(e.get("id"), int) else 0)
+        seen["entries"] = len(fresh)
+        if fresh == entries:
             return None
-        return {"current_version": version, "gcs_object_path": details_path,
-                "updated_at": now}, details
+        entries[:] = fresh
+        return True
 
-    final_details = commit_version(bucket, p_run_manifest(sub, run_id), claim)
+    changed = update_json(bucket, kind.index(sub), rebuild, list)
+    return {"entries": seen.get("entries", 0), "changed": bool(changed)}
 
-    tmp_fit.delete()
-    tmp_details.delete()
 
-    # Гистограммы для нагрузки (#66) — сразу, чтобы новую пробежку не пришлось
-    # дочитывать. Не вышло — пробежка всё равно сохраняется, а гистограммы
-    # дочитает build_training_load.
-    try:
-        remember_run_hist(bucket, sub, run_id, final_details)
-    except Exception:
-        logging.exception("run_hist: гистограммы пробежки %s не записаны", run_id)
+def migrate_entity_history(bucket, sub):
+    """Пробежки и старты sub — в версии: базовая версия для каждой записи
+    индекса без версий, затем пересборка индекса. Идемпотентна: повторный
+    вызов только сверяет индекс с версиями."""
+    report = {}
+    for kind in (RUNS, RACES):
+        entries = [e for e in _read_index(bucket, kind, sub)
+                   if isinstance(e, dict) and _clean_id(e.get("id"))]
+        manifests = _load_json_objects(bucket, [kind.manifest(sub, e["id"]) for e in entries],
+                                       skip_broken=True)
+        todo = [(e, m) for e, m in zip(entries, manifests)
+                if not _is_versioned(kind, sub, e["id"], m)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            migrated = sum(pool.map(lambda em: _migrate_entity(bucket, kind, sub, *em), todo))
+        report[f"{kind.name}s"] = {"migrated": migrated, **rebuild_index(bucket, kind, sub)}
+    return report
 
-    run["details_available"] = True
-    run["max_hr"] = summary.get("max_hr")
-    run["avg_cadence"] = summary.get("avg_cadence")
-    run["total_ascent_m"] = summary.get("total_ascent_m")
-    run["calories"] = summary.get("calories")
+
+def migrate_all_entity_history(bucket):
+    """migrate_entity_history по всем пользователям реестра (админ, #75):
+    {sub: отчёт}. Сбой у одного пользователя не останавливает остальных."""
+    report = {}
+    for sub in sorted(_fresh_registry(bucket).get("users", {})):
+        try:
+            report[sub] = migrate_entity_history(bucket, sub)
+        except Exception as e:
+            logging.exception("migrate-history: %s", sub)
+            report[sub] = {"error": str(e)[:120]}
+    return report
 
 
 # ── Plan helpers (per-plan weeks; #25) ────────────────────────────────────────
@@ -1441,7 +1874,7 @@ def migrate_single_plan(bucket, sub):
     Данные гонки берём из profile.json, текущие недели — из users/{sub}/plan/.
     Старые версии остаются по legacy-пути (append-only, ничего не удаляем):
     текущие недели переписываются как v1 нового плана.
-    Всем существующим пробежкам проставляется plan_id.
+    Активным пробежкам без плана проставляется plan_id.
     """
     index = _empty_plans_index()
 
@@ -1475,14 +1908,15 @@ def migrate_single_plan(bucket, sub):
             save_plan_weeks(bucket, sub, plan["id"], weeks,
                             "migrated from single plan (#25)", "auto-migrate", base_version=0)
 
-    # Привязываем существующие пробежки к мигрированному плану
-    def bind(runs):
-        unbound = [r for r in runs if not r.get("plan_id")]
-        for r in unbound:
-            r["plan_id"] = plan["id"]
-        return unbound or None
-
-    update_json(bucket, p_runs(sub), bind, list)
+    # Привязываем существующие пробежки к мигрированному плану — новой
+    # версией каждой (#75): правку индекса стёрла бы его пересборка. Скрытые
+    # не правятся, их и не показывают.
+    for run in read_runs(bucket, sub):
+        if isinstance(run, dict) and _clean_id(run.get("id")) and \
+                not run.get("plan_id") and not run.get("deleted"):
+            save_run(bucket, sub, {**run, "plan_id": plan["id"]},
+                     change_reason="привязка к плану (#25)",
+                     created_by=MIGRATION_AUTHOR, author="migration")
     return index
 
 

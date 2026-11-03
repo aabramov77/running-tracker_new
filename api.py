@@ -17,14 +17,15 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS,
                     MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
-from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
-                     LLMTruncated, PlansIndexBusy, PlanStale, RegistrationClosed,
-                     StorageBusy, UsageBusy,
+from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
+                     FitTokenInvalid, LLMRefused, LLMTruncated, PlansIndexBusy,
+                     PlanStale, RaceStale, RegistrationClosed, RunStale,
+                     StorageBusy, UsageBusy, RACE_FIELDS, RUN_FIELDS,
                      _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
-                     attach_fit_details_to_run, build_ai_turn,
+                     build_ai_turn,
                      build_plan_compliance, call_llm,
                      chat_unread, mark_chat_read, read_chat,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
@@ -33,23 +34,26 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
                      create_ai_thread, create_plan,
-                     current_coach, find_own_run, find_plan, get_active_plan,
+                     current_coach, delete_race, delete_run,
+                     find_own_run, find_plan, get_active_plan,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
                      mark_proposal_states, mask_key,
-                     migrate_legacy_to_user, my_coach, notify_plan_change,
+                     migrate_all_entity_history, migrate_legacy_to_user,
+                     my_coach, notify_plan_change,
                      parse_coach_reply, parse_fit_file, plan_author, plan_meta_unchanged,
                      read_advice_usage, read_ai_messages,
                      read_ai_thread, read_athlete_history,
                      read_athlete_profile,
                      read_llm_config_full, read_plan_history, read_plan_state,
                      read_plans_index,
-                     read_races, read_registry, read_run_details, read_runs,
+                     read_race_history, read_races, read_registry,
+                     read_run_details, read_run_history, read_runs,
                      release_advice_usage, reserve_advice_usage,
-                     resolve_user, run_title, save_plan_weeks, set_active_plan,
+                     resolve_user, restore_race, restore_run, run_title,
+                     save_plan_weeks, save_race, save_run, set_active_plan,
                      set_coach_flag, set_coach_plan_edit, set_user_coach,
-                     set_user_status, soft_delete_race, soft_delete_run,
-                     update_plan_meta, upsert_race, upsert_run,
+                     set_user_status, update_plan_meta,
                      write_athlete_version, write_llm_config_version,
                      write_parsed_fit_to_tmp)
 
@@ -438,6 +442,11 @@ def h_admin_migrate_legacy(c):
     return jresp(migrate_legacy_to_user(c.bucket, c.sub), 200)
 
 
+def h_admin_migrate_history(c):
+    # Пробежки и старты всех пользователей — в версии, индексы — заново (#75).
+    return jresp(migrate_all_entity_history(c.bucket), 200)
+
+
 def h_parse_fit(c):
     fit_file = c.request.files.get("fit") if c.request.files else None
     if not fit_file:
@@ -802,23 +811,43 @@ def h_races_post(c):
     clean, errors = clean_race(body)
     if errors:
         return validation_failed(errors)
-    race = {
-        "id": clean["id"] or _new_id(),
-        "name": clean["name"], "date": clean["date"],
-        "dist_label": clean["dist_label"], "time": clean["time"],
-        "deleted": False,
-    }
-    return jresp(upsert_race(c.bucket, c.sub, race), 201)
+    base_version, bad = _base_version(body)
+    if bad:
+        return bad
+    race = {"id": clean["id"] or _new_id(), **{f: clean[f] for f in RACE_FIELDS}}
+    try:
+        entry = save_race(c.bucket, c.sub, race, base_version=base_version,
+                          change_reason=clean_change_reason(body.get("change_reason")),
+                          created_by=c.email)
+    except RaceStale:
+        return jresp({"error": "race_stale"}, 409)
+    except EntityDeleted:
+        return jresp({"error": "race_deleted"}, 409)
+    return jresp(entry, 201)
 
 
 def h_races_delete(c):
     race_id, bad = c.query_id()
     if bad:
         return bad
-    target = soft_delete_race(c.bucket, c.sub, race_id)
+    target = delete_race(c.bucket, c.sub, race_id, deleted_by=c.email)
     if not target:
         return jresp({"error": "Race not found"}, 404)
     return jresp({"soft_deleted": race_id, "deleted_at": target["deleted_at"]}, 200)
+
+
+def h_race_restore(c):
+    race = restore_race(c.bucket, c.sub, int(c.args[0]), restored_by=c.email)
+    if not race:
+        return jresp({"error": "Race not found"}, 404)
+    return jresp(race, 200)
+
+
+def h_race_history(c):
+    history = read_race_history(c.bucket, c.sub, int(c.args[0]))
+    if history is None:
+        return jresp({"error": "Race not found"}, 404)
+    return jresp(history, 200)
 
 
 def h_plans_get(c):
@@ -872,11 +901,20 @@ def _plan_stale():
     return jresp({"error": "plan_stale"}, 409)
 
 
-def _save_plan_weeks(c, sub, plan_id, body, author):
-    """Новая версия недель плана sub → (результат, None) или (None, ответ с ошибкой)."""
+def _base_version(body):
+    """Версия, поверх которой сделана правка (#51, #75) → (версия, None) или
+    (None, ответ с ошибкой). None — без сверки."""
     base_version = body.get("base_version")
     if base_version is not None and (type(base_version) is not int or base_version < 0):
         return None, jresp({"error": "invalid base_version"}, 400)
+    return base_version, None
+
+
+def _save_plan_weeks(c, sub, plan_id, body, author):
+    """Новая версия недель плана sub → (результат, None) или (None, ответ с ошибкой)."""
+    base_version, bad = _base_version(body)
+    if bad:
+        return None, bad
     weeks, errors = clean_plan_weeks(body["weeks"])
     if errors:
         return None, validation_failed(errors)
@@ -965,41 +1003,52 @@ def h_runs_post(c):
     clean, errors = clean_run(body, index)
     if errors:
         return validation_failed(errors)
-    # Привязка к плану: явный plan_id или активный план (#25)
-    plan_id = clean["plan_id"]
-    if plan_id is None:
-        active = find_plan(index, index.get("active_plan_id"))
-        plan_id = active["id"] if active else None
-
-    run = {
-        "id": clean["id"] or _new_id(),
-        "date": clean["date"], "dist": clean["dist"],
-        "type": clean["type"], "time": clean["time"],
-        "pace": clean["pace"], "hr": clean["hr"],
-        "feel": clean["feel"], "notes": clean["notes"],
-        "plan_id": plan_id,
-        "deleted": False,
-    }
-    if clean["fit_token"]:
-        try:
-            attach_fit_details_to_run(c.bucket, c.sub, run, clean["fit_token"])
-        except ValueError:
-            # Токена нет или он просрочен. Прочие сбои — не ошибка запроса:
-            # они уходят в лог и отдаются как internal_error.
-            return jresp({"error": "Failed to attach FIT details: "
-                                   "token expired or invalid"}, 400)
-
-    return jresp(upsert_run(c.bucket, c.sub, run), 201)
+    base_version, bad = _base_version(body)
+    if bad:
+        return bad
+    # Привязка к плану: явный plan_id, при правке — прежний, у новой
+    # пробежки — активный план (#25)
+    active = find_plan(index, index.get("active_plan_id"))
+    run = {"id": clean["id"] or _new_id(), **{f: clean[f] for f in RUN_FIELDS}}
+    try:
+        entry = save_run(c.bucket, c.sub, run, fit_token=clean["fit_token"],
+                         base_version=base_version,
+                         change_reason=clean_change_reason(body.get("change_reason")),
+                         created_by=c.email, default_plan_id=active["id"] if active else None)
+    except FitTokenInvalid:
+        # Токена нет или он просрочен. Прочие сбои — не ошибка запроса:
+        # они уходят в лог и отдаются как internal_error.
+        return jresp({"error": "Failed to attach FIT details: "
+                               "token expired or invalid"}, 400)
+    except RunStale:
+        return jresp({"error": "run_stale"}, 409)
+    except EntityDeleted:
+        return jresp({"error": "run_deleted"}, 409)
+    return jresp(entry, 201)
 
 
 def h_runs_delete(c):
     run_id, bad = c.query_id()
     if bad:
         return bad
-    target = soft_delete_run(c.bucket, c.sub, run_id)
+    target = delete_run(c.bucket, c.sub, run_id, deleted_by=c.email)
     if not target:
         return jresp({"error": "Run not found"}, 404)
     return jresp({"soft_deleted": run_id, "deleted_at": target["deleted_at"]}, 200)
+
+
+def h_run_restore(c):
+    run = restore_run(c.bucket, c.sub, int(c.args[0]), restored_by=c.email)
+    if not run:
+        return jresp({"error": "Run not found"}, 404)
+    return jresp(run, 200)
+
+
+def h_run_history(c):
+    history = read_run_history(c.bucket, c.sub, int(c.args[0]))
+    if history is None:
+        return jresp({"error": "Run not found"}, 404)
+    return jresp(history, 200)
 
 
 # ── Таблица маршрутов (#36) ───────────────────────────────────────────────────
@@ -1014,6 +1063,7 @@ ROUTES = [
     ("POST",   r"^/admin/users/(approve|reject)$", h_admin_user_status,  True),
     ("POST",   r"^/admin/users/coach$",          h_admin_user_coach,     True),
     ("POST",   r"^/admin/migrate-legacy$",       h_admin_migrate_legacy, True),
+    ("POST",   r"^/admin/migrate-history$",      h_admin_migrate_history, True),
 
     ("GET",    r"^/coaches$",                    h_coaches,              False),
     ("GET",    r"^/my/coach$",                   h_my_coach_get,         False),
@@ -1040,6 +1090,8 @@ ROUTES = [
 
     ("POST",   r"^/runs/parse-fit$",             h_parse_fit,            False),
     ("GET",    r"^/runs/(\d+)/details$",         h_run_details,          False),
+    ("GET",    r"^/runs/(\d+)/history$",         h_run_history,          False),
+    ("POST",   r"^/runs/(\d+)/restore$",         h_run_restore,          False),
     ("GET",    r"^/load$",                       h_load,                 False),
 
     ("GET",    r"^/config/llm$",                 h_llm_config_get,       True),
@@ -1062,6 +1114,8 @@ ROUTES = [
     ("GET",    r"^/races$",                      h_races_get,            False),
     ("POST",   r"^/races$",                      h_races_post,           False),
     ("DELETE", r"^/races$",                      h_races_delete,         False),
+    ("GET",    r"^/races/(\d+)/history$",        h_race_history,         False),
+    ("POST",   r"^/races/(\d+)/restore$",        h_race_restore,         False),
 
     ("GET",    r"^/plans$",                      h_plans_get,            False),
     ("POST",   r"^/plans$",                      h_plans_post,           False),
