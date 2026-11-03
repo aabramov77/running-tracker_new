@@ -13,7 +13,7 @@
 <meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
 <meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=31">
+<link rel="stylesheet" href="style.css?v=32">
 <link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -409,7 +409,15 @@
 
     <!-- ФОРМА ЗАПИСИ -->
     <div class="card" id="run-form-card">
-      <div class="card-title">Записать пробежку</div>
+      <div class="card-title" id="run-form-title">Записать пробежку</div>
+      <!-- Правка пробежки (#76): та же форма с её данными -->
+      <div class="edit-banner" id="run-edit-banner" style="display:none">
+        <div>
+          <div id="run-edit-title"></div>
+          <div class="edit-banner-hint">Сохранение создаёт новую версию, прежняя остаётся в истории правок. Загруженный FIT заменит детали пробежки.</div>
+        </div>
+        <button class="btn-sm" onclick="endRunEdit()">Отменить правку</button>
+      </div>
       <!-- Импорт из Garmin -->
       <div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <label class="btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px">
@@ -475,9 +483,13 @@
           <label>Заметки</label>
           <textarea id="f-notes" placeholder="Например: 3×7 мин по 4:38, пауза 3:00..."></textarea>
         </div>
+        <div class="form-group full" id="f-reason-group" style="display:none">
+          <label for="f-reason">Причина правки</label>
+          <input type="text" id="f-reason" maxlength="200" placeholder="Необязательно — например: часы не остановил">
+        </div>
       </div>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-        <button class="btn-primary" onclick="saveRun()">Сохранить пробежку</button>
+        <button class="btn-primary" id="run-save-btn" onclick="saveRun()">Сохранить пробежку</button>
         <span id="save-msg" class="save-msg">✓ Сохранено!</span>
       </div>
     </div>
@@ -494,6 +506,11 @@
         </div>
       </div>
       <div id="run-log"><div class="empty">Пробежек пока нет. Добавьте первую!</div></div>
+      <!-- Скрытые пробежки (#76): по кнопке, с восстановлением -->
+      <div class="hidden-block">
+        <button class="btn-sm" id="hidden-runs-btn" onclick="toggleHidden('run')">Скрытые пробежки</button>
+        <div id="hidden-runs" style="display:none"></div>
+      </div>
     </div>
   </div>
 
@@ -932,8 +949,20 @@
 
   <!-- СТАРТЫ -->
   <div id="tab-races" class="tab">
-    <div class="card" style="margin-bottom:12px">
-      <div class="card-title">Записать результат забега</div>
+    <div class="card" id="r-card" style="margin-bottom:12px">
+      <div class="card-title" id="r-title">Записать результат забега</div>
+      <!-- Правка старта (#76). id с префиксом r-, как у полей формы: race-* уже
+           заняты карточкой гонки плана -->
+      <div class="edit-banner" id="r-edit-banner" style="display:none">
+        <div>
+          <div id="r-edit-title"></div>
+          <div class="edit-banner-hint">Сохранение создаёт новую версию, прежняя остаётся в истории правок.</div>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn-sm" onclick="showEditedRaceHistory()">🕘 История правок</button>
+          <button class="btn-sm" onclick="endRaceEdit()">Отменить правку</button>
+        </div>
+      </div>
       <div class="form-grid">
         <div class="form-group full">
           <label>Название забега</label>
@@ -957,15 +986,24 @@
           <label>Финишное время (мм:сс или чч:мм:сс)</label>
           <input type="text" id="r-time" placeholder="1:45:30">
         </div>
+        <div class="form-group full" id="r-reason-group" style="display:none">
+          <label for="r-reason">Причина правки</label>
+          <input type="text" id="r-reason" maxlength="200" placeholder="Необязательно — например: уточнил официальное время">
+        </div>
       </div>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-        <button class="btn-primary" onclick="saveRace()">Сохранить результат</button>
+        <button class="btn-primary" id="r-save-btn" onclick="saveRace()">Сохранить результат</button>
         <span id="race-save-msg" class="save-msg">✓ Сохранено!</span>
       </div>
     </div>
     <div class="card">
       <div class="card-title">Мои забеги</div>
       <div id="races-list"><div class="empty">Забегов пока нет. Добавьте первый!</div></div>
+      <!-- Скрытые забеги (#76) -->
+      <div class="hidden-block">
+        <button class="btn-sm" id="hidden-races-btn" onclick="toggleHidden('race')">Скрытые забеги</button>
+        <div id="hidden-races" style="display:none"></div>
+      </div>
     </div>
   </div>
 
@@ -984,7 +1022,7 @@
     </div>
   </div>
 
-  <!-- История плана (#60): у спортсмена и у тренера -->
+  <!-- История плана (#60), пробежки и старта (#76): окно одно на всех -->
   <div id="plan-history-overlay" class="run-detail-overlay" onclick="closePlanHistory(event)">
     <div class="run-detail-card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px">
@@ -1025,6 +1063,8 @@
       <div style="margin-top:20px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn-primary" onclick="closeRunDetail()">Закрыть</button>
         <button class="btn-sm" id="rd-ai-btn">🤖 Разобрать с ИИ</button>
+        <button class="btn-sm" id="rd-edit-btn">✎ Изменить</button>
+        <button class="btn-sm" id="rd-history-btn">🕘 История правок</button>
         <button class="btn-sm" id="rd-delete-btn" style="color:var(--c-danger)">Скрыть пробежку</button>
       </div>
     </div>
@@ -1107,6 +1147,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=51"></script>
+<script src="app.js?v=52"></script>
 </body>
 </html>
