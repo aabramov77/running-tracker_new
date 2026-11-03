@@ -508,6 +508,8 @@ async function apiError(res) {
   const data = await res.json().catch(() => ({}));
   // Реестр планов меняют параллельно (#60) — это не сбой, повтор поможет.
   if (data.error === 'plans_busy') return new Error('Планы сейчас меняют с другого устройства — попробуйте ещё раз');
+  // Те же данные сохраняют параллельно (#35) — повтор поможет.
+  if (data.error === 'storage_busy') return new Error('Данные сейчас меняют с другого устройства — попробуйте ещё раз');
   if (data.error !== 'validation_failed' || !data.fields) return new Error(`HTTP ${res.status}`);
   const text = Object.entries(data.fields).map(([field, why]) => `${field} — ${why}`).join('; ');
   return Object.assign(new Error('Проверьте данные: ' + text), { code: 'validation_failed' });
@@ -528,7 +530,7 @@ async function apiPost(run) {
 async function apiDelete(id) {
   const res = await fetch(`${API_URL}?id=${id}`, { method: 'DELETE', headers: authHeaders() });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   return res.json();
 }
 
@@ -547,7 +549,7 @@ async function apiPostRace(race) {
 async function apiDeleteRace(id) {
   const res = await fetch(`${API_URL}races?id=${id}`, { method: 'DELETE', headers: authHeaders() });
   if (res.status === 401) { handleAuthError(); throw new Error('Unauthorized'); }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await apiError(res);
   return res.json();
 }
 

@@ -9,7 +9,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from conftest import FakeRequest
+from conftest import FakeRequest, put_json
 
 
 def routes(api_module):
@@ -1444,7 +1444,7 @@ def test_coach_request_writes_nothing_to_the_athlete(api, patched_api, fake_buck
     _coached_with_load(api, patched_api, fake_bucket)
     runs = patched_api.read_runs(fake_bucket, "u1")
     runs[0]["details_available"] = True
-    patched_api.write_runs(fake_bucket, "u1", runs)
+    put_json(fake_bucket, "users/u1/runs.json", runs)
     _seed_run_details(fake_bucket, run_id=runs[0]["id"])
 
     def athlete_data():

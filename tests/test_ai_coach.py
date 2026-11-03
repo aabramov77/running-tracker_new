@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from conftest import FakeRequest
+from conftest import FakeRequest, interleave, put_json
 
 SUB, OTHER = "u1", "u2"
 ADMIN = {"sub": "admin-sub", "email": "aabramov77@gmail.com"}
@@ -455,7 +455,7 @@ def _seed_reviewable_run(api, patched_api, fake_bucket):
         "pace": "5:15", "hr": 149, "feel": "hard", "notes": "тяжело в конце"}))
     runs = patched_api.read_runs(fake_bucket, SUB)
     next(r for r in runs if r["id"] == 501)["details_available"] = True
-    patched_api.write_runs(fake_bucket, SUB, runs)
+    put_json(fake_bucket, f"users/{SUB}/runs.json", runs)
     _seed_details(fake_bucket, 501)
     return 501
 
@@ -1113,6 +1113,28 @@ def test_plan_rewritten_during_apply_is_not_overwritten(api, llm, patched_api, f
     assert manifest["current_version"] == 2 and manifest["change_reason"] == "правка с телефона"
     assert weeks[1]["fri"] == "5 км" and weeks[1]["wed"] == "6×800 м"
     assert not any("/applied/" in name for name in fake_bucket._store)
+
+
+def test_two_applies_at_once_change_the_plan_once(api, llm, patched_api, fake_bucket,
+                                                  storage_module, monkeypatch):
+    """Два «Применить» разом прошли все проверки (#35): план меняет один, второй
+    получает proposal_stale, а не затирает версию первого своей копией."""
+    plan_id = _seed_current_plan(patched_api, fake_bucket)
+    thread, answer = _propose(api, llm)
+    apply = storage_module.apply_ai_proposal
+    rival = []
+    # первый get_blob — чтение манифеста плана при записи версии
+    interleave(fake_bucket, monkeypatch,
+               lambda: rival.append(apply(fake_bucket, SUB, thread["id"], answer["id"])))
+
+    with pytest.raises(storage_module.AICoachError, match="proposal_stale"):
+        apply(fake_bucket, SUB, thread["id"], answer["id"])
+
+    manifest, weeks = _plan_state(patched_api, fake_bucket, plan_id)
+    assert rival[0]["to_version"] == manifest["current_version"] == 2
+    assert weeks[1]["wed"] == "6 км легко"
+    history = storage_module.read_plan_history(fake_bucket, SUB, plan_id)["versions"]
+    assert [v["version"] for v in history] == [2, 1]
 
 
 def test_proposal_goes_stale_once_its_day_has_passed(api, llm, patched_api, fake_bucket, storage_module):

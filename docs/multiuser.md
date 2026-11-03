@@ -49,7 +49,7 @@
 **Новое — реестр пользователей:**
 - `users/registry.json` — мутабельный список пользователей для быстрого чтения
   (статус — это lifecycle-метаданные, изменять разрешено правилом CLAUDE.md)
-- `users/events/{ts}-{sub}-{event}.json` — append-only аудит-лог переходов
+- `users/events/{ts}-{sub}-{event}-{rand}.json` — append-only аудит-лог переходов
   (register / approve / reject) для полной истории изменений
 
 Запись в `users/registry.json` структуры:

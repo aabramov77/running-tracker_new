@@ -62,8 +62,8 @@ def p_profile(sub):            return f"{upfx(sub)}profile.json"   # legacy: г�
 def p_athlete_manifest(sub):   return f"{upfx(sub)}athlete/manifest.json"
 def p_athlete_ver(sub, v):     return f"{upfx(sub)}athlete/v{v}/profile.json"
 def p_run_manifest(sub, rid):  return f"{upfx(sub)}runs/{rid}/manifest.json"
-def p_run_fit(sub, rid):       return f"{upfx(sub)}runs/{rid}/v1/activity.fit"
-def p_run_details(sub, rid):   return f"{upfx(sub)}runs/{rid}/v1/details.json"
+def p_run_fit(sub, rid, v=1):     return f"{upfx(sub)}runs/{rid}/v{v}/activity.fit"
+def p_run_details(sub, rid, v=1): return f"{upfx(sub)}runs/{rid}/v{v}/details.json"
 # Кэш гистограмм пульса и скорости по пробежкам (#66): производное от FIT,
 # не бизнес-запись — восстанавливается целиком, поэтому перезаписывается.
 def p_run_hist(sub):           return f"{upfx(sub)}derived/run_hist.json"
@@ -91,6 +91,159 @@ def legacy_run_manifest(rid): return f"runs/{rid}/manifest.json"
 def legacy_run_fit(rid):      return f"runs/{rid}/v1/activity.fit"
 
 
+# ── Запись в GCS (#35) ────────────────────────────────────────────────────────
+#
+# Каждая запись идёт с предусловием по поколению объекта (if_generation_match),
+# поэтому одновременные запросы не затирают друг друга. Способов три:
+#   create_json    — новый неизменяемый объект; если он уже есть, его не трогаем;
+#   update_json    — изменяемый объект: «прочитал — поправил — записал», а если
+#                    его успели изменить, то заново на свежих данных;
+#   commit_version — новая версия сущности: объекты версии и манифест.
+# Без предусловия пишутся только временные tmp/ — это проверяет
+# tests/test_write_preconditions.py.
+
+WRITE_ATTEMPTS = 8
+VERSION_SLOT_ATTEMPTS = 16   # столько занятых номеров подряд пропускает commit_version
+
+
+class StorageBusy(Exception):
+    """Объект не удалось записать: его всё время меняют параллельные запросы."""
+
+
+class VersionStale(Exception):
+    """Правка сделана поверх версии, которая уже не текущая."""
+
+
+def _dumps(obj):
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+
+
+def create_json(bucket, path, obj):
+    """Пишет объект, только если его ещё нет. False — он уже есть: его не
+    трогаем, а что это значит (повтор, чужая запись), решает вызывающий."""
+    try:
+        bucket.blob(path).upload_from_string(
+            _dumps(obj), content_type="application/json", if_generation_match=0)
+    except PreconditionFailed:
+        return False
+    return True
+
+
+def create_unique_json(bucket, make):
+    """create_json для объекта со случайной частью в имени. make() даёт
+    (путь, объект); имя совпало с уже существующим — make() зовётся заново."""
+    for _ in range(WRITE_ATTEMPTS):
+        path, obj = make()
+        if create_json(bucket, path, obj):
+            return obj
+    raise StorageBusy()
+
+
+def copy_once(bucket, src_blob, dst_path):
+    """Копия объекта, только если по dst_path ещё ничего нет. False — уже есть."""
+    try:
+        bucket.copy_blob(src_blob, bucket, dst_path, if_generation_match=0)
+    except PreconditionFailed:
+        return False
+    return True
+
+
+def update_json(bucket, path, change, empty, busy=StorageBusy):
+    """Меняет изменяемый объект атомарно и возвращает результат change.
+
+    change(data) правит data на месте и возвращает результат; None — писать
+    нечего, тогда и update_json вернёт None. Объекта нет — change получает
+    empty(). Если объект изменили между чтением и записью, change зовётся
+    заново на свежих данных, поэтому побочных эффектов у него быть не должно:
+    события аудита вызывающий пишет после успешной записи, один раз.
+    Не удалось за WRITE_ATTEMPTS попыток — busy().
+    """
+    for _ in range(WRITE_ATTEMPTS):
+        try:
+            blob = bucket.get_blob(path)            # вместе с номером поколения
+            data = json.loads(blob.download_as_text()) if blob else empty()
+            result = change(data)
+            if result is None:
+                return None
+            bucket.blob(path).upload_from_string(
+                _dumps(data), content_type="application/json",
+                if_generation_match=blob.generation if blob else 0)
+            return result
+        except (PreconditionFailed, NotFound):
+            continue        # объект успели изменить — берём свежий
+    raise busy()
+
+
+def commit_version(bucket, manifest_path, claim, base_version=None, stale=VersionStale):
+    """Выпускает новую версию сущности. Возвращает результат claim.
+
+    claim(version, current) создаёт объекты версии version через create_json
+    и возвращает (манифест, результат) либо None, если номер уже занят.
+    current — версия, поверх которой пишем: её claim ставит в
+    supersedes_version.
+
+    1. Манифест читается вместе с поколением. base_version задан и не совпал
+       с текущей версией → stale().
+    2. Номер — первый свободный после текущей. Занятый номер значит, что его
+       пишет параллельный запрос или он остался от сбоя.
+    3. Манифест пишется с предусловием. Не прошло — версию успели выпустить
+       параллельно: с base_version это stale(), без неё — всё заново.
+
+    Объект версии, не попавший в манифест, остаётся в хранилище
+    незафиксированным: он не удаляется и в историю не входит (version_chain).
+    Поэтому номера растут, но могут идти с пропусками.
+    """
+    for _ in range(WRITE_ATTEMPTS):
+        try:
+            man_blob = bucket.get_blob(manifest_path)
+            manifest = json.loads(man_blob.download_as_text()) if man_blob else None
+        except NotFound:
+            continue        # манифест сменился между чтением поколения и содержимого
+        current = manifest["current_version"] if manifest else 0
+        if base_version is not None and base_version != current:
+            raise stale()
+        for version in range(current + 1, current + 1 + VERSION_SLOT_ATTEMPTS):
+            claimed = claim(version, current)
+            if claimed:
+                break
+        else:
+            raise StorageBusy()
+        new_manifest, result = claimed
+        try:
+            bucket.blob(manifest_path).upload_from_string(
+                _dumps(new_manifest), content_type="application/json",
+                if_generation_match=man_blob.generation if man_blob else 0)
+        except PreconditionFailed:
+            if base_version is not None:
+                raise stale()
+            continue
+        return result
+    raise StorageBusy()
+
+
+def version_chain(payloads, current):
+    """Номера зафиксированных версий, от текущей к старым.
+
+    payloads — {номер: payload} загруженных версий; нечитаемая версия — None.
+    Цепочка идёт по supersedes_version от текущей, поэтому версия, не попавшая
+    в манифест (commit_version), в неё не входит. Без supersedes_version
+    (нечитаемая версия) предыдущей считается номер на единицу меньше; номер,
+    объекта которого нет, пропускается. Цепочка обрывается там, где кончаются
+    загруженные версии.
+    """
+    chain, version = [], current
+    lowest = min(payloads, default=0)
+    while version >= max(lowest, 1):
+        if version not in payloads:
+            version -= 1
+            continue
+        chain.append(version)
+        payload = payloads[version]
+        prev = payload.get("supersedes_version") if isinstance(payload, dict) else None
+        version = prev if isinstance(prev, int) and 0 <= prev < version else version - 1
+    return chain
+
+
 # ── Runs helpers ──────────────────────────────────────────────────────────────
 
 def read_runs(bucket, sub):
@@ -100,11 +253,40 @@ def read_runs(bucket, sub):
     return json.loads(blob.download_as_text())
 
 
-def write_runs(bucket, sub, runs):
-    bucket.blob(p_runs(sub)).upload_from_string(
-        json.dumps(runs, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+def _upsert_entry(bucket, path, entry):
+    """Добавляет запись в начало списка или заменяет запись с тем же id."""
+    def put(entries):
+        entries[:] = [e for e in entries if e.get("id") != entry["id"]]
+        entries.insert(0, entry)
+        return entry
+
+    return update_json(bucket, path, put, list)
+
+
+def _soft_delete_entry(bucket, path, entry_id):
+    """Логическое удаление записи списка: deleted и deleted_at. None — записи
+    с таким id нет. Уже удалённая возвращается как есть."""
+    def mark(entries):
+        target = next((e for e in entries if e.get("id") == entry_id), None)
+        if target is None:
+            return None
+        if target.get("deleted"):
+            found.append(target)
+            return None
+        target["deleted"] = True
+        target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
+        return target
+
+    found = []
+    return update_json(bucket, path, mark, list) or (found[-1] if found else None)
+
+
+def upsert_run(bucket, sub, run):
+    return _upsert_entry(bucket, p_runs(sub), run)
+
+
+def soft_delete_run(bucket, sub, run_id):
+    return _soft_delete_entry(bucket, p_runs(sub), run_id)
 
 
 # ── Проверка входных данных (#53) ─────────────────────────────────────────────
@@ -288,12 +470,9 @@ def read_legacy_race_profile(bucket, sub):
 
 
 def write_legacy_race_profile(bucket, sub, profile):
+    """Сид legacy-профиля (миграция). Уже есть — не трогаем: None."""
     clean = {k: (profile.get(k) or "") for k in PROFILE_FIELDS}
-    bucket.blob(p_profile(sub)).upload_from_string(
-        json.dumps(clean, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return clean
+    return clean if create_json(bucket, p_profile(sub), clean) else None
 
 
 # ── Athlete profile (#32) ─────────────────────────────────────────────────────
@@ -570,31 +749,25 @@ def read_athlete_profile(bucket, sub):
 
 
 def write_athlete_version(bucket, sub, profile, change_reason="", created_by="api"):
-    manifest = read_athlete_manifest(bucket, sub)
-    next_version = (manifest["current_version"] + 1) if manifest else 1
-    object_path = p_athlete_ver(sub, next_version)
-    now = datetime.utcnow().isoformat() + "Z"
+    """Новая версия профиля (commit_version) — её payload."""
+    def claim(version, current):
+        object_path = p_athlete_ver(sub, version)
+        now = datetime.utcnow().isoformat() + "Z"
+        payload = {
+            "version": version,
+            "is_current": True,
+            "created_at": now,
+            "created_by": created_by,
+            "change_reason": change_reason or "profile update",
+            "supersedes_version": current or None,
+            "profile": profile,
+        }
+        if not create_json(bucket, object_path, payload):
+            return None
+        return {"current_version": version, "gcs_object_path": object_path,
+                "updated_at": now}, payload
 
-    payload = {
-        "version": next_version,
-        "is_current": True,
-        "created_at": now,
-        "created_by": created_by,
-        "change_reason": change_reason or "profile update",
-        "supersedes_version": next_version - 1 if next_version > 1 else None,
-        "profile": profile,
-    }
-    bucket.blob(object_path).upload_from_string(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    bucket.blob(p_athlete_manifest(sub)).upload_from_string(
-        json.dumps({"current_version": next_version,
-                    "gcs_object_path": object_path,
-                    "updated_at": now}, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return payload
+    return commit_version(bucket, p_athlete_manifest(sub), claim)
 
 
 ATHLETE_HISTORY_LIMIT = 50
@@ -605,17 +778,20 @@ def read_athlete_history(bucket, sub, limit=ATHLETE_HISTORY_LIMIT):
 
     Каждая версия — отдельный объект в GCS, поэтому читаем ограниченное окно:
     у пользователя с сотнями сохранений полный обход упёрся бы в таймаут.
+    Версии, не попавшие в манифест (#35), в историю не входят.
     """
     manifest = read_athlete_manifest(bucket, sub)
     if not manifest:
         return []
     current = manifest["current_version"]
+    numbers = list(range(max(1, current - limit + 1), current + 1))
+    payloads = dict(zip(numbers, _load_json_objects(
+        bucket, [p_athlete_ver(sub, v) for v in numbers], skip_broken=True)))
     history = []
-    for version in range(max(1, current - limit + 1), current + 1):
-        blob = bucket.blob(p_athlete_ver(sub, version))
-        if not blob.exists():
+    for version in reversed(version_chain(payloads, current)):
+        data = payloads[version]
+        if not isinstance(data, dict):
             continue
-        data = json.loads(blob.download_as_text())
         stored = data.get("profile") or {}
         history.append({
             "version": data.get("version", version),
@@ -635,11 +811,12 @@ def read_races(bucket, sub):
     return json.loads(blob.download_as_text())
 
 
-def write_races(bucket, sub, races):
-    bucket.blob(p_races(sub)).upload_from_string(
-        json.dumps(races, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+def upsert_race(bucket, sub, race):
+    return _upsert_entry(bucket, p_races(sub), race)
+
+
+def soft_delete_race(bucket, sub, race_id):
+    return _soft_delete_entry(bucket, p_races(sub), race_id)
 
 
 # ── FIT parsing + run details helpers ────────────────────────────────────────
@@ -776,18 +953,17 @@ def read_run_details(bucket, sub, run_id):
     if not legacy_details.exists():
         return None
 
+    # Перенос идемпотентен: параллельный запрос мог успеть первым, тогда его
+    # копии и манифест остаются как есть.
     legacy_fit = bucket.blob(legacy_run_fit(run_id))
     if legacy_fit.exists():
-        bucket.copy_blob(legacy_fit, bucket, p_run_fit(sub, run_id))
-    bucket.copy_blob(legacy_details, bucket, p_run_details(sub, run_id))
-    bucket.blob(p_run_manifest(sub, run_id)).upload_from_string(
-        json.dumps({
-            "current_version": 1,
-            "gcs_object_path": p_run_details(sub, run_id),
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-        }, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+        copy_once(bucket, legacy_fit, p_run_fit(sub, run_id))
+    copy_once(bucket, legacy_details, p_run_details(sub, run_id))
+    create_json(bucket, p_run_manifest(sub, run_id), {
+        "current_version": 1,
+        "gcs_object_path": p_run_details(sub, run_id),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    })
     return json.loads(bucket.blob(p_run_details(sub, run_id)).download_as_text())
 
 
@@ -833,8 +1009,9 @@ def write_parsed_fit_to_tmp(bucket, sub, fit_bytes, parsed):
 
 
 def attach_fit_details_to_run(bucket, sub, run, fit_token):
-    """Переносит tmp/{sub}/{token}/* → users/{sub}/runs/{id}/v1/* и обновляет run.
-    Бизнес-записи пишутся как иммутабельные версии; tmp — ephemeral cleanup.
+    """Переносит tmp/{sub}/{token}/* → users/{sub}/runs/{id}/v{N}/* и обновляет run.
+    Бизнес-записи пишутся как иммутабельные версии (commit_version): FIT к той
+    же пробежке ещё раз — это v2, v1 остаётся. tmp — ephemeral cleanup.
     """
     run_id = run["id"]
     tmp_fit = bucket.blob(p_tmp_fit(sub, fit_token))
@@ -845,35 +1022,30 @@ def attach_fit_details_to_run(bucket, sub, run, fit_token):
     raw_details = json.loads(tmp_details.download_as_text())
     summary = raw_details.get("summary", {}) or {}
 
-    now = datetime.utcnow().isoformat() + "Z"
-    fit_path = p_run_fit(sub, run_id)
-    details_path = p_run_details(sub, run_id)
+    def claim(version, current):
+        now = datetime.utcnow().isoformat() + "Z"
+        fit_path = p_run_fit(sub, run_id, version)
+        details_path = p_run_details(sub, run_id, version)
+        details = {
+            "version": version,
+            "is_current": True,
+            "created_at": now,
+            "supersedes_version": current or None,
+            "source": "garmin_fit",
+            "fit_object_path": fit_path,
+            "date": raw_details.get("date"),
+            "summary": summary,
+            "laps": raw_details.get("laps", []),
+            "samples": raw_details.get("samples", {}),
+        }
+        # Номер занимает details.json; FIT ложится рядом. Если FIT по этому
+        # номеру уже есть (след сбоя), номер считается занятым.
+        if not create_json(bucket, details_path, details) or not copy_once(bucket, tmp_fit, fit_path):
+            return None
+        return {"current_version": version, "gcs_object_path": details_path,
+                "updated_at": now}, details
 
-    bucket.copy_blob(tmp_fit, bucket, fit_path)
-
-    final_details = {
-        "version": 1,
-        "is_current": True,
-        "created_at": now,
-        "source": "garmin_fit",
-        "fit_object_path": fit_path,
-        "date": raw_details.get("date"),
-        "summary": summary,
-        "laps": raw_details.get("laps", []),
-        "samples": raw_details.get("samples", {}),
-    }
-    bucket.blob(details_path).upload_from_string(
-        json.dumps(final_details, ensure_ascii=False, indent=2, default=str),
-        content_type="application/json"
-    )
-    bucket.blob(p_run_manifest(sub, run_id)).upload_from_string(
-        json.dumps({
-            "current_version": 1,
-            "gcs_object_path": details_path,
-            "updated_at": now,
-        }, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+    final_details = commit_version(bucket, p_run_manifest(sub, run_id), claim)
 
     tmp_fit.delete()
     tmp_details.delete()
@@ -927,72 +1099,52 @@ def read_plan_weeks(bucket, sub, plan_id):
     return read_plan_state(bucket, sub, plan_id)["weeks"]
 
 
-def write_plan_version(bucket, sub, plan_id, version, weeks, change_reason, created_by="api",
-                       author=None):
-    """author — {role, sub}: кто правил план (#60). created_by — почта для
-    аудита, author — для истории, которую видят спортсмен и тренер."""
-    object_path = p_plan_ver(sub, plan_id, version)
-    now = datetime.utcnow().isoformat() + "Z"
-
-    payload = {
-        "version": version,
-        "is_current": True,
-        "created_at": now,
-        "created_by": created_by,
-        "change_reason": change_reason or "",
-        "supersedes_version": version - 1 if version > 1 else None,
-        "weeks": weeks,
-    }
-    if author:
-        payload["author"] = author
-    payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
-    checksum = hashlib.sha256(payload_str.encode()).hexdigest()
-
-    # Записываем иммутабельную версию
-    bucket.blob(object_path).upload_from_string(
-        payload_str, content_type="application/json"
-    )
-
-    # Обновляем манифест (единственный перезаписываемый объект)
-    manifest = {
-        "current_version": version,
-        "gcs_object_path": object_path,
-        "created_at": now,
-        "created_by": created_by,
-        "change_reason": payload["change_reason"],
-        "checksum": checksum,
-    }
-    if author:
-        manifest["author"] = author
-    bucket.blob(p_plan_manifest(sub, plan_id)).upload_from_string(
-        json.dumps(manifest, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return {"version": version, "gcs_object_path": object_path}
-
-
-class PlanStale(Exception):
+class PlanStale(VersionStale):
     """Правка сделана поверх версии плана, которая уже не текущая."""
 
 
 def save_plan_weeks(bucket, sub, plan_id, weeks, change_reason="", created_by="api",
                     base_version=None, author=None):
-    """Пишет следующую версию недель плана.
+    """Пишет следующую версию недель плана (commit_version).
 
     base_version — версия, поверх которой сделана правка (0 — недель ещё не
-    было). Текущая уже другая → PlanStale, ничего не пишется. None — без
-    сверки: так пишет фронтенд, загруженный до #51.
+    было). Текущая уже другая — или её успели сменить параллельно → PlanStale,
+    в манифест ничего не попадает. None — без сверки: так пишет фронтенд,
+    загруженный до #51.
 
-    Сверка и запись идут не атомарно: два одновременных запроса с одной
-    base_version пройдут оба. Закрыто окно «прочитал — правил — записал»;
-    полное решение — предусловия записи (#35).
+    author — {role, sub}: кто правил план (#60). created_by — почта для
+    аудита, author — для истории, которую видят спортсмен и тренер.
     """
-    manifest = read_plan_manifest(bucket, sub, plan_id)
-    current = manifest["current_version"] if manifest else 0
-    if base_version is not None and base_version != current:
-        raise PlanStale("plan_stale")
-    return write_plan_version(bucket, sub, plan_id, current + 1, weeks,
-                              change_reason, created_by, author=author)
+    def claim(version, current):
+        object_path = p_plan_ver(sub, plan_id, version)
+        now = datetime.utcnow().isoformat() + "Z"
+        payload = {
+            "version": version,
+            "is_current": True,
+            "created_at": now,
+            "created_by": created_by,
+            "change_reason": change_reason or "",
+            "supersedes_version": current or None,
+            "weeks": weeks,
+        }
+        if author:
+            payload["author"] = author
+        if not create_json(bucket, object_path, payload):
+            return None
+        manifest = {
+            "current_version": version,
+            "gcs_object_path": object_path,
+            "created_at": now,
+            "created_by": created_by,
+            "change_reason": payload["change_reason"],
+            "checksum": hashlib.sha256(_dumps(payload).encode()).hexdigest(),
+        }
+        if author:
+            manifest["author"] = author
+        return manifest, {"version": version, "gcs_object_path": object_path}
+
+    return commit_version(bucket, p_plan_manifest(sub, plan_id), claim,
+                          base_version=base_version, stale=PlanStale)
 
 
 # ── История версий плана (#60) ────────────────────────────────────────────────
@@ -1027,16 +1179,22 @@ def read_plan_history(bucket, sub, plan_id, limit=PLAN_HISTORY_LIMIT):
     Автор — роль, sub и имя из реестра. Почта в историю не попадает, как и в
     карточку тренера: историю видит и вторая сторона пары.
     """
+    manifest = read_plan_manifest(bucket, sub, plan_id)
+    current = manifest["current_version"] if manifest else 0
     prefix = f"{upfx(sub)}plans/{plan_id}/v"
-    numbers = sorted({int(m.group(1)) for blob in bucket.list_blobs(prefix=prefix)
-                      if (m := _PLAN_VER_RE.search(blob.name))}, reverse=True)
+    # Номера выше текущего — версии, которые ещё пишутся или не попали в
+    # манифест (#35); ниже текущего такие отсеивает version_chain.
+    numbers = sorted({n for blob in bucket.list_blobs(prefix=prefix)
+                      if (m := _PLAN_VER_RE.search(blob.name)) and (n := int(m.group(1))) <= current},
+                     reverse=True)
     page = numbers[:limit]
     # Нечитаемая версия выпадает из истории, а не роняет её целиком.
-    payloads = _load_json_objects(bucket, [p_plan_ver(sub, plan_id, v) for v in page],
-                                  skip_broken=True)
+    payloads = dict(zip(page, _load_json_objects(
+        bucket, [p_plan_ver(sub, plan_id, v) for v in page], skip_broken=True)))
     users = read_registry(bucket).get("users", {})
     versions = []
-    for number, payload in zip(page, payloads):
+    for number in version_chain(payloads, current):
+        payload = payloads[number]
         if not isinstance(payload, dict):
             continue
         role = _version_author_role(payload)
@@ -1132,13 +1290,7 @@ def _read_plans_index_raw(bucket, sub):
 def _create_plans_index(bucket, sub, index):
     """Пишет реестр, только если его ещё нет. None — его успел создать другой
     запрос (if_generation_match=0)."""
-    try:
-        bucket.blob(p_plans_index(sub)).upload_from_string(
-            json.dumps(index, ensure_ascii=False, indent=2),
-            content_type="application/json", if_generation_match=0)
-    except PreconditionFailed:
-        return None
-    return index
+    return index if create_json(bucket, p_plans_index(sub), index) else None
 
 
 def read_plans_index(bucket, sub):
@@ -1166,11 +1318,10 @@ def get_active_plan(bucket, sub):
 # поправил, записал» из двух запросов разом теряло бы одну из правок. Запись
 # идёт с предусловием, как у счётчика обращений к LLM: объект с момента
 # чтения меняли — читаем заново и повторяем.
-PLANS_INDEX_WRITE_ATTEMPTS = 8
 _PLAN_META_EVENT_RE = re.compile(r"^\d{8}T\d{12}-[a-z]+-[0-9a-f]{8}$")
 
 
-class PlansIndexBusy(Exception):
+class PlansIndexBusy(StorageBusy):
     """Реестр планов не удалось обновить: его всё время меняют параллельно."""
 
 
@@ -1178,25 +1329,15 @@ def _update_plans_index(bucket, sub, change):
     """change(index) правит реестр на месте и возвращает результат; None —
     записывать нечего. При повторе change зовётся заново на свежем реестре."""
     path = p_plans_index(sub)
-    for _ in range(PLANS_INDEX_WRITE_ATTEMPTS):
-        blob = bucket.get_blob(path)                # вместе с номером поколения
-        if blob is None:
-            read_plans_index(bucket, sub)           # ленивая миграция создаст реестр
-            blob = bucket.get_blob(path)
-        try:
-            index = json.loads(blob.download_as_text())
-            index.setdefault("plans", [])
-            index.setdefault("active_plan_id", None)
-            result = change(index)
-            if result is None:
-                return None
-            bucket.blob(path).upload_from_string(
-                json.dumps(index, ensure_ascii=False, indent=2),
-                content_type="application/json", if_generation_match=blob.generation)
-            return result
-        except (PreconditionFailed, NotFound):
-            continue        # реестр успели изменить — берём свежий
-    raise PlansIndexBusy()
+    if bucket.get_blob(path) is None:
+        read_plans_index(bucket, sub)               # ленивая миграция создаст реестр
+
+    def normalized(index):
+        index.setdefault("plans", [])
+        index.setdefault("active_plan_id", None)
+        return change(index)
+
+    return update_json(bucket, path, normalized, _empty_plans_index, busy=PlansIndexBusy)
 
 
 def create_plan(bucket, sub, meta, make_active=True, author=None):
@@ -1267,11 +1408,14 @@ def update_plan_meta(bucket, sub, plan_id, meta, author=None):
         # Время в id строго растёт, как у сообщений чата: порядок событий —
         # порядок правок, даже если часы инстанса грубее двух правок подряд.
         ids = _message_ids(bucket, p_plan_meta_prefix(sub, plan_id), _PLAN_META_EVENT_RE)
-        event_id, _ = _next_message_id(ids, (author or {}).get("role") or "owner")
         event = {"plan_id": plan_id, "ts": plan["updated_at"], "author": author,
                  "before": before, "after": {f: plan.get(f, "") for f in PLAN_META_FIELDS}}
-        bucket.blob(p_plan_meta_event(sub, plan_id, event_id)).upload_from_string(
-            json.dumps(event, ensure_ascii=False, indent=2), content_type="application/json")
+
+        def make():
+            event_id, _ = _next_message_id(ids, (author or {}).get("role") or "owner")
+            return p_plan_meta_event(sub, plan_id, event_id), event
+
+        create_unique_json(bucket, make)
     return plan
 
 
@@ -1328,19 +1472,17 @@ def migrate_single_plan(bucket, sub):
         old_data = read_plan_version(bucket, old_manifest.get("gcs_object_path", ""))
         weeks = (old_data or {}).get("weeks", [])
         if weeks:
-            write_plan_version(bucket, sub, plan["id"], 1, weeks,
-                               "migrated from single plan (#25)", "auto-migrate")
+            save_plan_weeks(bucket, sub, plan["id"], weeks,
+                            "migrated from single plan (#25)", "auto-migrate", base_version=0)
 
     # Привязываем существующие пробежки к мигрированному плану
-    runs = read_runs(bucket, sub)
-    changed = False
-    for r in runs:
-        if not r.get("plan_id"):
+    def bind(runs):
+        unbound = [r for r in runs if not r.get("plan_id")]
+        for r in unbound:
             r["plan_id"] = plan["id"]
-            changed = True
-    if changed:
-        write_runs(bucket, sub, runs)
+        return unbound or None
 
+    update_json(bucket, p_runs(sub), bind, list)
     return index
 
 
@@ -1373,41 +1515,34 @@ def read_llm_config_full(bucket):
 
 
 def write_llm_config_version(bucket, provider, model, api_key, effort=None, created_by="aabramov77"):
-    manifest = read_llm_manifest(bucket)
-    next_version = (manifest["current_version"] + 1) if manifest else 1
-    object_path = f"config/llm/v{next_version}/config.json"
-    now = datetime.utcnow().isoformat() + "Z"
+    """Новая версия конфига LLM (commit_version)."""
+    def claim(version, current):
+        object_path = f"config/llm/v{version}/config.json"
+        now = datetime.utcnow().isoformat() + "Z"
+        payload = {
+            "version": version,
+            "is_current": True,
+            "created_at": now,
+            "created_by": created_by,
+            "provider": provider,
+            "model": model,
+            "api_key": api_key,
+            "effort": clean_effort(effort),
+            "supersedes_version": current or None,
+        }
+        if not create_json(bucket, object_path, payload):
+            return None
+        manifest = {
+            "current_version": version,
+            "gcs_object_path": object_path,
+            "updated_at": now,
+            "provider": provider,
+            "model": model,
+        }
+        return manifest, {"version": version, "provider": provider, "model": model,
+                          "effort": payload["effort"]}
 
-    payload = {
-        "version": next_version,
-        "is_current": True,
-        "created_at": now,
-        "created_by": created_by,
-        "provider": provider,
-        "model": model,
-        "api_key": api_key,
-        "effort": clean_effort(effort),
-        "supersedes_version": next_version - 1 if next_version > 1 else None,
-    }
-    payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
-
-    bucket.blob(object_path).upload_from_string(
-        payload_str, content_type="application/json"
-    )
-
-    new_manifest = {
-        "current_version": next_version,
-        "gcs_object_path": object_path,
-        "updated_at": now,
-        "provider": provider,
-        "model": model,
-    }
-    bucket.blob(LLM_CONFIG_MANIFEST).upload_from_string(
-        json.dumps(new_manifest, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return {"version": next_version, "provider": provider, "model": model,
-            "effort": payload["effort"]}
+    return commit_version(bucket, LLM_CONFIG_MANIFEST, claim)
 
 
 # ── LLM clients (Anthropic / OpenAI / Deepseek) ──────────────────────────────
@@ -1935,34 +2070,25 @@ def read_advice_usage(bucket, sub):
 # двух запросов разом теряет одно из прибавлений. Поэтому запись идёт с
 # предусловием: она проходит, только если объект с момента чтения не меняли
 # (if_generation_match). Не прошла — читаем заново и повторяем (#53; та же
-# основа нужна версионным записям, #35).
-USAGE_WRITE_ATTEMPTS = 8
+# основа у всех записей, #35 — update_json).
 
 
-class UsageBusy(Exception):
+class UsageBusy(StorageBusy):
     """Счётчик не удалось обновить: его всё время меняют параллельные запросы."""
 
 
 def _update_advice_usage(bucket, sub, change):
     """Меняет сегодняшний счётчик атомарно. change(usage) правит его на месте
     и возвращает False, если записывать нечего. Возвращает счётчик или None."""
-    path = p_advice_usage(sub)
     today = datetime.utcnow().date().isoformat()
-    for _ in range(USAGE_WRITE_ATTEMPTS):
-        try:
-            blob = bucket.get_blob(path)            # вместе с номером поколения
-            usage = json.loads(blob.download_as_text()) if blob else {}
-            if usage.get("date") != today:
-                usage = {"date": today, "count": 0}
-            if change(usage) is False:
-                return None
-            bucket.blob(path).upload_from_string(
-                json.dumps(usage, ensure_ascii=False), content_type="application/json",
-                if_generation_match=blob.generation if blob else 0)
-            return usage
-        except (PreconditionFailed, NotFound):
-            continue        # счётчик успели изменить — берём свежий
-    raise UsageBusy()
+
+    def apply(usage):
+        if usage.get("date") != today:
+            usage.clear()
+            usage.update(date=today, count=0)
+        return None if change(usage) is False else usage
+
+    return update_json(bucket, p_advice_usage(sub), apply, dict, busy=UsageBusy)
 
 
 def reserve_advice_usage(bucket, sub, limit):
@@ -2022,18 +2148,25 @@ def read_registry(bucket):
     return data
 
 
-def write_registry(bucket, registry):
-    bucket.blob(USERS_REGISTRY).upload_from_string(
-        json.dumps(registry, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    _registry_cache["data"] = registry
+def update_registry(bucket, change):
+    """Меняет реестр атомарно (update_json) и обновляет кэш инстанса тем, что
+    теперь лежит в хранилище. change(registry) — как в update_json."""
+    seen = {}
+
+    def apply(registry):
+        registry.setdefault("users", {})
+        seen["data"] = registry
+        return change(registry)
+
+    result = update_json(bucket, USERS_REGISTRY, apply, lambda: {"users": {}})
+    _registry_cache["data"] = seen["data"]
     _registry_cache["ts"] = time.time()
+    return result
 
 
 def _fresh_registry(bucket):
-    """Реестр мимо кэша. Кэш живёт REGISTRY_TTL_SEC на каждом инстансе, и
-    запись поверх устаревшей копии затёрла бы чужое изменение."""
+    """Реестр мимо кэша: кэш живёт REGISTRY_TTL_SEC на каждом инстансе, а
+    права доступа должны действовать сразу."""
     data = _load_registry(bucket)
     _registry_cache["data"] = data
     _registry_cache["ts"] = time.time()
@@ -2042,17 +2175,20 @@ def _fresh_registry(bucket):
 
 def append_user_event(bucket, sub, event, actor, details=None):
     """Append-only аудит переходов (register/approve/reject, тренер #44)."""
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
     payload = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "sub": sub, "event": event, "actor": actor,
     }
     if details:
         payload["details"] = details
-    bucket.blob(f"users/events/{ts}-{sub}-{event}.json").upload_from_string(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+
+    def make():
+        # Случайный хвост — как у сообщений чата: время одно на несколько
+        # событий подряд (грубые часы), а затирать событие нельзя (#35).
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+        return f"users/events/{ts}-{sub}-{event}-{secrets_mod.token_hex(4)}.json", payload
+
+    create_unique_json(bucket, make)
 
 
 def _is_admin(bucket, sub):
@@ -2079,48 +2215,55 @@ def resolve_user(bucket, token_info):
     if sub in users:
         return users[sub]
 
-    # Записи в кэше нет — перед записью берём свежий реестр (см. _fresh_registry).
-    registry = _fresh_registry(bucket)
-    users = registry.setdefault("users", {})
-    if sub in users:
-        return users[sub]
-
-    now = datetime.utcnow().isoformat() + "Z"
     # Совпадения адреса мало: админом делает только адрес, который Google
     # подтвердил (#53). Иначе это обычная заявка, как у всех.
     verified = token_info.get("email_verified")
     is_admin = email in ADMIN_EMAILS and (verified is True or verified == "true")
-    if not is_admin:
-        pending = sum(1 for u in users.values() if u.get("status") == "pending")
-        if pending >= MAX_PENDING:
-            raise RegistrationClosed()
+    existing = {}
 
-    rec = {
-        "sub": sub, "email": email, "name": name,
-        "status": "approved" if is_admin else "pending",
-        "role": "admin" if is_admin else "user",
-        "created_at": now, "updated_at": now,
-        "approved_by": sub if is_admin else None,
-    }
-    users[sub] = rec
-    write_registry(bucket, registry)
+    def register(registry):
+        # Записи в кэше нет — смотрим в свежий реестр: регистрацию мог успеть
+        # параллельный запрос того же пользователя.
+        users = registry["users"]
+        if sub in users:
+            existing["rec"] = users[sub]
+            return None
+        if not is_admin:
+            pending = sum(1 for u in users.values() if u.get("status") == "pending")
+            if pending >= MAX_PENDING:
+                raise RegistrationClosed()
+        now = datetime.utcnow().isoformat() + "Z"
+        users[sub] = {
+            "sub": sub, "email": email, "name": name,
+            "status": "approved" if is_admin else "pending",
+            "role": "admin" if is_admin else "user",
+            "created_at": now, "updated_at": now,
+            "approved_by": sub if is_admin else None,
+        }
+        return users[sub]
+
+    rec = update_registry(bucket, register)
+    if rec is None:
+        return existing["rec"]
     append_user_event(bucket, sub, "register", sub)
     return rec
 
 
 def set_user_status(bucket, target_sub, status, actor_sub):
     """Меняет статус пользователя (lifecycle-метаданные). Возвращает запись или None."""
-    registry = _fresh_registry(bucket)
-    users = registry.get("users", {})
-    if target_sub not in users:
-        return None
-    rec = users[target_sub]
-    rec["status"] = status
-    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    if status == "approved":
-        rec["approved_by"] = actor_sub
-    write_registry(bucket, registry)
-    append_user_event(bucket, target_sub, status, actor_sub)
+    def change(registry):
+        rec = registry["users"].get(target_sub)
+        if rec is None:
+            return None
+        rec["status"] = status
+        rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        if status == "approved":
+            rec["approved_by"] = actor_sub
+        return rec
+
+    rec = update_registry(bucket, change)
+    if rec is not None:
+        append_user_event(bucket, target_sub, status, actor_sub)
     return rec
 
 
@@ -2144,24 +2287,28 @@ def set_coach_flag(bucket, target_sub, is_coach, actor_sub):
     тренер, которого уже нет, а при повторном назначении доступ вернулся бы
     без их ведома.
     """
-    registry = _fresh_registry(bucket)
-    users = registry.get("users", {})
-    rec = users.get(target_sub)
+    released = []
+
+    def change(registry):
+        released.clear()            # при повторе собирается заново
+        users = registry["users"]
+        rec = users.get(target_sub)
+        if rec is None:
+            return None
+        now = datetime.utcnow().isoformat() + "Z"
+        rec["is_coach"] = bool(is_coach)
+        rec["updated_at"] = now
+        if not is_coach:
+            for user in users.values():
+                if user.get("coach_sub") == target_sub:
+                    user["coach_sub"] = None
+                    user["updated_at"] = now
+                    released.append(user["sub"])
+        return rec
+
+    rec = update_registry(bucket, change)
     if rec is None:
         return None
-
-    now = datetime.utcnow().isoformat() + "Z"
-    rec["is_coach"] = bool(is_coach)
-    rec["updated_at"] = now
-    released = []
-    if not is_coach:
-        for user in users.values():
-            if user.get("coach_sub") == target_sub:
-                user["coach_sub"] = None
-                user["updated_at"] = now
-                released.append(user["sub"])
-
-    write_registry(bucket, registry)
     append_user_event(bucket, target_sub,
                       "coach_grant" if is_coach else "coach_revoke", actor_sub)
     for sub in released:
@@ -2177,30 +2324,32 @@ def set_user_coach(bucket, sub, coach_sub):
     владелец данных. Поднимает CoachLinkError, если выбрать нельзя.
     """
     coach_sub = coach_sub or None
-    registry = _fresh_registry(bucket)
-    users = registry.get("users", {})
-    rec = users.get(sub)
-    if rec is None:
-        raise CoachLinkError("user_not_found")
-    if coach_sub:
-        if coach_sub == sub:
-            raise CoachLinkError("cannot_coach_yourself")
-        if not _is_active_coach(users.get(coach_sub)):
-            raise CoachLinkError("not_a_coach")
+    seen = {}
 
-    previous = rec.get("coach_sub")
-    if previous == coach_sub:
+    def change(registry):
+        users = registry["users"]
+        rec = users.get(sub)
+        if rec is None:
+            raise CoachLinkError("user_not_found")
+        if coach_sub:
+            if coach_sub == sub:
+                raise CoachLinkError("cannot_coach_yourself")
+            if not _is_active_coach(users.get(coach_sub)):
+                raise CoachLinkError("not_a_coach")
+        seen.update(rec=rec, previous=rec.get("coach_sub"))
+        if seen["previous"] == coach_sub:
+            return None
+        rec["coach_sub"] = coach_sub
+        # Разрешение править планы давалось прежнему тренеру. Новому действует
+        # значение по умолчанию (#60).
+        rec.pop("coach_plan_edit", None)
+        rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
         return rec
 
-    rec["coach_sub"] = coach_sub
-    # Разрешение править планы давалось прежнему тренеру. Новому действует
-    # значение по умолчанию (#60).
-    rec.pop("coach_plan_edit", None)
-    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    write_registry(bucket, registry)
-    append_user_event(bucket, sub, "coach_select" if coach_sub else "coach_clear", sub,
-                      {"coach_sub": coach_sub, "previous": previous})
-    return rec
+    if update_registry(bucket, change) is not None:
+        append_user_event(bucket, sub, "coach_select" if coach_sub else "coach_clear", sub,
+                          {"coach_sub": coach_sub, "previous": seen["previous"]})
+    return seen["rec"]
 
 
 def _coach_card(rec):
@@ -2258,20 +2407,26 @@ def set_coach_plan_edit(bucket, sub, allow):
     Разрешение — часть связи с тренером, поэтому без действующего тренера
     ставить нечего: CoachLinkError("no_coach").
     """
-    registry = _fresh_registry(bucket)
-    users = registry.get("users", {})
-    rec = users.get(sub)
-    if rec is None or not _is_active_coach(users.get(rec.get("coach_sub"))):
-        raise CoachLinkError("no_coach")
     allow = bool(allow)
-    if coach_plan_edit_allowed(rec) == allow:
+    seen = {}
+
+    def change(registry):
+        users = registry["users"]
+        rec = users.get(sub)
+        if rec is None or not _is_active_coach(users.get(rec.get("coach_sub"))):
+            raise CoachLinkError("no_coach")
+        seen["rec"] = rec
+        if coach_plan_edit_allowed(rec) == allow:
+            return None
+        rec["coach_plan_edit"] = allow
+        rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
         return rec
-    rec["coach_plan_edit"] = allow
-    rec["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    write_registry(bucket, registry)
-    append_user_event(bucket, sub, "coach_plan_edit_allow" if allow else "coach_plan_edit_deny",
-                      sub, {"coach_sub": rec["coach_sub"]})
-    return rec
+
+    rec = update_registry(bucket, change)
+    if rec is not None:
+        append_user_event(bucket, sub, "coach_plan_edit_allow" if allow else "coach_plan_edit_deny",
+                          sub, {"coach_sub": rec["coach_sub"]})
+    return seen["rec"]
 
 
 def my_coach(bucket, sub, fresh=False):
@@ -2386,14 +2541,15 @@ def append_chat_message(bucket, athlete, coach, from_sub, role, text, extra=None
         raise ChatError("empty_message")
     if len(text) > CHAT_TEXT_MAX:
         raise ChatError("message_too_long")
-    msg_id, now = _next_message_id(_chat_ids(bucket, athlete, coach), role)
-    message = {**(extra or {}), "id": msg_id, "ts": now.isoformat() + "Z",
-               "from_sub": from_sub, "from_role": role, "text": text}
-    bucket.blob(p_chat_msg(athlete, coach, msg_id)).upload_from_string(
-        json.dumps(message, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return message
+    ids = _chat_ids(bucket, athlete, coach)
+
+    def make():
+        msg_id, now = _next_message_id(ids, role)
+        message = {**(extra or {}), "id": msg_id, "ts": now.isoformat() + "Z",
+                   "from_sub": from_sub, "from_role": role, "text": text}
+        return p_chat_msg(athlete, coach, msg_id), message
+
+    return create_unique_json(bucket, make)
 
 
 # Что изменил тренер → начало сообщения спортсмену (#60).
@@ -2463,19 +2619,22 @@ def mark_chat_read(bucket, athlete, coach, reader_role, last_id=None):
     написанное нельзя. Отметка — lifecycle-метаданные, не бизнес-запись."""
     _check_chat_cursor(last_id)
     ids = _chat_ids(bucket, athlete, coach)
-    current = _chat_last_read(bucket, athlete, coach, reader_role)
     if not ids:
-        return current
+        return _chat_last_read(bucket, athlete, coach, reader_role)
     target = min(last_id, ids[-1]) if last_id else ids[-1]
-    if target <= current:
-        return current
-    bucket.blob(p_chat_read(athlete, coach, reader_role)).upload_from_string(
-        json.dumps({"last_read_id": target,
-                    "updated_at": datetime.utcnow().isoformat() + "Z"},
-                   ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return target
+    seen = {}
+
+    def advance(marker):
+        # Сверка с отметкой — на свежем чтении: две вкладки разом не
+        # откатят её назад (#35).
+        seen["last"] = marker.get("last_read_id") or ""
+        if target <= seen["last"]:
+            return None
+        marker.update(last_read_id=target, updated_at=datetime.utcnow().isoformat() + "Z")
+        return target
+
+    return update_json(bucket, p_chat_read(athlete, coach, reader_role), advance, dict) \
+        or seen["last"]
 
 
 # ── Разборы с ИИ-тренером (#46) ───────────────────────────────────────────────
@@ -2533,22 +2692,22 @@ def create_ai_thread(bucket, sub, title, run=None, created_by="api"):
     run — пробежка, которой разбор посвящён: она остаётся в фокусе на всём
     его протяжении и даёт заголовок, если своего не задали.
     """
-    now = datetime.utcnow()
     title = " ".join(str(title or "").split())[:AI_TITLE_MAX]
-    thread = {
-        "id": f"{now.strftime(_AI_ID_TIME)}-{secrets_mod.token_hex(4)}",
-        "kind": "run" if run else "general",
-        "run_id": run["id"] if run else None,
-        "title": title or (run_title(run) if run else "Разбор"),
-        "status": "active",
-        "created_at": now.isoformat() + "Z",
-        "created_by": created_by,
-    }
-    bucket.blob(p_ai_thread(sub, thread["id"])).upload_from_string(
-        json.dumps(thread, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return thread
+
+    def make():
+        now = datetime.utcnow()
+        thread = {
+            "id": f"{now.strftime(_AI_ID_TIME)}-{secrets_mod.token_hex(4)}",
+            "kind": "run" if run else "general",
+            "run_id": run["id"] if run else None,
+            "title": title or (run_title(run) if run else "Разбор"),
+            "status": "active",
+            "created_at": now.isoformat() + "Z",
+            "created_by": created_by,
+        }
+        return p_ai_thread(sub, thread["id"]), thread
+
+    return create_unique_json(bucket, make)
 
 
 def read_ai_thread(bucket, sub, thread_id):
@@ -2595,28 +2754,27 @@ def list_ai_threads(bucket, sub):
 
 
 def archive_ai_thread(bucket, sub, thread_id, archived_by="api"):
-    """Скрывает разбор из списка. False — скрывать нечего."""
+    """Скрывает разбор из списка. False — скрывать нечего. Если параллельный
+    запрос успел скрыть первым, его событие остаётся как есть."""
     if not read_ai_thread(bucket, sub, thread_id):
         return False
-    bucket.blob(p_ai_archived(sub, thread_id)).upload_from_string(
-        json.dumps({"archived_at": datetime.utcnow().isoformat() + "Z",
-                    "archived_by": archived_by}, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
+    create_json(bucket, p_ai_archived(sub, thread_id),
+                {"archived_at": datetime.utcnow().isoformat() + "Z",
+                 "archived_by": archived_by})
     return True
 
 
 def append_ai_message(bucket, sub, thread_id, role, text, extra=None):
     """Пишет реплику разбора новым объектом и возвращает её."""
-    prefix = p_ai_msg_prefix(sub, thread_id)
-    msg_id, now = _next_message_id(_message_ids(bucket, prefix, _AI_MSG_ID_RE), role)
-    message = {"id": msg_id, "ts": now.isoformat() + "Z", "role": role,
-               "text": text, **(extra or {})}
-    bucket.blob(p_ai_msg(sub, thread_id, msg_id)).upload_from_string(
-        json.dumps(message, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-    return message
+    ids = _message_ids(bucket, p_ai_msg_prefix(sub, thread_id), _AI_MSG_ID_RE)
+
+    def make():
+        msg_id, now = _next_message_id(ids, role)
+        message = {"id": msg_id, "ts": now.isoformat() + "Z", "role": role,
+                   "text": text, **(extra or {})}
+        return p_ai_msg(sub, thread_id, msg_id), message
+
+    return create_unique_json(bucket, make)
 
 
 def read_ai_messages(bucket, sub, thread_id):
@@ -2897,9 +3055,10 @@ def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=No
     proposal_stale. Прежняя версия плана остаётся в хранилище, вернуться к
     ней можно обычной правкой.
 
-    Проверка «не применено ли уже» и запись идут не атомарно: два
-    одновременных запроса создадут две одинаковые версии плана подряд.
-    Данные при этом не теряются; полное решение — предусловия записи (#35).
+    Версия плана пишется поверх той, на которую смотрело предложение
+    (base_version), поэтому из двух одновременных запросов план меняет один;
+    второй получает proposal_stale, а фронтенд, перечитав разбор, видит
+    «применено» (#35).
     """
     message = read_ai_message(bucket, sub, thread_id, msg_id)
     if not message:
@@ -2934,8 +3093,7 @@ def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=No
         "applied_at": datetime.utcnow().isoformat() + "Z", "applied_by": applied_by,
         "plan_id": plan_id, "from_version": version, "to_version": saved["version"],
     }
-    marker_blob.upload_from_string(json.dumps(marker, ensure_ascii=False, indent=2),
-                                   content_type="application/json")
+    create_json(bucket, p_ai_applied(sub, thread_id, msg_id), marker)
     return marker
 
 
@@ -2955,10 +3113,9 @@ def migrate_legacy_to_user(bucket, sub):
             if not src_blob.exists():
                 report["skipped"].append(f"{src} (нет источника)")
                 return
-            if bucket.blob(dst).exists():
+            if not copy_once(bucket, src_blob, dst):
                 report["skipped"].append(f"{dst} (уже есть)")
                 return
-            bucket.copy_blob(src_blob, bucket, dst)
             report["copied"].append(dst)
         except Exception as e:
             report["errors"].append(f"{src}->{dst}: {str(e)[:120]}")
@@ -2973,28 +3130,22 @@ def migrate_legacy_to_user(bucket, sub):
         for v in range(1, cur + 1):
             copy_obj(ver_src(v), ver_dst(v))
         # Манифест не копируем как есть — пишем свежий с per-user gcs_object_path
-        if bucket.blob(dst_manifest_path).exists():
-            report["skipped"].append(f"{dst_manifest_path} (уже есть)")
-        else:
-            new_man = dict(man)
-            new_man["gcs_object_path"] = ver_dst(cur)
-            bucket.blob(dst_manifest_path).upload_from_string(
-                json.dumps(new_man, ensure_ascii=False, indent=2),
-                content_type="application/json"
-            )
+        new_man = dict(man)
+        new_man["gcs_object_path"] = ver_dst(cur)
+        if create_json(bucket, dst_manifest_path, new_man):
             report["copied"].append(dst_manifest_path)
+        else:
+            report["skipped"].append(f"{dst_manifest_path} (уже есть)")
 
     copy_obj(LEGACY_RUNS, p_runs(sub))
     copy_obj(LEGACY_RACES, p_races(sub))
     # Сид профиля Alexander'а (исторические константы приложения)
-    if bucket.blob(p_profile(sub)).exists():
-        report["skipped"].append(f"{p_profile(sub)} (уже есть)")
-    else:
-        write_legacy_race_profile(bucket, sub, {
+    if write_legacy_race_profile(bucket, sub, {
             "race_name": "Полумарафон", "race_date": "2026-08-09",
-            "target_time": "1:40", "plan_start": "2026-05-10",
-        })
+            "target_time": "1:40", "plan_start": "2026-05-10"}):
         report["copied"].append(p_profile(sub))
+    else:
+        report["skipped"].append(f"{p_profile(sub)} (уже есть)")
     # Глобальный план → per-user одиночный план; дальше его подхватит
     # migrate_single_plan() и переведёт в реестр планов (#25).
     migrate_versioned(

@@ -2,6 +2,8 @@
 legacy migration — against the in-memory fake bucket."""
 import pytest
 
+from conftest import put_json
+
 
 ADMIN_TOKEN = {"sub": "admin-sub", "email": "aabramov77@gmail.com",
                "email_verified": True, "name": "Alex"}
@@ -94,7 +96,7 @@ def test_set_status_unknown_user(storage_module, fake_bucket):
 
 # ── registry cache ────────────────────────────────────────────────────────────
 
-def test_write_registry_updates_cache(storage_module, fake_bucket):
+def test_registration_updates_cache(storage_module, fake_bucket):
     storage_module.resolve_user(fake_bucket, ADMIN_TOKEN)
     # cache now warm; a fresh read returns the admin without hitting a cold load
     reg = storage_module.read_registry(fake_bucket)
@@ -154,7 +156,7 @@ def _seed_single_plan(storage_module, fake_bucket, sub=SUB):
 
 def test_lazy_migration_creates_plan_from_profile(storage_module, fake_bucket):
     _seed_single_plan(storage_module, fake_bucket)
-    storage_module.write_runs(fake_bucket, SUB, [{"id": 1, "dist": 10}, {"id": 2, "dist": 5}])
+    put_json(fake_bucket, storage_module.p_runs(SUB), [{"id": 1, "dist": 10}, {"id": 2, "dist": 5}])
 
     index = storage_module.read_plans_index(fake_bucket, SUB)   # triggers migration
     assert len(index["plans"]) == 1
@@ -182,7 +184,7 @@ def test_concurrent_migrations_keep_one_plan(storage_module, fake_bucket):
     """Тренер и спортсмен разом увидели, что реестра нет (#60): второй перенос
     не должен затереть первый и перепривязать пробежки к другому id."""
     _seed_single_plan(storage_module, fake_bucket)
-    storage_module.write_runs(fake_bucket, SUB, [{"id": 1, "dist": 10}])
+    put_json(fake_bucket, storage_module.p_runs(SUB), [{"id": 1, "dist": 10}])
     first = storage_module.migrate_single_plan(fake_bucket, SUB)
     second = storage_module.migrate_single_plan(fake_bucket, SUB)   # опоздавший запрос
 

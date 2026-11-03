@@ -5,6 +5,7 @@ installed in the local/test environment. Ничего из этого не тр�
 импорта, поэтому модули подменяются заглушками до первого import.
 fitparse and httpx ARE installed and used for real.
 """
+import json
 import sys
 import types
 from pathlib import Path
@@ -152,9 +153,48 @@ class FakeBucket:
         return [FakeBlob(self, n, self._generations[n])
                 for n in sorted(self._store) if n.startswith(prefix)]
 
-    def copy_blob(self, src_blob, dst_bucket, dst_name):
+    def copy_blob(self, src_blob, dst_bucket, dst_name, if_generation_match=None):
+        # Предусловие — на объект назначения, как в GCS (#35).
+        current = dst_bucket._generations.get(dst_name, 0)
+        if if_generation_match is not None and if_generation_match != current:
+            raise PreconditionFailed(dst_name)
         dst_bucket._put(dst_name, src_blob._store[src_blob.name])
         return FakeBlob(dst_bucket, dst_name, dst_bucket._generations[dst_name])
+
+
+def put_json(bucket, path, obj):
+    """Кладёт объект в бакет напрямую — подготовка данных в тестах. Код
+    приложения так не пишет: у него каждая запись с предусловием (#35)."""
+    bucket.blob(path).upload_from_string(json.dumps(obj, ensure_ascii=False))
+
+
+def interleave(fake_bucket, monkeypatch, competitor, before_read=False):
+    """Один раз вклинивает competitor() в чужое «прочитал — записал»: на
+    первом get_blob, после чтения содержимого (данные у пишущего устарели).
+
+    before_read — ещё раньше: между чтением номера поколения и содержимого.
+    """
+    real_get, pending = fake_bucket.get_blob, [competitor]
+
+    def get_blob(name):
+        blob = real_get(name)
+        if not pending:
+            return blob
+        run = pending.pop()
+        if blob is None or before_read:
+            run()
+            return blob
+        read = blob.download_as_text
+
+        def download_as_text():
+            text = read()
+            run()
+            return text
+
+        blob.download_as_text = download_as_text
+        return blob
+
+    monkeypatch.setattr(fake_bucket, "get_blob", get_blob)
 
 
 class FakeClient:

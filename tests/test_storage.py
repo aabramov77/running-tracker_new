@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import domain
+from conftest import put_json
 
 SUB = "user-abc"
 SUB2 = "user-xyz"
@@ -21,7 +22,7 @@ SUB2 = "user-xyz"
 def test_runs_roundtrip(storage_module, fake_bucket):
     assert storage_module.read_runs(fake_bucket, SUB) == []
     runs = [{"id": 1, "date": "2026-05-01", "dist": 10.0, "deleted": False}]
-    storage_module.write_runs(fake_bucket, SUB, runs)
+    put_json(fake_bucket, storage_module.p_runs(SUB), runs)
     assert storage_module.read_runs(fake_bucket, SUB) == runs
     # isolation: another user sees nothing
     assert storage_module.read_runs(fake_bucket, SUB2) == []
@@ -31,13 +32,13 @@ def test_races_roundtrip(storage_module, fake_bucket):
     assert storage_module.read_races(fake_bucket, SUB) == []
     races = [{"id": 7, "name": "HM", "date": "2026-05-01", "dist_label": "HM",
               "time": "1:40:00", "deleted": False}]
-    storage_module.write_races(fake_bucket, SUB, races)
+    put_json(fake_bucket, storage_module.p_races(SUB), races)
     assert storage_module.read_races(fake_bucket, SUB) == races
     assert storage_module.read_races(fake_bucket, SUB2) == []
 
 
 def test_runs_namespaced_paths(storage_module, fake_bucket):
-    storage_module.write_runs(fake_bucket, SUB, [{"id": 1}])
+    put_json(fake_bucket, storage_module.p_runs(SUB), [{"id": 1}])
     assert f"users/{SUB}/runs.json" in fake_bucket._store
     assert "runs.json" not in fake_bucket._store   # no global write
 
@@ -343,14 +344,14 @@ PID = "plan-1"
 
 def test_plan_versioning(storage_module, fake_bucket):
     w1 = [{"w": 1, "type": "dev", "sun": "10км"}]
-    storage_module.write_plan_version(fake_bucket, SUB, PID, 1, w1, "seed")
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, w1, "seed")
     man = storage_module.read_plan_manifest(fake_bucket, SUB, PID)
     assert man["current_version"] == 1
     v1 = storage_module.read_plan_version(fake_bucket, man["gcs_object_path"])
     assert v1["weeks"] == w1
 
     w2 = [{"w": 1, "type": "dev", "sun": "12км"}]
-    storage_module.write_plan_version(fake_bucket, SUB, PID, 2, w2, "edit")
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, w2, "edit")
     man2 = storage_module.read_plan_manifest(fake_bucket, SUB, PID)
     assert man2["current_version"] == 2
     # v1 still readable — immutable history preserved
@@ -467,7 +468,7 @@ def test_plan_history_newest_first_with_names_but_no_emails(storage_module, fake
 ])
 def test_history_guesses_the_author_of_versions_written_before_60(storage_module, fake_bucket,
                                                                   created_by, reason, role):
-    storage_module.write_plan_version(fake_bucket, SUB, PID, 1, [{"w": 1}], reason, created_by)
+    storage_module.save_plan_weeks(fake_bucket, SUB, PID, [{"w": 1}], reason, created_by)
     (version,) = storage_module.read_plan_history(fake_bucket, SUB, PID)["versions"]
     assert version["author_role"] == role
     assert version["author_sub"] == (None if role == "migration" else SUB)
@@ -639,7 +640,7 @@ def test_llm_context_uses_only_active_plan(storage_module, fake_bucket):
     b = storage_module.create_plan(fake_bucket, SUB, {"race_name": "B", "plan_start": "2026-06-01"})
     storage_module.save_plan_weeks(fake_bucket, SUB, a["id"], [{"w": 1, "mon": "A-неделя"}])
     storage_module.save_plan_weeks(fake_bucket, SUB, b["id"], [{"w": 1, "mon": "B-неделя"}])
-    storage_module.write_runs(fake_bucket, SUB, [
+    put_json(fake_bucket, storage_module.p_runs(SUB), [
         {"id": 1, "date": "2026-05-20", "dist": 10, "plan_id": a["id"]},
         {"id": 2, "date": "2026-06-10", "dist": 5, "plan_id": b["id"]},
     ])
@@ -755,7 +756,7 @@ def _fit_runs(storage_module, bucket, count):
     runs = [{"id": i, "date": "2026-10-13", "dist": 5.0, "type": "easy", "time": "25:00",
              "pace": "5:00", "hr": 130, "details_available": True, "deleted": False}
             for i in range(1, count + 1)]
-    storage_module.write_runs(bucket, SUB, runs)
+    put_json(bucket, storage_module.p_runs(SUB), runs)
     return runs
 
 
