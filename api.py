@@ -18,7 +18,8 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
-                     LLMTruncated, PlansIndexBusy, PlanStale, RegistrationClosed, UsageBusy,
+                     LLMTruncated, PlansIndexBusy, PlanStale, RegistrationClosed,
+                     StorageBusy, UsageBusy,
                      _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
@@ -47,9 +48,10 @@ from storage import (AICoachError, ChatError, CoachLinkError, LLMRefused,
                      release_advice_usage, reserve_advice_usage,
                      resolve_user, run_title, save_plan_weeks, set_active_plan,
                      set_coach_flag, set_coach_plan_edit, set_user_coach,
-                     set_user_status, update_plan_meta,
+                     set_user_status, soft_delete_race, soft_delete_run,
+                     update_plan_meta, upsert_race, upsert_run,
                      write_athlete_version, write_llm_config_version,
-                     write_parsed_fit_to_tmp, write_races, write_runs)
+                     write_parsed_fit_to_tmp)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -806,24 +808,16 @@ def h_races_post(c):
         "dist_label": clean["dist_label"], "time": clean["time"],
         "deleted": False,
     }
-    all_races = read_races(c.bucket, c.sub)
-    all_races = [r for r in all_races if r.get("id") != race["id"]]
-    all_races.insert(0, race)
-    write_races(c.bucket, c.sub, all_races)
-    return jresp(race, 201)
+    return jresp(upsert_race(c.bucket, c.sub, race), 201)
 
 
 def h_races_delete(c):
     race_id, bad = c.query_id()
     if bad:
         return bad
-    all_races = read_races(c.bucket, c.sub)
-    target = next((r for r in all_races if r.get("id") == race_id), None)
+    target = soft_delete_race(c.bucket, c.sub, race_id)
     if not target:
         return jresp({"error": "Race not found"}, 404)
-    target["deleted"] = True
-    target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
-    write_races(c.bucket, c.sub, all_races)
     return jresp({"soft_deleted": race_id, "deleted_at": target["deleted_at"]}, 200)
 
 
@@ -995,24 +989,16 @@ def h_runs_post(c):
             return jresp({"error": "Failed to attach FIT details: "
                                    "token expired or invalid"}, 400)
 
-    all_runs = read_runs(c.bucket, c.sub)
-    all_runs = [r for r in all_runs if r.get("id") != run["id"]]
-    all_runs.insert(0, run)
-    write_runs(c.bucket, c.sub, all_runs)
-    return jresp(run, 201)
+    return jresp(upsert_run(c.bucket, c.sub, run), 201)
 
 
 def h_runs_delete(c):
     run_id, bad = c.query_id()
     if bad:
         return bad
-    all_runs = read_runs(c.bucket, c.sub)
-    target = next((r for r in all_runs if r.get("id") == run_id), None)
+    target = soft_delete_run(c.bucket, c.sub, run_id)
     if not target:
         return jresp({"error": "Run not found"}, 404)
-    target["deleted"] = True
-    target["deleted_at"] = datetime.utcnow().isoformat() + "Z"
-    write_runs(c.bucket, c.sub, all_runs)
     return jresp({"soft_deleted": run_id, "deleted_at": target["deleted_at"]}, 200)
 
 
@@ -1154,6 +1140,8 @@ def handle_request(request):
         user = resolve_user(bucket, token_info)
     except RegistrationClosed:
         return jresp({"error": "registration_closed"}, 403)
+    except StorageBusy:
+        return jresp({"error": "storage_busy"}, 503)
 
     # /me вне таблицы намеренно: он обязан отвечать до проверки одобрения —
     # именно из него фронт узнаёт, что заявка ещё на рассмотрении.
@@ -1191,6 +1179,9 @@ def handle_request(request):
         # Реестр планов всё время меняют параллельно (#60): повтор поможет,
         # поэтому это не ошибка сервера.
         return jresp({"error": "plans_busy"}, 503)
+    except StorageBusy:
+        # Объект всё время меняют параллельно (#35) — повтор поможет.
+        return jresp({"error": "storage_busy"}, 503)
     except RunNotFound:
         return jresp({"error": "run not found"}, 404)
     except NoCoach:

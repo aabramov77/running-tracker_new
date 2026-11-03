@@ -11,7 +11,8 @@ from datetime import date, timedelta
 import httpx
 import pytest
 
-from conftest import FakeRequest, NotFound, PreconditionFailed
+from conftest import (FakeRequest, NotFound, PreconditionFailed,
+                      interleave as _interleave, put_json)
 
 ADMIN = {"sub": "admin-sub", "email": "aabramov77@gmail.com"}
 COACH = {"sub": "c1", "email": "c1@example.com"}
@@ -498,34 +499,6 @@ def test_parallel_messages_do_not_all_slip_under_the_daily_limit(api, model, pat
     assert _used(patched_api, fake_bucket) == 1
 
 
-def _interleave(fake_bucket, monkeypatch, competitor, before_read=False):
-    """Один раз вклинивает competitor() в чужое «прочитал счётчик — записал».
-
-    before_read — ещё раньше: между чтением номера поколения и содержимого.
-    """
-    real_get, pending = fake_bucket.get_blob, [competitor]
-
-    def get_blob(name):
-        blob = real_get(name)
-        if not pending:
-            return blob
-        run = pending.pop()
-        if blob is None or before_read:
-            run()
-            return blob
-        read = blob.download_as_text
-
-        def download_as_text():
-            text = read()
-            run()
-            return text
-
-        blob.download_as_text = download_as_text
-        return blob
-
-    monkeypatch.setattr(fake_bucket, "get_blob", get_blob)
-
-
 @pytest.mark.parametrize("already_used", [0, 1], ids=["счётчика ещё нет", "счётчик есть"])
 @pytest.mark.parametrize("before_read", [False, True], ids=["после чтения", "до чтения"])
 def test_two_writers_never_lose_an_attempt_or_share_the_last_one(storage_module, fake_bucket,
@@ -887,7 +860,7 @@ def test_load_does_not_pull_someone_elses_legacy_details(api, patched_api, fake_
     assert _status(_post(api, "/", {**RUN, "id": 999})) == 201
     runs = patched_api.read_runs(fake_bucket, "u1")
     runs[0]["details_available"] = True                 # флаг FIT, поставленный в обход формы
-    patched_api.write_runs(fake_bucket, "u1", runs)
+    put_json(fake_bucket, "users/u1/runs.json", runs)
 
     assert _status(api(FakeRequest("GET", "/load"))) == 200
     assert not [name for name in fake_bucket._store if name.startswith("users/u1/runs/")]
