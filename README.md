@@ -313,6 +313,8 @@ Push в `Dev` → `runs-api-dev` + dev-bucket; push в `main` → `runs-api` +
 прод-bucket. Настроено в
 [.github/workflows/deploy-cloudrun.yml](.github/workflows/deploy-cloudrun.yml),
 аутентификация в GCP — через Workload Identity Federation, без JSON-ключей.
+Перед деплоем job `test` прогоняет pytest на Python 3.11: тесты упали —
+деплоя нет. Правка только в `tests/` workflow не запускает.
 Фронтенд деплоится сам: GitHub Pages из `main`, Cloudflare Pages из `Dev`.
 
 Первоначальная настройка стендов — [docs/env-split-and-cd.md](docs/env-split-and-cd.md),

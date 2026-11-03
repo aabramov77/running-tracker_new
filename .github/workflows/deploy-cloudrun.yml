@@ -19,7 +19,30 @@ permissions:
   id-token: write   # для Workload Identity Federation
 
 jobs:
+  # Деплой ждёт тестов: с красным pytest код не уходит ни на dev, ни на прод.
+  # Google-модули тесты подменяют заглушками (tests/conftest.py), но ставим
+  # весь requirements.txt — заодно CI заметит пин, который не ставится.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # токен GCP тестам не нужен
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # как рантайм Cloud Run (DEPLOY.md)
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt "pytest==8.*"
+
+      - name: Run tests
+        run: python -m pytest -o addopts="" -rs
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
