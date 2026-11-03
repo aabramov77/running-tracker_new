@@ -4019,7 +4019,7 @@ async function coachSavePlan() {
     return;
   }
   const athlete = COACH.athlete, planId = plan.id;
-  const btn = document.getElementById('coach-save-btn');
+  const btn = document.getElementById('coach-plan-save-btn');
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Сохранение…';
   try {
@@ -4605,9 +4605,9 @@ function renderCoachHeader() {
   // Бэкенд до #60 поля can_edit не знает — тогда и отказа не показываем.
   show('coach-edit-note', COACH.athlete.can_edit === false);
   show('coach-save-bar', COACH.editing);
-  show('coach-save-btn', COACH.editing && editable);
+  show('coach-plan-save-btn', COACH.editing && editable);
   show('coach-save-new-btn', COACH.editing && !!COACH.importInfo && canEdit);
-  document.getElementById('coach-save-btn').textContent =
+  document.getElementById('coach-plan-save-btn').textContent =
     COACH.importInfo ? 'Сохранить в этот план' : 'Сохранить изменения';
 }
 

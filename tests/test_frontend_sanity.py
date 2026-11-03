@@ -1190,18 +1190,14 @@ def test_landing_mockups_are_hidden_from_screen_readers():
 
 # ── Правка, история и скрытые пробежки и старты (#76) ────────────────────────
 
-# Дубль, найденный при #76: кнопка «Мой тренер» и кнопка сохранения плана в
-# конструкторе тренера. getElementById берёт первую — чинится отдельно.
-KNOWN_DUPLICATE_IDS = {"coach-save-btn"}
-
-
 def test_element_ids_are_unique():
     """getElementById отдаёт первый элемент с id: второй такой же молча
     получает чужие правки. Так форма результата забега (#76) переписывала
-    заголовок и кнопку карточки гонки плана."""
+    заголовок и кнопку карточки гонки плана, а кнопка конструктора тренера
+    делила id с кнопкой «Мой тренер»."""
     ids = re.findall(r'\bid="([^"]+)"', INDEX.read_text(encoding="utf-8"))
     duplicates = {i for i in ids if ids.count(i) > 1}
-    assert duplicates == KNOWN_DUPLICATE_IDS, sorted(duplicates ^ KNOWN_DUPLICATE_IDS)
+    assert duplicates == set(), sorted(duplicates)
 
 
 def _history_section(js):
