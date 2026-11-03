@@ -705,13 +705,15 @@ def test_parse_fit_tmp_then_attach(storage_module, fake_bucket):
     token = storage_module.write_parsed_fit_to_tmp(fake_bucket, SUB, b"FITBYTES", parsed)
     assert fake_bucket.blob(f"tmp/{SUB}/{token}/activity.fit").exists()
 
-    run = {"id": 123, "date": "2026-05-01"}
-    storage_module.attach_fit_details_to_run(fake_bucket, SUB, run, token)
+    run = storage_module.save_run(fake_bucket, SUB, {"id": 123, "date": "2026-05-01"},
+                                  fit_token=token)
 
     assert run["details_available"] is True
     assert run["avg_cadence"] == 176 and run["calories"] == 210
+    # пробежка и её FIT — одна версия (#75)
     assert fake_bucket.blob(f"users/{SUB}/runs/123/v1/activity.fit").exists()
     assert fake_bucket.blob(f"users/{SUB}/runs/123/v1/details.json").exists()
+    assert fake_bucket.blob(f"users/{SUB}/runs/123/v1/run.json").exists()
     assert fake_bucket.blob(f"users/{SUB}/runs/123/manifest.json").exists()
     # tmp cleaned
     assert not fake_bucket.blob(f"tmp/{SUB}/{token}/activity.fit").exists()
@@ -721,8 +723,9 @@ def test_parse_fit_tmp_then_attach(storage_module, fake_bucket):
 
 
 def test_attach_fails_on_missing_token(storage_module, fake_bucket):
-    with pytest.raises(ValueError):
-        storage_module.attach_fit_details_to_run(fake_bucket, SUB, {"id": 1}, "nonexistent")
+    with pytest.raises(storage_module.FitTokenInvalid):
+        storage_module.save_run(fake_bucket, SUB, {"id": 1}, fit_token="nonexistent")
+    assert not [name for name in fake_bucket._store if name.startswith(f"users/{SUB}/")]
 
 
 def test_read_run_details_lazy_legacy_fallback(storage_module, fake_bucket):
@@ -789,7 +792,7 @@ def test_attaching_fit_puts_its_histograms_into_the_cache(storage_module, fake_b
     fit = (Path(__file__).parent / "fixtures" / "synthetic_activity.fit").read_bytes()
     parsed = storage_module.parse_fit_file(fit)
     token = storage_module.write_parsed_fit_to_tmp(fake_bucket, SUB, fit, parsed)
-    storage_module.attach_fit_details_to_run(fake_bucket, SUB, {"id": 123}, token)
+    storage_module.save_run(fake_bucket, SUB, {"id": 123}, fit_token=token)
 
     entry = _cached(fake_bucket)["runs"]["123"]
     pulses = [int(k) for k in entry["hr"]]
@@ -804,8 +807,7 @@ def test_cache_failure_does_not_lose_the_run(storage_module, fake_bucket, monkey
 
     monkeypatch.setattr(storage_module, "remember_run_hist", broken)
     token = storage_module.write_parsed_fit_to_tmp(fake_bucket, SUB, b"FIT", FIT_SAMPLES)
-    run = {"id": 5}
-    storage_module.attach_fit_details_to_run(fake_bucket, SUB, run, token)
+    run = storage_module.save_run(fake_bucket, SUB, {"id": 5}, fit_token=token)
     assert run["details_available"] is True
     assert fake_bucket.blob(f"users/{SUB}/runs/5/v1/details.json").exists()
     assert _cached(fake_bucket) is None

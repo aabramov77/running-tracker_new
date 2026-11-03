@@ -25,7 +25,7 @@ def _token(sub):
 
 # Временные tmp/ пишутся и удаляются без предусловия: это не бизнес-данные.
 TMP_WRITERS = {"write_parsed_fit_to_tmp"}
-TMP_DELETERS = {"cleanup_old_tmp", "attach_fit_details_to_run"}
+TMP_DELETERS = {"cleanup_old_tmp", "_drop_tmp_fit"}
 
 
 def _calls(module_file, method):
@@ -181,9 +181,7 @@ def test_fit_attached_again_is_a_new_version(storage_module, fake_bucket):
     def attach(date):
         token = storage_module.write_parsed_fit_to_tmp(
             fake_bucket, SUB, f"fit {date}".encode(), {"date": date, "summary": {"max_hr": 150}})
-        run = {"id": 7}
-        storage_module.attach_fit_details_to_run(fake_bucket, SUB, run, token)
-        return run
+        return storage_module.save_run(fake_bucket, SUB, {"id": 7, "dist": 5.0}, fit_token=token)
 
     attach("2026-11-01")
     assert attach("2026-11-02")["details_available"] is True
@@ -197,37 +195,146 @@ def test_fit_attached_again_is_a_new_version(storage_module, fake_bucket):
     assert not any(name.startswith("tmp/") for name in fake_bucket._store)
 
 
-# ── Пробежки и старты ─────────────────────────────────────────────────────────
+# ── Пробежки и старты (#75) ───────────────────────────────────────────────────
+
+KINDS = {"run": {"id": 1, "date": "2026-11-01", "dist": 5.0, "plan_id": None},
+         "race": {"id": 1, "name": "Осенний 10К", "date": "2026-11-01",
+                  "dist_label": "10km", "time": "45:00"}}
+
+
+def _kind(storage_module, kind):
+    """save, delete и read для пробежки или старта."""
+    return (getattr(storage_module, f"save_{kind}"), getattr(storage_module, f"delete_{kind}"),
+            getattr(storage_module, f"read_{kind}s"))
+
+
+@pytest.fixture
+def entities(storage_module, fake_bucket):
+    """Номера версий в истории сущности — короче в проверках."""
+    def versions(kind, eid=1):
+        history = getattr(storage_module, f"read_{kind}_history")(fake_bucket, SUB, eid)
+        return [v["version"] for v in history["versions"]]
+    return versions
+
 
 @pytest.mark.parametrize("kind", ["run", "race"])
 def test_concurrent_add_and_delete_are_both_kept(storage_module, fake_bucket, monkeypatch, kind):
-    """Пробежку добавили с телефона, пока с ноутбука удаляли другую."""
-    upsert = getattr(storage_module, f"upsert_{kind}")
-    delete = getattr(storage_module, f"soft_delete_{kind}")
-    read = getattr(storage_module, f"read_{kind}s")
-    upsert(fake_bucket, SUB, {"id": 1, "deleted": False})
-    interleave(fake_bucket, monkeypatch,
-               lambda: upsert(fake_bucket, SUB, {"id": 2, "deleted": False}))
+    """Пробежку добавили с телефона, пока с ноутбука скрывали другую."""
+    save, delete, read = _kind(storage_module, kind)
+    save(fake_bucket, SUB, KINDS[kind])
+    interleave(fake_bucket, monkeypatch, lambda: save(fake_bucket, SUB, {**KINDS[kind], "id": 2}))
 
     assert delete(fake_bucket, SUB, 1)["deleted"] is True
 
     entries = {e["id"]: e for e in read(fake_bucket, SUB)}
-    assert entries[2] == {"id": 2, "deleted": False}
-    assert entries[1]["deleted"] is True
+    assert entries[2] == {**KINDS[kind], "id": 2, "deleted": False, "version": 1}
+    assert entries[1]["deleted"] is True and entries[1]["version"] == 2
 
 
-def test_second_delete_keeps_the_first_timestamp(storage_module, fake_bucket):
-    storage_module.upsert_run(fake_bucket, SUB, {"id": 1, "deleted": False})
-    first = storage_module.soft_delete_run(fake_bucket, SUB, 1)["deleted_at"]
-    assert storage_module.soft_delete_run(fake_bucket, SUB, 1)["deleted_at"] == first
-    assert storage_module.soft_delete_run(fake_bucket, SUB, 404) is None
+@pytest.mark.parametrize("kind", ["run", "race"])
+@pytest.mark.parametrize("before_read", [False, True], ids=["после чтения", "до чтения"])
+def test_concurrent_edits_keep_both_versions(storage_module, fake_bucket, monkeypatch, entities,
+                                             kind, before_read):
+    """Две правки без сверки: обе — версии, индекс на последней."""
+    save, _, read = _kind(storage_module, kind)
+    save(fake_bucket, SUB, KINDS[kind])
+    rival = []
+    interleave(fake_bucket, monkeypatch,
+               lambda: rival.append(save(fake_bucket, SUB, {**KINDS[kind], "date": "2026-11-02"})),
+               before_read=before_read)
+
+    mine = save(fake_bucket, SUB, {**KINDS[kind], "date": "2026-11-03"})
+
+    assert rival[0]["version"] == 2 and mine["version"] > 2
+    assert entities(kind) == [mine["version"], 2, 1]
+    assert read(fake_bucket, SUB) == [mine]
 
 
-def test_upsert_replaces_the_entry_with_the_same_id(storage_module, fake_bucket):
-    storage_module.upsert_run(fake_bucket, SUB, {"id": 1, "dist": 5})
-    storage_module.upsert_run(fake_bucket, SUB, {"id": 2, "dist": 8})
-    storage_module.upsert_run(fake_bucket, SUB, {"id": 1, "dist": 6})
-    assert storage_module.read_runs(fake_bucket, SUB) == [{"id": 1, "dist": 6}, {"id": 2, "dist": 8}]
+@pytest.mark.parametrize("kind", ["run", "race"])
+def test_concurrent_edit_of_the_same_version_is_stale(storage_module, fake_bucket, monkeypatch,
+                                                      entities, kind):
+    save, _, read = _kind(storage_module, kind)
+    save(fake_bucket, SUB, KINDS[kind])
+    interleave(fake_bucket, monkeypatch,
+               lambda: save(fake_bucket, SUB, {**KINDS[kind], "date": "2026-11-02"}, base_version=1))
+
+    with pytest.raises(storage_module.VersionStale):
+        save(fake_bucket, SUB, {**KINDS[kind], "date": "2026-11-03"}, base_version=1)
+
+    assert entities(kind) == [2, 1]
+    assert read(fake_bucket, SUB)[0]["date"] == "2026-11-02"
+
+
+def test_index_keeps_a_newer_version_written_in_between(storage_module, fake_bucket, monkeypatch):
+    """Моя версия зафиксирована, а до записи индекса соперник выпустил
+    следующую и уже поставил её: моя запись индекс назад не откатывает."""
+    storage_module.save_run(fake_bucket, SUB, KINDS["run"])
+    real, pending = storage_module.update_json, []
+
+    def update_json(bucket, path, change, empty, busy=storage_module.StorageBusy):
+        if pending and path == storage_module.p_runs(SUB):
+            pending.pop()()
+        return real(bucket, path, change, empty, busy)
+
+    monkeypatch.setattr(storage_module, "update_json", update_json)
+    pending.append(lambda: storage_module.save_run(fake_bucket, SUB, {**KINDS["run"], "dist": 9.0}))
+
+    mine = storage_module.save_run(fake_bucket, SUB, {**KINDS["run"], "dist": 8.0})
+
+    assert mine["version"] == 2
+    assert storage_module.read_runs(fake_bucket, SUB) == [
+        {**KINDS["run"], "dist": 9.0, "deleted": False, "version": 3}]
+
+
+def test_second_delete_keeps_the_first_timestamp(storage_module, fake_bucket, entities):
+    storage_module.save_run(fake_bucket, SUB, KINDS["run"])
+    first = storage_module.delete_run(fake_bucket, SUB, 1)["deleted_at"]
+    assert storage_module.delete_run(fake_bucket, SUB, 1)["deleted_at"] == first
+    assert entities("run") == [2, 1]
+    assert storage_module.delete_run(fake_bucket, SUB, 404) is None
+
+
+def test_two_migrations_at_once_write_one_baseline(storage_module, fake_bucket, monkeypatch,
+                                                   entities):
+    """Миграцию запустили дважды разом: базовая версия у пробежки одна."""
+    put_json(fake_bucket, storage_module.p_runs(SUB), [{**KINDS["run"], "deleted": False}])
+    rival = []
+    interleave(fake_bucket, monkeypatch,
+               lambda: rival.append(storage_module.migrate_entity_history(fake_bucket, SUB)))
+
+    mine = storage_module.migrate_entity_history(fake_bucket, SUB)
+
+    assert (rival[0]["runs"]["migrated"], mine["runs"]["migrated"]) == (1, 0)
+    assert entities("run") == [1]
+    assert storage_module.read_runs(fake_bucket, SUB)[0]["version"] == 1
+
+
+def test_write_during_migration_keeps_the_old_values(storage_module, fake_bucket, monkeypatch,
+                                                     entities):
+    """Правка пришла, пока шла миграция: прежние значения — в базовой версии,
+    правка — поверх неё, второй базовой версии нет."""
+    put_json(fake_bucket, storage_module.p_runs(SUB), [{**KINDS["run"], "deleted": False}])
+    interleave(fake_bucket, monkeypatch,
+               lambda: storage_module.save_run(fake_bucket, SUB, {**KINDS["run"], "dist": 7.0}))
+
+    storage_module.migrate_entity_history(fake_bucket, SUB)
+
+    assert entities("run") == [2, 1]
+    old = json.loads(fake_bucket._store[storage_module.p_run_ver(SUB, 1, 1)])
+    assert (old["author"], old["run"]["dist"]) == ("migration", 5.0)
+    assert storage_module.read_runs(fake_bucket, SUB)[0]["dist"] == 7.0
+
+
+def test_run_version_left_by_a_crash_is_skipped(storage_module, fake_bucket, entities):
+    """run.json v2 есть, а манифест на v1: v2 не трогаем, правка встаёт v3."""
+    storage_module.save_run(fake_bucket, SUB, KINDS["run"])
+    put_json(fake_bucket, storage_module.p_run_ver(SUB, 1, 2),
+             {"id": 1, "version": 2, "supersedes_version": 1, "status": "ACTIVE",
+              "run": {"dist": 99.0}})
+
+    assert storage_module.save_run(fake_bucket, SUB, {**KINDS["run"], "dist": 6.0})["version"] == 3
+    assert json.loads(fake_bucket._store[storage_module.p_run_ver(SUB, 1, 3)])["supersedes_version"] == 1
+    assert entities("run") == [3, 1]
 
 
 # ── Реестр пользователей ──────────────────────────────────────────────────────

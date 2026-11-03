@@ -72,7 +72,8 @@ def test_run_with_a_bad_field_is_rejected_and_nothing_is_stored(api, patched_api
 def test_run_from_the_form_is_stored_as_sent(api):
     """Ровно то, что шлёт saveRun, проверку проходит без изменений."""
     body, code, _ = _post(api, "/", RUN)
-    assert code == 201 and json.loads(body) == {**RUN, "plan_id": None, "deleted": False}
+    assert code == 201 and json.loads(body) == {**RUN, "plan_id": None, "deleted": False,
+                                                "version": 1}
 
 
 def test_run_fields_are_normalised_and_defaults_survive(api):
@@ -145,7 +146,7 @@ def test_race_with_a_bad_field_is_rejected_and_nothing_is_stored(api, patched_ap
 
 def test_race_from_the_form_is_stored_as_sent(api):
     body, code, _ = _post(api, "/races", RACE)
-    assert code == 201 and json.loads(body) == {**RACE, "deleted": False}
+    assert code == 201 and json.loads(body) == {**RACE, "deleted": False, "version": 1}
 
 
 # ── 2. Нечисловой ?id= ────────────────────────────────────────────────────────
@@ -612,6 +613,13 @@ def _legacy_details(fake_bucket, run_id=999):
         {"current_version": 1, "gcs_object_path": f"runs/{run_id}/v1/details.json"}))
 
 
+def _fit_copies(fake_bucket, sub):
+    """Детали и FIT в namespace sub. Версии самой пробежки (run.json,
+    манифест, #75) — не копия чужих данных."""
+    return [name for name in fake_bucket._store if name.startswith(f"users/{sub}/runs/")
+            and name.endswith(("/details.json", "/activity.fit"))]
+
+
 def test_claiming_a_legacy_run_id_does_not_hand_over_its_details(api, fake_bucket):
     """id пробежки задаёт клиент. До #53 совпадения с legacy-id хватало: детали
     копировались в namespace этого пользователя и отдавались ему."""
@@ -620,7 +628,7 @@ def test_claiming_a_legacy_run_id_does_not_hand_over_its_details(api, fake_bucke
 
     body, code, _ = api(FakeRequest("GET", "/runs/999/details"))
     assert code == 404 and "avg_hr" not in body
-    assert not [name for name in fake_bucket._store if name.startswith("users/u1/runs/")]
+    assert _fit_copies(fake_bucket, "u1") == []
 
 
 def test_admin_keeps_own_legacy_details_and_so_does_the_admins_coach(api, fake_bucket):
@@ -863,7 +871,7 @@ def test_load_does_not_pull_someone_elses_legacy_details(api, patched_api, fake_
     put_json(fake_bucket, "users/u1/runs.json", runs)
 
     assert _status(api(FakeRequest("GET", "/load"))) == 200
-    assert not [name for name in fake_bucket._store if name.startswith("users/u1/runs/")]
+    assert _fit_copies(fake_bucket, "u1") == []
     cache = json.loads(fake_bucket._store["users/u1/derived/run_hist.json"])
     assert cache["runs"]["999"] == {"hr": {}, "spd": {}}
 
