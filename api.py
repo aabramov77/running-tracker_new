@@ -19,8 +19,8 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
-                     FitTokenInvalid, LLMRefused, LLMTruncated, PlansIndexBusy,
-                     PlanStale, RaceStale, RegistrationClosed, RunStale,
+                     FitTokenInvalid, LLMRefused, LLMTruncated, MemoryStale,
+                     PlansIndexBusy, PlanStale, RaceStale, RegistrationClosed, RunStale,
                      StorageBusy, UsageBusy, RACE_FIELDS, RUN_FIELDS,
                      _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
@@ -30,7 +30,8 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      build_plan_compliance, call_llm,
                      chat_unread, mark_chat_read, read_chat,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
-                     clean_effort, clean_plan_meta, clean_plan_weeks,
+                     clean_effort, clean_memory_edit, clean_memory_ops,
+                     clean_plan_meta, clean_plan_weeks,
                      clean_proposal, clean_race, clean_run,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
@@ -39,12 +40,12 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      find_own_run, find_plan, get_active_plan,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
-                     mark_proposal_states, mask_key,
+                     mark_proposal_states, mask_key, memory_facts, memory_view,
                      migrate_all_entity_history, migrate_legacy_to_user,
                      my_coach, notify_plan_change,
                      parse_coach_reply, parse_fit_file, plan_author, plan_meta_unchanged,
-                     read_advice_usage, read_ai_messages,
-                     read_ai_thread, read_athlete_history,
+                     read_advice_usage, read_ai_memory, read_ai_memory_history,
+                     read_ai_messages, read_ai_thread, read_athlete_history,
                      read_athlete_profile,
                      read_llm_config_full, read_plan_history, read_plan_state,
                      read_plans_index,
@@ -55,7 +56,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      save_plan_weeks, save_race, save_run, set_active_plan,
                      set_coach_flag, set_coach_plan_edit, set_user_coach,
                      set_user_status, update_plan_meta,
-                     write_athlete_version, write_llm_config_version,
+                     write_ai_memory, write_athlete_version, write_llm_config_version,
                      write_parsed_fit_to_tmp)
 
 
@@ -750,6 +751,7 @@ def h_ai_message_post(c):
     if failure:
         release_advice_usage(c.bucket, c.sub)
         return failure
+    memory = _remember(c, thread, turn, envelope.get("memory"))
 
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
@@ -775,11 +777,31 @@ def h_ai_message_post(c):
         "based_on_plan_version": ctx.get("plan_version"),
         "based_on_profile_version": ctx.get("profile_version", 0),
         "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
+        "based_on_memory_version": turn["memory_version"],
         **({"proposal": proposal} if proposal else {}),
+        **({"memory_changes": memory["changes"], "memory_version": memory["version"]}
+           if memory else {}),
     })
     if proposal:
         answer = {**answer, "proposal_state": "open"}
     return jresp({"messages": [question, answer], "usage": usage}, 201)
+
+
+def _remember(c, thread, turn, raw):
+    """Изменения памяти из ответа модели → новая версия памяти или None (#80).
+
+    К этому моменту ответ получен и попытка списана, поэтому сбой записи
+    памяти ход не роняет: ответ уходит спортсмену без изменений памяти.
+    """
+    ops = clean_memory_ops(raw, memory_facts(turn["memory"]))
+    if not ops:
+        return None
+    try:
+        return write_ai_memory(c.bucket, c.sub, ops, "ai", created_by=c.email,
+                               thread_id=thread["id"])
+    except Exception:
+        logging.exception("ai memory: изменения из ответа модели не записаны")
+        return None
 
 
 def h_ai_proposal_apply(c):
@@ -796,6 +818,43 @@ def h_ai_proposal_apply(c):
     if not applied:
         return jresp({"error": "message not found"}, 404)
     return jresp({"applied": applied}, 201)
+
+
+# ── Память ИИ-тренера (#80) ───────────────────────────────────────────────────
+# Только своя память: путь строится от c.sub, тренеру-человеку маршрутов нет.
+
+def h_ai_memory_get(c):
+    return jresp(memory_view(*read_ai_memory(c.bucket, c.sub)), 200)
+
+
+def h_ai_memory_post(c):
+    """Правка памяти спортсменом: add / edit / hide / restore поверх
+    base_version. Каждая — новая версия памяти, прежние остаются."""
+    body = c.body()
+    base_version, bad = _base_version(body)
+    if bad:
+        return bad
+    if base_version is None:
+        return jresp({"error": "Missing base_version"}, 400)
+    doc, version = read_ai_memory(c.bucket, c.sub)
+    if base_version != version:
+        return jresp({"error": "memory_stale"}, 409)
+    try:
+        op = clean_memory_edit(body, doc)
+    except AICoachError as e:
+        return jresp({"error": str(e)}, 404 if str(e) == "fact_not_found" else 400)
+    try:
+        written = write_ai_memory(c.bucket, c.sub, [op], "athlete", created_by=c.email,
+                                  base_version=base_version)
+    except MemoryStale:
+        return jresp({"error": "memory_stale"}, 409)
+    if not written:             # правка ничего не поменяла — версии нет
+        return jresp(memory_view(doc, version), 200)
+    return jresp(memory_view(written, written["version"]), 201)
+
+
+def h_ai_memory_history(c):
+    return jresp({"versions": read_ai_memory_history(c.bucket, c.sub)}, 200)
 
 
 def h_profile_history(c):
@@ -1168,6 +1227,9 @@ ROUTES = [
     ("POST",   r"^/ai-coach/threads/([\w-]+)/archive$",    h_ai_thread_archive, False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages$",   h_ai_message_post,   False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages/([\w-]+)/apply$", h_ai_proposal_apply, False),
+    ("GET",    r"^/ai-coach/memory$",                      h_ai_memory_get,     False),
+    ("POST",   r"^/ai-coach/memory$",                      h_ai_memory_post,    False),
+    ("GET",    r"^/ai-coach/memory/history$",              h_ai_memory_history, False),
 
     ("GET",    r"^/profile$",                    h_profile_get,          False),
     ("POST",   r"^/profile$",                    h_profile_post,         False),

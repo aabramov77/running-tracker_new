@@ -275,6 +275,26 @@ def test_ai_coach_generated_handlers_exist():
     assert not (called - defined), sorted(called - defined)
 
 
+def test_ai_memory_card_is_wired():
+    """Память тренера (#80): карточка размечена, грузится при открытии
+    вкладки, правки уходят с версией, а память прежнего пользователя
+    следующему не достаётся."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    for el in ("ai-mem-count", "ai-mem-toggle", "ai-mem-body", "ai-mem-list", "ai-mem-kind",
+               "ai-mem-text", "ai-mem-add-btn", "ai-mem-hidden", "ai-mem-msg"):
+        assert f'id="{el}"' in html, el
+    assert "aiMemoryLoad()" in _js_section(js, "function openAiCoachTab(", "\n}\n")
+    assert "AIMEM" in _js_section(js, "function aiReset(", "\n}\n")
+    post = _js_section(js, "async function aiMemoryPost(", "\n}\n")
+    assert "base_version: AIMEM.data.version" in post and "memory_stale" in post
+    assert "aiMemoryChangesHtml(m.memory_changes)" in _js_section(js, "function aiMessageHtml(", "\n}\n")
+    section = _js_section(js, "// ── ИИ-тренер (#46)", "function showTab(")
+    called = set(re.findall(r'onclick="(\w+)\(', section))
+    assert {"aiMemoryShow", "aiMemoryEdit", "aiMemorySave", "aiMemoryHide", "aiMemoryRestore",
+            "aiMemoryToggleHidden"} <= called
+
+
 def test_plan_is_changed_only_by_the_apply_button():
     """ИИ предлагает, применяет спортсмен: раздел ИИ-тренера сам план не
     пишет — ни напрямую в PLAN, ни через сохранение недель. После применения

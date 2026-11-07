@@ -569,6 +569,37 @@ table.pb-table td:last-child { text-align: right; }
 .ai-prop-why { font-size: 12px; color: var(--text-muted); }
 .ai-prop-state { font-size: 12px; color: var(--text-muted); }
 .ai-prop-state.done { color: var(--c-accent); font-weight: 500; }
+/* Память ИИ-тренера (#80) */
+.ai-mem-count { font-weight: 400; }
+.ai-mem-kind {
+  margin: 10px 0 2px; font-size: 11px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted);
+}
+.ai-mem-fact {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
+  padding: 6px 0; border-bottom: 0.5px solid var(--border);
+}
+.ai-mem-fact.editing { flex-wrap: wrap; }
+.ai-mem-fact.is-hidden .ai-mem-text { color: var(--text-muted); }
+.ai-mem-text { min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
+.ai-mem-meta { display: block; font-size: 11px; color: var(--text-muted); }
+.ai-mem-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.ai-mem-add { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.ai-mem-fact.editing input, .ai-mem-add input, .ai-mem-add select {
+  padding: 7px 10px;
+  border: 0.5px solid var(--border); border-radius: 8px;
+  font-family: inherit; font-size: 13px;
+  background: var(--bg); color: var(--text);
+}
+.ai-mem-fact.editing input, .ai-mem-add input { flex: 1 1 220px; min-width: 0; }
+#ai-mem-msg { margin-top: 8px; }
+/* Что тренер записал в память — под его ответом; white-space сброшен, как у правок */
+.ai-mem-changes {
+  white-space: normal; margin-top: 8px; padding: 6px 10px;
+  background: var(--bg-card); color: var(--text-muted); font-size: 12px; cursor: pointer;
+  border: 0.5px solid var(--border); border-left: 3px solid var(--c-accent);
+  border-radius: 0 8px 8px 0;
+}
 @media (max-width: 600px) {
   .ai-log .chat-msg { max-width: 96%; }
   /* На узком экране дата правки встаёт над ней, а не сбоку */

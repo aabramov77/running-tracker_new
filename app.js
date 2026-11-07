@@ -3205,12 +3205,16 @@ const AI_STARTERS = [
 // ответила.
 const AICOACH = { threads: [], thread: null, messages: [], usage: null,
                   pending: null, loading: false, applying: false, session: 0 };
+// Память тренера (#80): data — ответ GET /ai-coach/memory, по его version
+// идут правки; editing — id факта, который правится на месте.
+const AIMEM = { data: null, open: false, editing: null, showHidden: false, busy: false };
 const AI_DAY_LABELS = Object.fromEntries(PLAN_DAYS);    // mon → «Пн»
 
 function aiReset() {
   AICOACH.session++;
   Object.assign(AICOACH, { threads: [], thread: null, messages: [], usage: null,
                            pending: null, loading: false, applying: false });
+  Object.assign(AIMEM, { data: null, open: false, editing: null, showHidden: false, busy: false });
 }
 
 async function aiFetch(path, { method = 'GET', body = null } = {}) {
@@ -3299,7 +3303,8 @@ function aiMessageHtml(m) {
   const mine = m.role === 'athlete';
   const chip = m.run_id ? aiRunChipHtml(m.run_id, m.run_title || 'тренировка') : '';
   const proposal = m.proposal ? aiProposalHtml(m) : '';
-  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+  const memory = m.memory_changes && m.memory_changes.length ? aiMemoryChangesHtml(m.memory_changes) : '';
+  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}${memory}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
 }
 
 function aiRenderRunChoices() {
@@ -3361,6 +3366,8 @@ function openAiCoachTab() {
   aiRenderRunChoices();
   aiRender(false);
   aiLoadThreads();
+  aiMemoryRender();
+  aiMemoryLoad();         // #80: число фактов видно и у свёрнутой карточки
 }
 
 async function aiLoadThreads() {
@@ -3444,6 +3451,7 @@ async function aiSend(preset = null) {
     AICOACH.pending = null;
     aiRender();
     aiLoadThreads();
+    if ((data.messages || []).some(m => m.memory_changes)) aiMemoryLoad();   // тренер что-то запомнил
   } catch (e) {
     if (AICOACH.session !== session) return;
     AICOACH.pending = null;
@@ -3519,6 +3527,198 @@ async function aiArchiveThread(id) {
   }
   if (AICOACH.thread && AICOACH.thread.id === id) aiNewThread();
   aiLoadThreads();
+}
+
+// ── Память ИИ-тренера (#80) ──
+// Общая для всех разборов: тренер пишет в неё сам, спортсмен правит, скрывает
+// и добавляет своё. Каждая правка уходит с base_version — версией, которую
+// спортсмен видел; разошлась — сервер отвечает memory_stale, и карточка
+// перечитывается. Скрытый факт остаётся в истории и возвращается кнопкой.
+const AI_MEMORY_CHANGE_LABELS = { add: '📝 Запомнил', edit: '✎ Уточнил', hide: '🗑 Забыл' };
+
+function aiMemoryKindLabel(kind) {
+  const found = ((AIMEM.data && AIMEM.data.kinds) || []).find(k => k.id === kind);
+  const label = found ? found.label : 'прочее';
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function aiMemoryNote(text, ok) {
+  flashMsg(document.getElementById('ai-mem-msg'), text, ok, ok ? 2500 : 0);
+}
+
+function aiMemoryErrorText(e) {
+  if (e.code === 'memory_full') return 'Память заполнена — скройте лишние факты';
+  if (e.code === 'invalid_fact') return 'Факт пустой или длиннее 300 символов';
+  if (e.code === 'fact_not_found') return 'Этого факта уже нет — показана свежая память';
+  return aiErrorText(e);
+}
+
+async function aiMemoryLoad() {
+  const who = userSub;
+  try {
+    const data = await aiFetch('memory');
+    if (userSub !== who) return;          // за время запроса вошёл другой человек
+    AIMEM.data = data;
+    aiMemoryRender();
+  } catch (e) {
+    if (!e.handled && AIMEM.open) aiMemoryNote('Не удалось загрузить память тренера');
+  }
+}
+
+function aiMemoryToggle() {
+  AIMEM.open = !AIMEM.open;
+  aiMemoryRender();
+  if (AIMEM.open && !AIMEM.data) aiMemoryLoad();
+}
+
+function aiMemoryToggleHidden() {
+  AIMEM.showHidden = !AIMEM.showHidden;
+  aiMemoryRender();
+}
+
+// Строка «Запомнил: …» под ответом тренера: карточка раскрывается и
+// перечитывается — в ней уже есть то, что он только что записал.
+function aiMemoryShow() {
+  AIMEM.open = true;
+  aiMemoryRender();
+  aiMemoryLoad();
+  document.getElementById('ai-mem-body').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function aiMemoryChangesHtml(changes) {
+  return '<div class="ai-mem-changes" onclick="aiMemoryShow()" title="Открыть память тренера">'
+    + changes.map(c => `<div>${AI_MEMORY_CHANGE_LABELS[c.op] || '📝 Запомнил'}: ${escapeHtml(c.text)}</div>`).join('')
+    + '</div>';
+}
+
+function aiMemoryFactHtml(f) {
+  const id = escapeHtml(f.id);
+  const iso = String(f.updated_at || f.created_at || '');
+  const date = iso.length >= 10 ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : '';
+  if (AIMEM.editing === f.id) {
+    return `<div class="ai-mem-fact editing">
+      <input type="text" id="ai-mem-edit" maxlength="300" value="${escapeHtml(f.text)}" onkeydown="aiMemoryEditKey(event, '${id}')">
+      <div class="ai-mem-actions">
+        <button class="btn-primary" onclick="aiMemorySave('${id}')">Сохранить</button>
+        <button class="btn-sm" onclick="aiMemoryEdit(null)">Отмена</button>
+      </div>
+    </div>`;
+  }
+  const who = f.source === 'athlete' ? 'вы' : 'тренер';
+  return `<div class="ai-mem-fact">
+    <div class="ai-mem-text">${escapeHtml(f.text)}<span class="ai-mem-meta">${who} · ${escapeHtml(date)}</span></div>
+    <div class="ai-mem-actions">
+      <button class="btn-sm" title="Поправить" aria-label="Поправить" onclick="aiMemoryEdit('${id}')">✎</button>
+      <button class="btn-sm" title="Скрыть" aria-label="Скрыть" onclick="aiMemoryHide('${id}')" style="color:var(--c-danger)">✕</button>
+    </div>
+  </div>`;
+}
+
+function aiMemoryRender() {
+  const data = AIMEM.data;
+  const facts = data ? data.facts || [] : [];
+  const hidden = data ? data.hidden || [] : [];
+  document.getElementById('ai-mem-count').textContent = data ? `· ${facts.length}` : '';
+  const toggle = document.getElementById('ai-mem-toggle');
+  toggle.textContent = AIMEM.open ? 'Свернуть' : 'Показать';
+  toggle.setAttribute('aria-expanded', String(AIMEM.open));
+  document.getElementById('ai-mem-body').style.display = AIMEM.open ? '' : 'none';
+  if (!AIMEM.open) return;
+
+  const list = document.getElementById('ai-mem-list');
+  if (!data) { list.innerHTML = '<div class="empty">Загрузка…</div>'; return; }
+  list.innerHTML = facts.length
+    ? data.kinds.map(k => {
+        const group = facts.filter(f => f.kind === k.id);
+        return group.length
+          ? `<div class="ai-mem-kind">${escapeHtml(aiMemoryKindLabel(k.id))}</div>` + group.map(aiMemoryFactHtml).join('')
+          : '';
+      }).join('')
+    : '<div class="empty">Тренер пока ничего не запомнил. Расскажите ему о себе в разборе или добавьте факт сами.</div>';
+
+  const select = document.getElementById('ai-mem-kind');
+  if (!select.options.length) {
+    select.innerHTML = data.kinds.map(k =>
+      `<option value="${escapeHtml(k.id)}">${escapeHtml(aiMemoryKindLabel(k.id))}</option>`).join('');
+  }
+  const full = facts.length >= data.limits.facts;
+  const input = document.getElementById('ai-mem-text');
+  input.disabled = full;
+  input.placeholder = full ? `Память заполнена (${data.limits.facts}) — скройте лишнее` : 'Что тренеру стоит помнить';
+  document.getElementById('ai-mem-add-btn').disabled = full || AIMEM.busy;
+
+  document.getElementById('ai-mem-hidden').innerHTML = !hidden.length ? ''
+    : `<button class="btn-sm" onclick="aiMemoryToggleHidden()">${AIMEM.showHidden ? 'Свернуть скрытые' : `Скрытые (${hidden.length})`}</button>`
+      + (AIMEM.showHidden ? hidden.map(f => `<div class="ai-mem-fact is-hidden">
+          <div class="ai-mem-text">${escapeHtml(f.text)}<span class="ai-mem-meta">${escapeHtml(aiMemoryKindLabel(f.kind))}</span></div>
+          <div class="ai-mem-actions"><button class="btn-sm" ${full ? 'disabled title="Память заполнена"' : ''} onclick="aiMemoryRestore('${escapeHtml(f.id)}')">Вернуть</button></div>
+        </div>`).join('') : '');
+}
+
+// Правка памяти → true, если сервер её принял. Ответ — уже новая память.
+async function aiMemoryPost(body) {
+  if (!AIMEM.data || AIMEM.busy) return false;
+  AIMEM.busy = true;
+  aiMemoryNote('');
+  try {
+    AIMEM.data = await aiFetch('memory', { method: 'POST',
+                                           body: { ...body, base_version: AIMEM.data.version } });
+    if (body.id && body.id === AIMEM.editing) AIMEM.editing = null;
+    return true;
+  } catch (e) {
+    if (e.handled) return false;
+    aiMemoryNote(e.code === 'memory_stale'
+      ? 'Память успела измениться — показана свежая, повторите правку' : aiMemoryErrorText(e));
+    if (e.code === 'memory_stale' || e.code === 'fact_not_found') {
+      AIMEM.editing = null;
+      await aiMemoryLoad();
+    }
+    return false;
+  } finally {
+    AIMEM.busy = false;
+    aiMemoryRender();
+  }
+}
+
+async function aiMemoryAdd() {
+  const input = document.getElementById('ai-mem-text');
+  const text = input.value.trim();
+  if (!text) return;
+  const kind = document.getElementById('ai-mem-kind').value;
+  if (await aiMemoryPost({ op: 'add', kind, text })) {
+    input.value = '';
+    aiMemoryNote('Тренер будет это помнить', true);
+  }
+}
+
+function aiMemoryKey(event) {
+  if (event.key === 'Enter') { event.preventDefault(); aiMemoryAdd(); }
+}
+
+function aiMemoryEdit(id) {
+  AIMEM.editing = id;
+  aiMemoryRender();
+  const input = document.getElementById('ai-mem-edit');
+  if (input) input.focus();
+}
+
+function aiMemoryEditKey(event, id) {
+  if (event.key === 'Enter') { event.preventDefault(); aiMemorySave(id); }
+  if (event.key === 'Escape') aiMemoryEdit(null);
+}
+
+async function aiMemorySave(id) {
+  const text = document.getElementById('ai-mem-edit').value.trim();
+  if (!text) { aiMemoryNote('Пустой факт не сохранить — его можно скрыть'); return; }
+  await aiMemoryPost({ op: 'edit', id, text });
+}
+
+async function aiMemoryHide(id) {
+  if (await aiMemoryPost({ op: 'hide', id })) aiMemoryNote('Скрыто — вернуть можно из «Скрытых»', true);
+}
+
+async function aiMemoryRestore(id) {
+  await aiMemoryPost({ op: 'restore', id });
 }
 
 // Кнопку не передаём: активные пункты ищутся по имени вкладки, потому что у
