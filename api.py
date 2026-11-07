@@ -7,6 +7,7 @@
 import json
 import logging
 import re
+import time
 from datetime import datetime
 
 import httpx
@@ -60,6 +61,47 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+def _fresh_for(headers):
+    """Сколько секунд ответ ещё свеж по Cache-Control (max-age минус Age)."""
+    rules = headers.get("Cache-Control") or ""
+    max_age = re.search(r"max-age=(\d+)", rules)
+    if not max_age or "no-store" in rules or "no-cache" in rules:
+        return 0
+    try:
+        age = int(headers.get("Age") or 0)
+    except ValueError:
+        age = 0
+    return int(max_age.group(1)) - age
+
+
+class CachingTransport:
+    """Транспорт google-auth, который помнит ответы на GET, пока они свежи.
+
+    google-auth сертификаты не кэширует: verify_oauth2_token на каждом запросе
+    к API заново скачивал их у Google — лишний поход в сеть и TLS-рукопожатие.
+    Google отдаёт сертификаты с max-age в несколько часов и публикует новый
+    ключ заранее, поэтому держать ответ max-age безопасно.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._cache = {}          # url → (свеж до, ответ)
+
+    def __call__(self, url, method="GET", **kwargs):
+        cached = self._cache.get(url) if method == "GET" else None
+        if cached and cached[0] > self._clock():
+            return cached[1]
+        response = google_requests.Request()(url, method=method, **kwargs)
+        if method == "GET" and response.status == 200:
+            fresh = _fresh_for(response.headers)
+            if fresh > 0:
+                self._cache[url] = (self._clock() + fresh, response)
+        return response
+
+
+_GOOGLE_TRANSPORT = CachingTransport()
+
+
 def verify_token(request):
     """Проверяет подпись Google ID-токена. Возвращает info (sub/email/name) или None.
     Авторизация (кто допущен) решается отдельно через реестр — resolve_user.
@@ -69,17 +111,21 @@ def verify_token(request):
         return None
     token = auth[7:]
     try:
-        return id_token.verify_oauth2_token(token, google_requests.Request(), CLIENT_ID)
+        return id_token.verify_oauth2_token(token, _GOOGLE_TRANSPORT, CLIENT_ID)
     except Exception:
         return None
 
 
 # ── HTTP: ответы и контекст запроса ───────────────────────────────────────────
 
+# Любой запрос фронтенда несёт Authorization, поэтому браузер шлёт перед ним
+# предварительный OPTIONS. Max-Age даёт браузеру запомнить ответ на час
+# (Chrome держит не дольше двух), а не переспрашивать каждые пять секунд.
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "3600",
 }
 JSON_HEADERS = {**CORS_HEADERS, "Content-Type": "application/json"}
 

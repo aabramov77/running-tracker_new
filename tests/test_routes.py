@@ -163,6 +163,11 @@ def test_dispatch_options_needs_no_token(patched_api):
     assert code == 204 and "Access-Control-Allow-Origin" in headers
 
 
+def test_browser_keeps_the_preflight_answer(patched_api):
+    _, _, headers = patched_api.handle_request(FakeRequest("OPTIONS", "/profile"))
+    assert headers["Access-Control-Max-Age"] == "3600"
+
+
 def test_dispatch_blocks_admin_routes_for_regular_user(api):
     assert _status(api(FakeRequest("GET", "/admin/users"))) == 403
 

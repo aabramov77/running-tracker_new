@@ -233,7 +233,9 @@ main.py         точка входа Cloud Run Function
 - Фронтенд — vanilla JS без сборки; выбор API-эндпоинта по hostname.
 - Авторизация — Google Identity Services (JS-API: кнопки рисуются в
   `[data-gsi-button]` стартовой страницы), бэкенд проверяет ID-токен и
-  разграничивает данные по `sub` из токена.
+  разграничивает данные по `sub` из токена. Сертификаты Google для проверки
+  подписи держатся в памяти инстанса, пока свежи по `Cache-Control`, а ответ
+  на предварительный `OPTIONS` браузер помнит час (`Access-Control-Max-Age`).
 - Стартовая страница живёт в том же `index.html`; её стили — в `landing.css`,
   чтобы `style.css` оставался стилями приложения.
 - Оффлайн — последние данные кэшируются в `localStorage`.
@@ -327,7 +329,7 @@ config/llm/…                      конфиг и ключ LLM (только �
 
 ```bash
 git checkout Dev        # весь код пишется в Dev, в main — только merge
-python -m pytest -q     # 1199 тестов
+python -m pytest -q     # 1269 тестов
 ```
 
 - Тесты не требуют доступа к GCP: `tests/conftest.py` подменяет
