@@ -21,7 +21,7 @@ from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      FitTokenInvalid, LLMRefused, LLMTruncated, MemoryStale,
                      PlansIndexBusy, PlanStale, RaceStale, RegistrationClosed, RunStale,
-                     StorageBusy, UsageBusy, RACE_FIELDS, RUN_FIELDS,
+                     StorageBusy, UsageBusy, LATE_PROFILE_FIELDS, RACE_FIELDS, RUN_FIELDS,
                      _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
@@ -58,6 +58,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      set_user_status, update_plan_meta,
                      write_ai_memory, write_athlete_version, write_llm_config_version,
                      write_parsed_fit_to_tmp)
+from weather import clean_geocode_query, geocode
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -883,18 +884,31 @@ def h_profile_post(c):
     profile, errors = clean_athlete_profile(source)
     if errors:
         return validation_failed(errors)
-    # Клиент до #66 поля порога не знает, а POST заменяет профиль целиком:
-    # без этого сохранение из старой вкладки молча стёрло бы порог. Явный
-    # null или пустая строка по-прежнему его сбрасывают.
-    if isinstance(source, dict) and "threshold_pace_sec" not in source:
-        profile["threshold_pace_sec"] = \
-            read_athlete_profile(c.bucket, c.sub)[0].get("threshold_pace_sec")
+    # Клиент до #66 не знает поля порога, до #72 — полей погоды, а POST
+    # заменяет профиль целиком: без этого сохранение из старой вкладки молча
+    # стёрло бы их. Явный null или пустое значение по-прежнему сбрасывают.
+    missing = [f for f in LATE_PROFILE_FIELDS if f not in source]
+    if missing:
+        current = read_athlete_profile(c.bucket, c.sub)[0]
+        profile.update({f: current.get(f) for f in missing})
     payload = write_athlete_version(
         c.bucket, c.sub, profile,
         change_reason=clean_change_reason(body.get("change_reason")),
         created_by=c.email)
     return jresp(profile_response(c.bucket, c.sub, profile,
                                   payload["version"], payload["created_at"]), 201)
+
+
+def h_weather_geocode(c):
+    """Поиск места для прогноза (#72) — через сервер, чтобы браузер не ходил
+    к стороннему сервису сам и не светил ему адрес пользователя."""
+    query, error = clean_geocode_query(c.request.args.get("q"))
+    if error:
+        return validation_failed({"q": error})
+    found = geocode(query)
+    if found is None:
+        return jresp({"error": "geocoder_unavailable"}, 502)
+    return jresp({"results": found}, 200)
 
 
 def h_races_get(c):
@@ -1234,6 +1248,7 @@ ROUTES = [
     ("GET",    r"^/profile$",                    h_profile_get,          False),
     ("POST",   r"^/profile$",                    h_profile_post,         False),
     ("GET",    r"^/profile/history$",            h_profile_history,      False),
+    ("GET",    r"^/weather/geocode$",            h_weather_geocode,      False),
 
     ("GET",    r"^/races$",                      h_races_get,            False),
     ("POST",   r"^/races$",                      h_races_post,           False),

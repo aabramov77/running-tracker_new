@@ -59,6 +59,7 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/profile",               "h_profile_get"),
     ("POST",   "/profile",               "h_profile_post"),
     ("GET",    "/profile/history",       "h_profile_history"),
+    ("GET",    "/weather/geocode",       "h_weather_geocode"),
     ("GET",    "/plans",                 "h_plans_get"),
     ("POST",   "/plans/active",          "h_plan_activate"),
     ("POST",   "/plans/abc-123/meta",    "h_plan_meta"),
@@ -1468,3 +1469,48 @@ def test_coach_request_writes_nothing_to_the_athlete(api, patched_api, fake_buck
     assert athlete_data() == before
     api(FakeRequest("GET", "/load"))                       # а сам спортсмен кэш дописывает
     assert fake_bucket.blob("users/u1/derived/run_hist.json").exists()
+
+
+# ── Погода (#72): поиск места и поля профиля ─────────────────────────────────
+
+MOSCOW = {"name": "Москва", "lat": 55.75, "lon": 37.62}
+WEATHER_PROFILE = {"location": MOSCOW, "run_time": "07:30", "venues": ["manege"],
+                   "cold_sensitivity": "cold"}
+
+
+def test_geocode_validates_the_query(api):
+    body, code, _ = api(FakeRequest("GET", "/weather/geocode", args={"q": "М"}))
+    assert code == 400 and "q" in json.loads(body)["fields"]
+    assert _status(api(FakeRequest("GET", "/weather/geocode"))) == 400
+
+
+def test_geocode_reports_provider_failure(api):
+    """Сеть в тестах выключена — как упавший геокодер."""
+    body, code, _ = api(FakeRequest("GET", "/weather/geocode", args={"q": "Москва"}))
+    assert code == 502 and json.loads(body)["error"] == "geocoder_unavailable"
+
+
+def test_geocode_returns_places(api, monkeypatch):
+    import weather
+    monkeypatch.setattr(weather, "_http_get", lambda url, params: {"results": [
+        {"name": "Москва", "latitude": 55.75204, "longitude": 37.61781,
+         "country": "Россия", "admin1": "Москва"}]})
+    body, code, _ = api(FakeRequest("GET", "/weather/geocode", args={"q": "Москва"}))
+    assert code == 200
+    assert json.loads(body)["results"] == [{**MOSCOW, "admin1": "Москва", "country": "Россия"}]
+
+
+def test_profile_saved_by_an_old_tab_keeps_weather_fields(api):
+    """Вкладка до #72 полей погоды не знает и шлёт профиль без них."""
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    old_tab = {"hr_max": 185}
+    saved = json.loads(api(FakeRequest("POST", "/profile", {"profile": old_tab}))[0])["profile"]
+    assert saved["hr_max"] == 185
+    assert {k: saved[k] for k in WEATHER_PROFILE} == WEATHER_PROFILE
+
+
+def test_explicit_empty_weather_fields_reset_them(api):
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    cleared = {"location": None, "run_time": "", "venues": [], "cold_sensitivity": ""}
+    saved = json.loads(api(FakeRequest("POST", "/profile", {"profile": cleared}))[0])["profile"]
+    assert {k: saved[k] for k in cleared} == cleared

@@ -37,6 +37,7 @@ from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_memory_block,
                         format_plan_window, format_run_focus)
+from weather import COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time
 
 def get_storage_client():
     return gcs.Client()
@@ -489,7 +490,46 @@ def empty_athlete_profile():
     profile["available_days"] = []
     profile["hr_zones_custom"] = None       # None — зоны считаются от HRmax
     profile["threshold_pace_sec"] = None    # None — порог оценивается по «Стартам» (#66)
+    # Погода (#72): место прогноза, час тренировки, площадки и чувствительность к холоду
+    profile["location"] = None
+    profile["run_time"] = ""
+    profile["venues"] = []
+    profile["cold_sensitivity"] = ""
     return profile
+
+
+# Поля, появившиеся в профиле после #32. Клиент, который о них не знает,
+# присылает профиль без них, а POST заменяет профиль целиком: такое поле берётся
+# из текущей версии (api.h_profile_post). Явный null или пустое значение сбрасывает.
+LATE_PROFILE_FIELDS = ("threshold_pace_sec", "location", "run_time", "venues",
+                       "cold_sensitivity")
+
+
+def clean_location(value):
+    """Место для прогноза (#72): ({name, lat, lon} или None, ошибка или None).
+
+    Координаты округляются до 0,01° (~1 км): прогнозу точнее не нужно, а
+    точка «Моё местоположение» не должна указывать на дом.
+    """
+    if value in (None, "", {}):
+        return None, None
+    if not isinstance(value, dict):
+        return None, "ожидается объект {name, lat, lon}"
+    name = value.get("name")
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    if not name:
+        return None, "укажите название места"
+    if len(name) > LOCATION_NAME_MAX:
+        return None, f"название длиннее {LOCATION_NAME_MAX} символов"
+    coords = []
+    for key, limit in (("lat", 90), ("lon", 180)):
+        number = value.get(key)
+        # Сравнение отсекает NaN и бесконечность; bool — не координата.
+        if isinstance(number, bool) or not isinstance(number, (int, float)) \
+                or not -limit <= number <= limit:
+            return None, "координаты вне допустимого диапазона"
+        coords.append(round(number, 2))
+    return {"name": name, "lat": coords[0], "lon": coords[1]}, None
 
 
 def clean_threshold_pace(value):
@@ -620,6 +660,36 @@ def clean_athlete_profile(raw):
     profile["threshold_pace_sec"], pace_error = clean_threshold_pace(raw.get("threshold_pace_sec"))
     if pace_error:
         errors["threshold_pace_sec"] = pace_error
+
+    profile["location"], location_error = clean_location(raw.get("location"))
+    if location_error:
+        errors["location"] = location_error
+
+    run_time = raw.get("run_time")
+    run_time = run_time.strip() if isinstance(run_time, str) else run_time
+    profile["run_time"] = ""
+    if run_time not in (None, ""):
+        # parse_run_time молча подставляет время по умолчанию — здесь это ошибка
+        hh, mm = parse_run_time(run_time)
+        if not isinstance(run_time, str) or run_time != f"{hh:02d}:{mm:02d}":
+            errors["run_time"] = "ожидается время ЧЧ:ММ"
+        else:
+            profile["run_time"] = run_time
+
+    raw_venues = raw.get("venues") or []
+    if not isinstance(raw_venues, list):
+        errors["venues"] = "ожидается список"
+        raw_venues = []
+    unknown = [str(v) for v in raw_venues if v not in VENUES]
+    if unknown:
+        errors["venues"] = "неизвестные площадки: " + ", ".join(unknown)
+    profile["venues"] = [v for v in VENUES if v in raw_venues]
+
+    sensitivity = raw.get("cold_sensitivity") or ""
+    if sensitivity not in COLD_SENSITIVITY:
+        errors["cold_sensitivity"] = "допустимо: cold, warm или пусто"
+        sensitivity = ""
+    profile["cold_sensitivity"] = sensitivity
 
     return profile, errors
 
