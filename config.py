@@ -39,3 +39,14 @@ LLM_MAX_TOKENS = 8000
 # OpenAI. #38
 LLM_EFFORT_LEVELS = ("low", "medium", "high")
 LLM_DEFAULT_EFFORT = "medium"
+
+# Прогноз погоды (#72): Open-Meteo, без ключа. Бесплатный тариф — только для
+# некоммерческого использования и с подписью источника; платный отличается
+# адресом (customer-api.open-meteo.com) и параметром apikey.
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_TTL_SEC = 30 * 60          # прогноз в памяти инстанса
+WEATHER_FAIL_TTL_SEC = 2 * 60      # провайдер не ответил — столько не переспрашиваем
+GEOCODE_TTL_SEC = 24 * 3600
+WEATHER_TIMEOUT_SEC = 5
+WEATHER_DEFAULT_RUN_TIME = "08:00"
