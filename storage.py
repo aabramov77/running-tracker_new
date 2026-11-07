@@ -29,6 +29,7 @@ from compliance import (DEFAULT as UNDATED, anchor_source,
 from domain import (DIST_LABEL_KM, FEEL_LABELS, HR_ZONE_BOUNDS, MEMORY_FACTS_MAX,
                     MEMORY_KIND_LABELS, MEMORY_OPS_MAX, MEMORY_TEXT_MAX, PLAN_DAYS,
                     TYPE_LABELS, parse_time_to_sec, personal_bests)
+from history import monthly_summary, past_plan_candidates, past_plans
 from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
                   ZONE_GAP_CAP_SEC, axes, clean_hist_entry, format_duration,
                   hr_histogram, run_hist_entry, threshold_for, weekly_load,
@@ -2373,9 +2374,15 @@ def coach_load_view(load):
     }
 
 
+LLM_RACES_DAYS = 730           # забеги в контексте — за два года (#81)
+LLM_RACES_MAX = 10
+
+
 def build_llm_context(bucket, sub):
     """Собирает компактный богатый контекст для LLM: активный план и его пробежки."""
-    active_plan = get_active_plan(bucket, sub)
+    today = datetime.utcnow().date()
+    plans_index = read_plans_index(bucket, sub)
+    active_plan = find_plan(plans_index, plans_index.get("active_plan_id"))
     plan_id = active_plan["id"] if active_plan else None
 
     # Runs активного плана (#25)
@@ -2403,8 +2410,9 @@ def build_llm_context(bucket, sub):
     # Races
     all_races = read_races(bucket, sub)
     active_races = [r for r in all_races if not r.get("deleted", False)]
-    active_races.sort(key=lambda r: r.get("date", ""), reverse=True)
-    last_races = active_races[:3]
+    active_races.sort(key=lambda r: str(r.get("date", "")), reverse=True)
+    since = (today - timedelta(days=LLM_RACES_DAYS)).isoformat()
+    last_races = [r for r in active_races if str(r.get("date", "")) >= since][:LLM_RACES_MAX]
 
     # Нагрузка (#66) — по всем пробежкам, а не по плану: устаёт организм, а не
     # план. Сбой расчёта не роняет ход ИИ: модель получит «нагрузка недоступна».
@@ -2414,6 +2422,21 @@ def build_llm_context(bucket, sub):
     except Exception:
         logging.exception("load: нагрузка для контекста ИИ не посчитана")
         training_load = None
+
+    # История (#81): месяцы за год по всем пробежкам и итоги прошлых планов.
+    # Недели читаются только у прошлых планов, попавших в сводку. Сбой, как и
+    # у нагрузки, ход не роняет.
+    try:
+        candidates = past_plan_candidates(plans_index, today)
+        history = {
+            "months": monthly_summary(all_runs, (training_load or {}).get("runs"), today),
+            "plans": past_plans(candidates,
+                                {p["id"]: read_plan_weeks(bucket, sub, p["id"]) for p in candidates},
+                                all_runs, all_races),
+        }
+    except Exception:
+        logging.exception("history: история для контекста ИИ не посчитана")
+        history = None
 
     # Plan (недели активного плана)
     plan = None
@@ -2467,6 +2490,7 @@ def build_llm_context(bucket, sub):
         "profile_derived": athlete_derived(profile, all_races),
         "profile_version": profile_version,
         "load": training_load,
+        "history": history,
         "personal_bests": personal_bests(all_races),
         "last_runs": last_runs,
         "last_races": last_races,
