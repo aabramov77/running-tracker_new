@@ -569,6 +569,13 @@ table.pb-table td:last-child { text-align: right; }
 .ai-prop-why { font-size: 12px; color: var(--text-muted); }
 .ai-prop-state { font-size: 12px; color: var(--text-muted); }
 .ai-prop-state.done { color: var(--c-accent); font-weight: 500; }
+/* Что тренер помнит об открытом разборе (#82) */
+.ai-summary { margin: 0 0 8px; font-size: 12px; color: var(--text-muted); }
+.ai-summary summary { cursor: pointer; width: fit-content; }
+#ai-summary-text {
+  margin-top: 4px; padding: 6px 10px; color: var(--text); overflow-wrap: anywhere;
+  background: var(--bg-metric); border-left: 3px solid var(--c-accent); border-radius: 0 8px 8px 0;
+}
 /* Память ИИ-тренера (#80) */
 .ai-mem-count { font-weight: 400; }
 .ai-mem-kind {

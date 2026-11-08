@@ -36,7 +36,8 @@ from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
                   zone_seconds)
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_memory_block,
-                        format_plan_window, format_run_focus)
+                        format_past_threads, format_plan_window, format_run_focus,
+                        format_thread_start)
 from weather import (COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time,
                      weather_report)
 
@@ -3221,7 +3222,12 @@ def mark_chat_read(bucket, athlete, coach, reader_role, last_id=None):
 # разбора — объект-событие рядом; сама ветка остаётся в хранилище.
 
 AI_TITLE_MAX = 80
-AI_HISTORY_WINDOW = 12        # столько последних реплик ветки уходит модели
+# Переписка разбора уходит модели целиком, пока помещается в столько
+# символов; у более длинной начало заменяет его краткое содержание (#82).
+AI_HISTORY_CHARS = 40000
+AI_FOCUS_WINDOW = 12          # пробежки, прикреплённые к стольким последним репликам, — в фокусе
+AI_SUMMARY_MAX = 1000         # краткое содержание разбора, которое пишет модель (#82)
+AI_PAST_THREADS = 5           # столько прошлых разборов модель видит кратко (#82)
 _AI_ID_TIME = "%Y%m%dT%H%M%S%f"
 _AI_THREAD_ID_RE = re.compile(r"^\d{8}T\d{12}-[0-9a-f]{8}$")
 _AI_MSG_ID_RE = re.compile(r"^\d{8}T\d{12}-(athlete|ai)-[0-9a-f]{8}$")
@@ -3298,13 +3304,9 @@ def read_ai_thread(bucket, sub, thread_id):
     return json.loads(blob.download_as_text())
 
 
-def list_ai_threads(bucket, sub):
-    """Разборы пользователя, сначала с самой свежей репликой.
-
-    Число сообщений и время последнего берутся из имён объектов, одним
-    list_blobs; скачиваются только карточки. Разбор без единого сообщения в
-    список не попадает: он остаётся, когда первый ход не дошёл до модели.
-    """
+def _visible_ai_threads(bucket, sub):
+    """[(id разбора, id его сообщений)] — не скрытые разборы с репликами,
+    сначала с самой свежей. Всё из имён объектов, одним list_blobs."""
     root = p_ai_root(sub)
     found = {}
     for blob in bucket.list_blobs(prefix=root):
@@ -3319,16 +3321,54 @@ def list_ai_threads(bucket, sub):
         elif rest.startswith("m/") and _AI_MSG_ID_RE.match(rest[2:-len(".json")]):
             entry["ids"].append(rest[2:-len(".json")])
 
-    visible = sorted((tid for tid, e in found.items()
-                      if e["card"] and e["ids"] and not e["archived"]),
-                     key=lambda tid: max(found[tid]["ids"]), reverse=True)
-    threads = _load_json_objects(bucket, [p_ai_thread(sub, tid) for tid in visible])
-    for thread in threads:
-        ids = found[thread["id"]]["ids"]
-        last = datetime.strptime(max(ids)[:21], _AI_ID_TIME)
+    visible = [(tid, sorted(e["ids"])) for tid, e in found.items()
+               if e["card"] and e["ids"] and not e["archived"]]
+    return sorted(visible, key=lambda item: item[1][-1], reverse=True)
+
+
+def _message_ts(msg_id):
+    return datetime.strptime(msg_id[:21], _AI_ID_TIME).isoformat() + "Z"
+
+
+def list_ai_threads(bucket, sub):
+    """Разборы пользователя, сначала с самой свежей репликой.
+
+    Число сообщений и время последнего берутся из имён объектов, одним
+    list_blobs; скачиваются только карточки. Разбор без единого сообщения в
+    список не попадает: он остаётся, когда первый ход не дошёл до модели.
+    """
+    visible = _visible_ai_threads(bucket, sub)
+    threads = _load_json_objects(bucket, [p_ai_thread(sub, tid) for tid, _ in visible])
+    for thread, (_, ids) in zip(threads, visible):
         thread["messages"] = len(ids)
-        thread["last_ts"] = last.isoformat() + "Z"
+        thread["last_ts"] = _message_ts(ids[-1])
     return threads
+
+
+def past_ai_threads(bucket, sub, exclude_id=None, limit=AI_PAST_THREADS):
+    """Последние limit разборов, кроме exclude_id: название, время и краткое
+    содержание (#82). Скрытые не берутся.
+
+    Содержание лежит в последней реплике тренера: при записи ответа оно
+    переносится из прежней, если модель нового не дала. Поэтому на разбор —
+    одно чтение карточки и одно реплики, параллельно.
+    """
+    picked = [(tid, ids) for tid, ids in _visible_ai_threads(bucket, sub)
+              if tid != exclude_id][:limit]
+    last_ai = [next((i for i in reversed(ids) if "-ai-" in i), None) for _, ids in picked]
+    cards = _load_json_objects(bucket, [p_ai_thread(sub, tid) for tid, _ in picked],
+                               skip_broken=True)
+    answers = _load_json_objects(bucket, [p_ai_msg(sub, tid, mid)
+                                          for (tid, _), mid in zip(picked, last_ai) if mid],
+                                 skip_broken=True)
+    answers = iter(answers)
+    result = []
+    for (tid, ids), card, mid in zip(picked, cards, last_ai):
+        answer = next(answers) if mid else None
+        result.append({"id": tid, "title": (card or {}).get("title") or "Разбор",
+                       "last_ts": _message_ts(ids[-1]),
+                       "summary": (answer or {}).get("thread_summary") or ""})
+    return result
 
 
 def archive_ai_thread(bucket, sub, thread_id, archived_by="api"):
@@ -3360,19 +3400,54 @@ def read_ai_messages(bucket, sub, thread_id):
     return _load_json_objects(bucket, [p_ai_msg(sub, thread_id, i) for i in ids])
 
 
-def ai_history(messages, window=AI_HISTORY_WINDOW):
-    """Последние реплики ветки в виде, который принимает call_llm.
+def ai_history_start(messages, budget=AI_HISTORY_CHARS):
+    """Индекс первой реплики, которая уходит модели (#82).
+
+    Берутся самые свежие реплики, пока их текст помещается в budget. Обычный
+    разбор уходит целиком, у длинного начало отбрасывается — его заменяет
+    краткое содержание. Диалог для провайдера открывает вопрос, поэтому
+    ответ в начале окна тоже отбрасывается. Последний вопрос с ответом на
+    него уходят всегда, даже если вдвоём они больше budget.
+    """
+    start, used = len(messages), 0
+    while start > 0 and used + len(messages[start - 1].get("text") or "") <= budget:
+        used += len(messages[start - 1].get("text") or "")
+        start -= 1
+    while start < len(messages) and messages[start]["role"] != "athlete":
+        start += 1
+    if start == len(messages):
+        start = next((i for i in range(len(messages) - 1, -1, -1)
+                      if messages[i]["role"] == "athlete"), len(messages))
+    return start
+
+
+def clean_thread_summary(value):
+    """Краткое содержание разбора от модели: одна строка, не длиннее
+    AI_SUMMARY_MAX; не строка или пусто — ""."""
+    return " ".join(value.split())[:AI_SUMMARY_MAX] if isinstance(value, str) else ""
+
+
+def latest_thread_summary(messages):
+    """Самое свежее краткое содержание разбора; "" — его ещё нет."""
+    return next((m["thread_summary"] for m in reversed(messages)
+                 if m.get("role") == "ai" and m.get("thread_summary")), "")
+
+
+def ai_history(messages, budget=AI_HISTORY_CHARS):
+    """Реплики ветки, которые помещаются в budget, в виде для call_llm.
 
     Ответы ИИ отдаются тем же JSON-конвертом, в каком модель их писала:
     увидев свои прошлые ответы простым текстом, она начинает отвечать так же
-    и ломает JSON-режим.
+    и ломает JSON-режим. Краткое содержание (#82) есть только у последнего
+    ответа: у каждого оно повторяло бы почти то же самое.
     """
-    recent = messages[-window:]
-    while recent and recent[0]["role"] != "athlete":    # диалог открывает вопрос
-        recent = recent[1:]
+    recent = messages[ai_history_start(messages, budget):]
+    last_ai = next((i for i in range(len(recent) - 1, -1, -1) if recent[i]["role"] == "ai"), None)
 
-    def envelope(message):
+    def envelope(message, last):
         data = {"reply": message["text"]}
+        if last and message.get("thread_summary"):
+            data["summary"] = message["thread_summary"]
         proposal = message.get("proposal")
         if proposal:        # модель должна помнить, что именно она предлагала
             data["proposal"] = {
@@ -3385,8 +3460,8 @@ def ai_history(messages, window=AI_HISTORY_WINDOW):
         return json.dumps(data, ensure_ascii=False)
 
     return [{"role": "user", "content": m["text"]} if m["role"] == "athlete" else
-            {"role": "assistant", "content": envelope(m)}
-            for m in recent]
+            {"role": "assistant", "content": envelope(m, i == last_ai)}
+            for i, m in enumerate(recent)]
 
 
 def parse_coach_reply(text):
@@ -3412,7 +3487,7 @@ def parse_coach_reply(text):
 AI_FOCUS_RUNS_MAX = 3         # подробных блоков по пробежкам на один ход
 
 
-def ai_focus_run_ids(thread, messages, run_id=None, window=AI_HISTORY_WINDOW):
+def ai_focus_run_ids(thread, messages, run_id=None, window=AI_FOCUS_WINDOW):
     """Какие пробежки разбираются на этом ходу, от давно упомянутой к свежей.
 
     Пробежка разбора, прикреплённые к репликам окна и прикреплённая сейчас.
@@ -3480,6 +3555,10 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
     добавить пробежку или поправить план. run — пробежка, прикреплённая к
     новому вопросу. Память (#80) общая для всех разборов и тоже читается
     заново: её могли поправить в другом разборе или руками.
+
+    Память диалогов (#82): переписка разбора уходит целиком, пока помещается
+    в AI_HISTORY_CHARS; отброшенное начало заменяет краткое содержание
+    разбора. Прошлые разборы модель видит по их кратким содержаниям.
     """
     ctx = build_llm_context(bucket, sub)
     own = {r.get("id"): r for r in read_runs(bucket, sub) if not r.get("deleted", False)}
@@ -3489,20 +3568,25 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
               for rid in focus_ids]
     window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
     memory, memory_version = read_ai_memory(bucket, sub)
+    summary = latest_thread_summary(messages)
+    cut = ai_history_start(messages, AI_HISTORY_CHARS) > 0
     instructions = coach_chat_instructions(with_proposals=bool(window))
     data = coach_chat_data(format_context_for_llm(ctx), blocks,
                            format_plan_window(window) if window else "",
-                           format_memory_block(memory_facts(memory)))
+                           format_memory_block(memory_facts(memory)),
+                           format_past_threads(past_ai_threads(bucket, sub, thread.get("id"))),
+                           format_thread_start(summary) if cut else "")
     return {
         "ctx": ctx,
         "memory": memory,
         "memory_version": memory_version,
+        "thread_summary": summary,
         "focus_run_ids": focus_ids,
         "plan_window": window,
         "instructions": instructions,
         "data": data,
         "system": instructions + "\n\n" + data,
-        "history": ai_history(messages),
+        "history": ai_history(messages, AI_HISTORY_CHARS),
     }
 
 

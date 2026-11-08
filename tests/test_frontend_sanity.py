@@ -295,6 +295,17 @@ def test_ai_memory_card_is_wired():
             "aiMemoryToggleHidden"} <= called
 
 
+def test_thread_summary_line_is_wired():
+    """Краткое содержание разбора (#82) пишет модель — в разметку оно идёт
+    только текстом."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert 'id="ai-summary"' in html and 'id="ai-summary-text"' in html
+    render = _js_section(js, "function aiRender(", "\n}\n")
+    assert "getElementById('ai-summary-text').textContent" in render
+    assert "thread_summary" in render
+
+
 def test_plan_is_changed_only_by_the_apply_button():
     """ИИ предлагает, применяет спортсмен: раздел ИИ-тренера сам план не
     пишет — ни напрямую в PLAN, ни через сохранение недель. После применения

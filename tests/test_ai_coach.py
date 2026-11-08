@@ -174,18 +174,35 @@ def test_history_maps_roles_and_wraps_answers_in_the_reply_envelope(storage_modu
     assert json.loads(history[1]["content"]) == {"reply": "m1"}
 
 
-def test_history_is_a_window_over_the_latest_turns(storage_module):
+def test_a_usual_thread_goes_to_the_model_whole(storage_module):
+    """Память диалогов (#82): не последние 12 реплик, а весь разбор."""
     history = storage_module.ai_history(_dialogue(40))
-    assert len(history) == storage_module.AI_HISTORY_WINDOW
-    assert history[-1]["role"] == "assistant"
+    assert len(history) == 40
     assert json.loads(history[-1]["content"]) == {"reply": "m39"}
 
 
+def test_a_long_thread_keeps_the_latest_turns_that_fit(storage_module):
+    dialogue = [{**m, "text": m["text"].ljust(100)} for m in _dialogue(40)]
+    history = storage_module.ai_history(dialogue, budget=1000)
+    assert len(history) == 10
+    assert json.loads(history[-1]["content"])["reply"].strip() == "m39"
+    assert storage_module.ai_history_start(dialogue, budget=1000) == 30
+
+
 def test_history_never_opens_with_an_answer(storage_module):
-    """Окно могло разрезать пару; провайдеры ждут первым ход пользователя."""
-    history = storage_module.ai_history(_dialogue(40), window=5)
+    """Лимит мог разрезать пару; провайдеры ждут первым ход пользователя."""
+    dialogue = [{**m, "text": m["text"].ljust(100)} for m in _dialogue(40)]
+    history = storage_module.ai_history(dialogue, budget=500)
     assert history[0]["role"] == "user"
     assert len(history) == 4
+
+
+def test_the_last_exchange_goes_even_when_it_is_over_the_budget(storage_module):
+    dialogue = _dialogue(4) + [{"role": "ai", "text": "ответ" * 100}]
+    dialogue[3]["role"] = "athlete"                     # m0 m1 m2 вопрос → длинный ответ
+    assert storage_module.ai_history_start(dialogue, budget=10) == 3
+    assert [h["role"] for h in storage_module.ai_history(dialogue, budget=10)] == ["user", "assistant"]
+    assert storage_module.ai_history_start([{"role": "ai", "text": "x"}], budget=0) == 1
 
 
 def test_history_of_a_new_thread_is_empty(storage_module):
@@ -531,7 +548,7 @@ def test_focus_keeps_the_latest_runs_and_moves_a_repeat_to_the_end(storage_modul
 
 
 def test_focus_forgets_runs_attached_before_the_history_window(storage_module):
-    messages = [_asked(9)] + [_asked() for _ in range(storage_module.AI_HISTORY_WINDOW)]
+    messages = [_asked(9)] + [_asked() for _ in range(storage_module.AI_FOCUS_WINDOW)]
     assert storage_module.ai_focus_run_ids({"run_id": None}, messages) == []
 
 

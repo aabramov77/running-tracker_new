@@ -3593,6 +3593,10 @@ function aiRender(scrollToEnd = true) {
     usage ? `сегодня ${usage.count} из ${usage.limit}` : '';
   document.getElementById('ai-focus').innerHTML = thread && thread.run_id
     ? aiRunChipHtml(thread.run_id, 'открыть тренировку') : '';
+  // #82: краткое содержание разбора, которое модель ведёт в каждом ответе
+  const remembered = [...messages].reverse().find(m => m.role === 'ai' && m.thread_summary);
+  document.getElementById('ai-summary').style.display = remembered ? '' : 'none';
+  document.getElementById('ai-summary-text').textContent = remembered ? remembered.thread_summary : '';
 
   let html = loading ? '<div class="empty">Загрузка…</div>' : messages.map(aiMessageHtml).join('');
   if (pending) {

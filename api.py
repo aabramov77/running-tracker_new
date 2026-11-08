@@ -32,7 +32,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
                      clean_effort, clean_memory_edit, clean_memory_ops,
                      clean_plan_meta, clean_plan_weeks,
-                     clean_proposal, clean_race, clean_run,
+                     clean_proposal, clean_race, clean_run, clean_thread_summary,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
                      coach_weather_view,
@@ -763,6 +763,9 @@ def h_ai_message_post(c):
         release_advice_usage(c.bucket, c.sub)
         return failure
     memory = _remember(c, thread, turn, envelope.get("memory"))
+    # Краткое содержание разбора (#82): модель не дала нового — переносим
+    # прежнее, чтобы последняя реплика тренера всегда несла свежее.
+    summary = clean_thread_summary(envelope.get("summary")) or turn["thread_summary"]
 
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
@@ -789,6 +792,7 @@ def h_ai_message_post(c):
         "based_on_profile_version": ctx.get("profile_version", 0),
         "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
         "based_on_memory_version": turn["memory_version"],
+        **({"thread_summary": summary} if summary else {}),
         **({"proposal": proposal} if proposal else {}),
         **({"memory_changes": memory["changes"], "memory_version": memory["version"]}
            if memory else {}),
