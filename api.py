@@ -27,7 +27,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
                      build_ai_turn,
-                     build_plan_compliance, call_llm,
+                     build_plan_compliance, build_plan_weather, call_llm,
                      chat_unread, mark_chat_read, read_chat,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
                      clean_effort, clean_memory_edit, clean_memory_ops,
@@ -1082,6 +1082,13 @@ def h_plan_compliance(c):
     return jresp(result, 200)
 
 
+def h_plan_weather(c):
+    result = build_plan_weather(c.bucket, c.sub, c.args[0])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(result, 200)
+
+
 def h_plan_weeks_post(c):
     plan_id = c.args[0]
     if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
@@ -1266,6 +1273,7 @@ ROUTES = [
     ("POST",   r"^/plans/([\w-]+)/weeks$",       h_plan_weeks_post,      False),
     ("GET",    r"^/plans/([\w-]+)/history$",     h_plan_history,         False),
     ("GET",    r"^/plans/([\w-]+)/compliance$",  h_plan_compliance,      False),
+    ("GET",    r"^/plans/([\w-]+)/weather$",     h_plan_weather,         False),
 
     ("GET",    r"^/plan$",                       h_active_plan_weeks_get,  False),
     ("POST",   r"^/plan$",                       h_active_plan_weeks_post, False),

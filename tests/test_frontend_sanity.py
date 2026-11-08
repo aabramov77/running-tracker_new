@@ -476,7 +476,8 @@ def js_templates(src):
 # которые сами собирают разметку или текст из своих аргументов.
 _SAFE_CALLS = ("escapeHtml", "Number", "km1", "chatTime", "mdLite", "ddmm", "secondsToTime",
                "plannedKmLabel", "dayFactHtml", "aiRunChipHtml", "aiProposalHtml",
-               "runItemHtml", "kmCell", "dayCell", "inp", "typeSel", "hero")
+               "runItemHtml", "kmCell", "dayCell", "inp", "typeSel", "hero",
+               "wxDeg", "wxVenueHtml", "wxCellHtml", "wxShortHtml", "wxDetailHtml")
 # Словари подписей в коде: значение берётся из них, а не из данных.
 _SAFE_MAPS = r"(?:[A-Z][A-Z_0-9]*|label|feelEmoji|typeLabels|statusLabel)"
 _MARKUP = re.compile(r"</?[a-zA-Z]")
@@ -1349,3 +1350,44 @@ def test_hidden_lists_load_on_demand_and_restore_refreshes_the_rest():
     assert "if (HIDDEN.run.open) loadHidden('run');" in _fn(js, "deleteRun")
     assert "if (HIDDEN.race.open) loadHidden('race');" in _fn(js, "deleteRace")
     assert "loadHidden" in _history_section(js)
+
+
+# ── Погода (#72) ──────────────────────────────────────────────────────────────
+
+def test_weather_is_loaded_with_the_plan_and_after_profile_save():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "loadWeather();" in _js_section(js, "async function loadPlan() {", "\n}\n")
+    assert "loadWeather();" in _js_section(js, "async function saveProfile() {", "\n}\n")
+    assert "WEATHER = null;" in _js_section(js, "async function switchPlan(", "\n}\n")
+    # ответ для прежнего плана к новому не прикладываем
+    assert "data.plan_id === activePlanId()" in _fn(js, "loadWeather")
+
+
+def test_weather_reaches_every_view_of_the_plan():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "WEATHER)" in _fn(js, "renderPlanTable")
+    assert "weather: WEATHER" in _fn(js, "renderPlanWeek")
+    assert "weatherByDate(WEATHER)" in _fn(js, "renderToday")
+    assert "day-sheet-wx" in _fn(js, "openDaySheet")
+    assert 'id="day-sheet-wx"' in INDEX.read_text(encoding="utf-8")
+    assert "wxShortHtml(" in _js_section(js, "function planWeekHtml(", "\n}\n")
+    assert "wxRow(" in _js_section(js, "function planViewRowsHtml(", "\n}\n")
+
+
+def test_profile_sends_weather_fields():
+    """POST /profile заменяет профиль целиком, а поле, которого нет в теле,
+    сервер берёт из прошлой версии: без явного null город было бы не убрать."""
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _js_section(js, "function collectProfileForm(", "\n}\n")
+    assert "body.location = PROFILE_LOCATION;" in body and "body.venues = " in body
+    assert "run_time: 'pr-run-time'" in js and "cold_sensitivity: 'pr-cold'" in js
+    fill = _js_section(js, "function fillProfileForm(", "\n}\n")
+    assert "PROFILE_LOCATION = profile.location || null;" in fill
+
+
+def test_weather_credits_the_provider():
+    """Бесплатный тариф Open-Meteo требует подписи источника."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "https://open-meteo.com/" in js
+    assert "WX_SOURCE" in _js_section(js, "function wxDetailHtml(", "\n}\n")
+    assert "WX_SOURCE" in _js_section(js, "function planViewRowsHtml(", "\n}\n")

@@ -834,3 +834,36 @@ table.pb-table td:last-child { text-align: right; }
 .coach-load-badges { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: 6px; vertical-align: 1px; }
 .coach-load-badges .load-pill { font-size: 11px; font-weight: 400; }
 .field-hint { margin: 4px 0 0; font-size: 12px; }
+
+/* Погода и советы к тренировке (#72) */
+table.plan tr.wx-row td { background: var(--bg-card); vertical-align: top; font-size: 11px; line-height: 1.35; }
+table.plan tr.wx-row:hover td { background: var(--bg-card); }
+.wx-label { color: var(--text-muted); }
+.wx-cell .wx-t { font-size: 12px; font-weight: 500; white-space: nowrap; }
+.wx-cell .wx-sub, .wx-cell .wx-wear { color: var(--text-muted); }
+.wx-cell .wx-venue { margin-top: 2px; }
+.wx-cell .wx-wear { margin-top: 2px; }
+.wx-hard .wx-venue, .pw-wx.wx-hard { color: var(--c-warn); }
+.wx-danger .wx-venue, .pw-wx.wx-danger { color: var(--c-danger); font-weight: 500; }
+.wx-src { margin-top: 4px; font-size: 11px; color: var(--text-muted); }
+.wx-src a { color: inherit; }
+.pw-wx { margin-top: 2px; font-size: 12px; color: var(--text-muted); }
+.wx-detail { margin: 10px 0 12px; padding: 10px 12px; border-radius: 8px; background: var(--bg-metric); color: var(--text); font-size: 13px; }
+.wx-detail .wx-head { font-weight: 500; }
+.wx-detail .wx-head span { font-weight: 400; color: var(--text-muted); }
+.wx-detail .wx-meta { font-size: 12px; color: var(--text-muted); }
+.wx-detail .wx-venue { margin-top: 6px; font-weight: 500; }
+.wx-zones { display: grid; gap: 2px; margin-top: 6px; }
+.wx-zones span { display: inline-block; min-width: 64px; color: var(--text-muted); }
+.wx-notes { margin: 6px 0 0 18px; font-size: 12px; }
+.city-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.city-row input { flex: 1; min-width: 160px; }
+.city-results { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.city-results:empty { display: none; }
+.city-option {
+  text-align: left; padding: 8px 10px; cursor: pointer;
+  border: 0.5px solid var(--border); border-radius: 8px;
+  background: var(--bg-card); color: var(--text); font: inherit;
+}
+.city-option span { font-size: 12px; color: var(--text-muted); }
+.location-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }

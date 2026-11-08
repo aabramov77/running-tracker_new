@@ -21,8 +21,8 @@ BASE_HOUR = {"temperature_2m": 10, "apparent_temperature": 10, "precipitation": 
              "wind_gusts_10m": 4, "uv_index": 1}
 
 
-def raw_forecast(days=8, offset=10800, sunrise="07:48", sunset="16:37"):
-    dates = [(FIRST + timedelta(days=i)).isoformat() for i in range(days)]
+def raw_forecast(days=8, offset=10800, sunrise="07:48", sunset="16:37", first=FIRST):
+    dates = [(first + timedelta(days=i)).isoformat() for i in range(days)]
     times = [f"{d}T{h:02d}:00" for d in dates for h in range(24)]
     hourly = {"time": times, **{k: [v] * len(times) for k, v in BASE_HOUR.items()}}
     daily = {"time": dates, "weather_code": [3] * days,

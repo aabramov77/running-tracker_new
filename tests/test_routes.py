@@ -67,6 +67,7 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/plans/abc-123/weeks",   "h_plan_weeks_get"),
     ("POST",   "/plans/abc-123/weeks",   "h_plan_weeks_post"),
     ("GET",    "/plans/abc-123/compliance", "h_plan_compliance"),
+    ("GET",    "/plans/abc-123/weather",    "h_plan_weather"),
     ("GET",    "/plan",                  "h_active_plan_weeks_get"),
     ("POST",   "/runs/parse-fit",        "h_parse_fit"),
     ("GET",    "/runs/12345/details",    "h_run_details"),
@@ -1514,3 +1515,64 @@ def test_explicit_empty_weather_fields_reset_them(api):
     cleared = {"location": None, "run_time": "", "venues": [], "cold_sensitivity": ""}
     saved = json.loads(api(FakeRequest("POST", "/profile", {"profile": cleared}))[0])["profile"]
     assert {k: saved[k] for k in cleared} == cleared
+
+
+def _local_today():
+    """Сегодня по Москве — так же, как его считает weather по utc_offset."""
+    from datetime import datetime
+    return (datetime.utcnow() + timedelta(hours=3)).date()
+
+
+def _plan_for_this_week(patched_api, fake_bucket, sub="u1"):
+    """План, первая строка которого начинается сегодня: день 0 — «6×1 км»."""
+    today = _local_today()
+    plan = patched_api.create_plan(fake_bucket, sub, {"race_name": "HM",
+                                                      "plan_start": today.isoformat()})
+    field = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][today.weekday()]
+    patched_api.save_plan_weeks(fake_bucket, sub, plan["id"], [
+        {"w": 1, "start": today.isoformat(), field: "6×1 км по 4:30"}], "seed")
+    return plan["id"]
+
+
+def _forecast_online(monkeypatch):
+    import weather
+    from test_weather import raw_forecast
+    first = _local_today() - timedelta(days=1)
+    monkeypatch.setattr(weather, "_http_get", lambda url, params: raw_forecast(first=first))
+
+
+def test_plan_weather_unknown_plan_is_404(api):
+    assert _status(api(FakeRequest("GET", "/plans/no-such-plan/weather"))) == 404
+
+
+def test_plan_weather_without_location(api, patched_api, fake_bucket):
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("GET", f"/plans/{plan_id}/weather"))
+    report = json.loads(body)
+    assert code == 200
+    assert (report["status"], report["days"], report["plan_id"]) == ("no_location", [], plan_id)
+
+
+def test_plan_weather_when_provider_is_down(api, patched_api, fake_bucket):
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    report = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/weather"))[0])
+    assert report["status"] == "unavailable"
+
+
+def test_plan_weather_gives_advice_for_plan_days(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    _forecast_online(monkeypatch)
+    def athlete_data():
+        return {k: v for k, v in fake_bucket._store.items() if k.startswith("users/u1/")}
+
+    before = athlete_data()
+    report = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/weather"))[0])
+    assert report["status"] == "ok" and report["run_time"] == "07:30"
+    assert report["location"] == MOSCOW and len(report["days"]) == 7
+    today = report["days"][0]
+    assert (today["date"], today["kind"], today["week_idx"]) == \
+        (_local_today().isoformat(), "quality", 0)
+    assert today["venue"]["code"] == "outdoor" and today["clothing"]["top"]
+    assert athlete_data() == before                         # погода в GCS не пишется

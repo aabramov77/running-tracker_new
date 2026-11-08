@@ -37,7 +37,8 @@ from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_context_for_llm, format_memory_block,
                         format_plan_window, format_run_focus)
-from weather import COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time
+from weather import (COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time,
+                     weather_report)
 
 def get_storage_client():
     return gcs.Client()
@@ -2235,6 +2236,22 @@ def build_plan_compliance(bucket, sub, plan_id):
     result["plan_start"] = plan_start or ""
     result["current_week"] = current_week_idx(plan_start, len(weeks), weeks=weeks)
     return result
+
+
+def build_plan_weather(bucket, sub, plan_id):
+    """Погода и советы к дням плана (#72); None — плана нет.
+
+    Читающая операция, как и план/факт: в GCS ничего не пишется, прогноз
+    живёт только в памяти инстанса.
+    """
+    plan = find_plan(read_plans_index(bucket, sub), plan_id)
+    if not plan:
+        return None
+    profile = read_athlete_profile(bucket, sub)[0]
+    report = weather_report(profile, read_plan_weeks(bucket, sub, plan_id),
+                            plan.get("plan_start"))
+    report["plan_id"] = plan_id
+    return report
 
 
 def compute_hr_drift(details):
