@@ -59,6 +59,7 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/profile",               "h_profile_get"),
     ("POST",   "/profile",               "h_profile_post"),
     ("GET",    "/profile/history",       "h_profile_history"),
+    ("GET",    "/weather/geocode",       "h_weather_geocode"),
     ("GET",    "/plans",                 "h_plans_get"),
     ("POST",   "/plans/active",          "h_plan_activate"),
     ("POST",   "/plans/abc-123/meta",    "h_plan_meta"),
@@ -66,6 +67,7 @@ def test_privileged_paths_are_admin_only(api_module, prefix):
     ("GET",    "/plans/abc-123/weeks",   "h_plan_weeks_get"),
     ("POST",   "/plans/abc-123/weeks",   "h_plan_weeks_post"),
     ("GET",    "/plans/abc-123/compliance", "h_plan_compliance"),
+    ("GET",    "/plans/abc-123/weather",    "h_plan_weather"),
     ("GET",    "/plan",                  "h_active_plan_weeks_get"),
     ("POST",   "/runs/parse-fit",        "h_parse_fit"),
     ("GET",    "/runs/12345/details",    "h_run_details"),
@@ -815,7 +817,7 @@ def test_run_hidden_by_athlete_is_hidden_from_the_coach(api, patched_api, fake_b
 
 def test_coach_gets_404_for_unknown_plan_of_own_athlete(api, patched_api, fake_bucket):
     _coached(api, patched_api, fake_bucket)
-    for tail in ("weeks", "compliance"):
+    for tail in ("weeks", "compliance", "weather"):
         path = f"/coach/athletes/u1/plans/no-such-plan/{tail}"
         assert _status(api(FakeRequest("GET", path), **COACH)) == 404
 
@@ -1468,3 +1470,144 @@ def test_coach_request_writes_nothing_to_the_athlete(api, patched_api, fake_buck
     assert athlete_data() == before
     api(FakeRequest("GET", "/load"))                       # а сам спортсмен кэш дописывает
     assert fake_bucket.blob("users/u1/derived/run_hist.json").exists()
+
+
+# ── Погода (#72): поиск места и поля профиля ─────────────────────────────────
+
+MOSCOW = {"name": "Москва", "lat": 55.75, "lon": 37.62}
+WEATHER_PROFILE = {"location": MOSCOW, "run_time": "07:30", "venues": ["manege"],
+                   "cold_sensitivity": "cold"}
+
+
+def test_geocode_validates_the_query(api):
+    body, code, _ = api(FakeRequest("GET", "/weather/geocode", args={"q": "М"}))
+    assert code == 400 and "q" in json.loads(body)["fields"]
+    assert _status(api(FakeRequest("GET", "/weather/geocode"))) == 400
+
+
+def test_geocode_reports_provider_failure(api):
+    """Сеть в тестах выключена — как упавший геокодер."""
+    body, code, _ = api(FakeRequest("GET", "/weather/geocode", args={"q": "Москва"}))
+    assert code == 502 and json.loads(body)["error"] == "geocoder_unavailable"
+
+
+def test_geocode_returns_places(api, monkeypatch):
+    import weather
+    monkeypatch.setattr(weather, "_http_get", lambda url, params: {"results": [
+        {"name": "Москва", "latitude": 55.75204, "longitude": 37.61781,
+         "country": "Россия", "admin1": "Москва"}]})
+    body, code, _ = api(FakeRequest("GET", "/weather/geocode", args={"q": "Москва"}))
+    assert code == 200
+    assert json.loads(body)["results"] == [{**MOSCOW, "admin1": "Москва", "country": "Россия"}]
+
+
+def test_profile_saved_by_an_old_tab_keeps_weather_fields(api):
+    """Вкладка до #72 полей погоды не знает и шлёт профиль без них."""
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    old_tab = {"hr_max": 185}
+    saved = json.loads(api(FakeRequest("POST", "/profile", {"profile": old_tab}))[0])["profile"]
+    assert saved["hr_max"] == 185
+    assert {k: saved[k] for k in WEATHER_PROFILE} == WEATHER_PROFILE
+
+
+def test_explicit_empty_weather_fields_reset_them(api):
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    cleared = {"location": None, "run_time": "", "venues": [], "cold_sensitivity": ""}
+    saved = json.loads(api(FakeRequest("POST", "/profile", {"profile": cleared}))[0])["profile"]
+    assert {k: saved[k] for k in cleared} == cleared
+
+
+def _local_today():
+    """Сегодня по Москве — так же, как его считает weather по utc_offset."""
+    from datetime import datetime
+    return (datetime.utcnow() + timedelta(hours=3)).date()
+
+
+def _plan_for_this_week(patched_api, fake_bucket, sub="u1"):
+    """План, первая строка которого начинается сегодня: день 0 — «6×1 км»."""
+    today = _local_today()
+    plan = patched_api.create_plan(fake_bucket, sub, {"race_name": "HM",
+                                                      "plan_start": today.isoformat()})
+    field = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][today.weekday()]
+    patched_api.save_plan_weeks(fake_bucket, sub, plan["id"], [
+        {"w": 1, "start": today.isoformat(), field: "6×1 км по 4:30"}], "seed")
+    return plan["id"]
+
+
+def _forecast_online(monkeypatch):
+    import weather
+    from test_weather import raw_forecast
+    first = _local_today() - timedelta(days=1)
+    monkeypatch.setattr(weather, "_http_get", lambda url, params: raw_forecast(first=first))
+
+
+def test_plan_weather_unknown_plan_is_404(api):
+    assert _status(api(FakeRequest("GET", "/plans/no-such-plan/weather"))) == 404
+
+
+def test_plan_weather_without_location(api, patched_api, fake_bucket):
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    body, code, _ = api(FakeRequest("GET", f"/plans/{plan_id}/weather"))
+    report = json.loads(body)
+    assert code == 200
+    assert (report["status"], report["days"], report["plan_id"]) == ("no_location", [], plan_id)
+
+
+def test_plan_weather_when_provider_is_down(api, patched_api, fake_bucket):
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    report = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/weather"))[0])
+    assert report["status"] == "unavailable"
+
+
+def test_plan_weather_gives_advice_for_plan_days(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    _forecast_online(monkeypatch)
+    def athlete_data():
+        return {k: v for k, v in fake_bucket._store.items() if k.startswith("users/u1/")}
+
+    before = athlete_data()
+    report = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/weather"))[0])
+    assert report["status"] == "ok" and report["run_time"] == "07:30"
+    assert report["location"] == MOSCOW and len(report["days"]) == 7
+    today = report["days"][0]
+    assert (today["date"], today["kind"], today["week_idx"]) == \
+        (_local_today().isoformat(), "quality", 0)
+    assert today["venue"]["code"] == "outdoor" and today["clothing"]["top"]
+    assert athlete_data() == before                         # погода в GCS не пишется
+
+
+# ── Погода у тренера (#72) ────────────────────────────────────────────────────
+
+def _coached_with_weather(api, patched_api, fake_bucket, monkeypatch):
+    _coached(api, patched_api, fake_bucket)
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    _forecast_online(monkeypatch)
+    return plan_id
+
+
+def test_coach_sees_weather_with_the_city_but_without_coordinates(api, patched_api,
+                                                                   fake_bucket, monkeypatch):
+    plan_id = _coached_with_weather(api, patched_api, fake_bucket, monkeypatch)
+    body, code, _ = api(FakeRequest("GET", f"/coach/athletes/u1/plans/{plan_id}/weather"), **COACH)
+    report = json.loads(body)
+    assert code == 200 and report["status"] == "ok"
+    assert report["location"] == {"name": "Москва"}
+    assert "55.75" not in body and "37.62" not in body
+    own = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/weather"))[0])
+    assert report["days"] == own["days"]
+
+
+def test_view_only_coach_sees_the_weather(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _coached_with_weather(api, patched_api, fake_bucket, monkeypatch)
+    assert _status(api(FakeRequest("POST", "/my/coach/plan-edit", {"allow": False}))) == 200
+    path = f"/coach/athletes/u1/plans/{plan_id}/weather"
+    assert _status(api(FakeRequest("GET", path), **COACH)) == 200
+
+
+def test_stranger_gets_no_weather_of_the_athlete(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _coached_with_weather(api, patched_api, fake_bucket, monkeypatch)
+    path = f"/coach/athletes/u1/plans/{plan_id}/weather"
+    assert _status(api(FakeRequest("GET", path), sub="x9", email="x9@example.com")) != 200

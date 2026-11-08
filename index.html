@@ -13,7 +13,7 @@
 <meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
 <meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=32">
+<link rel="stylesheet" href="style.css?v=34">
 <link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -353,6 +353,7 @@
         <span id="plan-save-msg" class="save-msg"></span>
       </div>
       <div id="plan-compliance-note" class="hint" style="display:none;margin:0 0 8px"></div>
+      <div id="plan-weather-note" class="hint" style="display:none;margin:0 0 8px"></div>
       <div id="plan-week" class="plan-week"></div>
       <div class="plan-table-wrap" style="overflow-x:auto">
         <table class="plan">
@@ -540,6 +541,24 @@
       </div>
       <div id="ai-threads"><div class="empty">Загрузка…</div></div>
     </div>
+    <!-- Память ИИ-тренера (#80) -->
+    <div class="card" style="margin-top:12px">
+      <div class="week-header" style="gap:8px">
+        <div class="card-title" style="margin:0">Что помнит тренер <span class="hint ai-mem-count" id="ai-mem-count"></span></div>
+        <button class="btn-sm" id="ai-mem-toggle" onclick="aiMemoryToggle()" aria-expanded="false">Показать</button>
+      </div>
+      <div id="ai-mem-body" style="display:none">
+        <p class="hint">Тренер сам записывает сюда то, что вы рассказали в разборах, и ваши договорённости, — и видит это во всех разборах. Лишнее поправьте или скройте: каждая правка сохраняется новой версией.</p>
+        <div id="ai-mem-list"></div>
+        <div class="ai-mem-add">
+          <select id="ai-mem-kind" aria-label="Вид факта"></select>
+          <input type="text" id="ai-mem-text" maxlength="300" placeholder="Что тренеру стоит помнить" onkeydown="aiMemoryKey(event)">
+          <button class="btn-sm" id="ai-mem-add-btn" onclick="aiMemoryAdd()">Добавить</button>
+        </div>
+        <div id="ai-mem-hidden" class="hidden-block"></div>
+        <span id="ai-mem-msg" class="save-msg"></span>
+      </div>
+    </div>
     <div class="card" style="margin-top:12px">
       <div class="week-header" style="gap:8px">
         <div class="card-title" id="ai-title" style="margin:0">Новый разбор</div>
@@ -548,7 +567,7 @@
       <div id="ai-focus"></div>
       <div class="chat-log ai-log" id="ai-log" style="display:none"></div>
       <div id="ai-starters">
-        <p class="hint">Спросите ИИ-тренера о тренировках и плане. Он видит ваш профиль, план, его выполнение и последние пробежки.</p>
+        <p class="hint">Спросите ИИ-тренера о тренировках и плане. Он видит ваш профиль, план, его выполнение и последние пробежки и помнит то, что вы рассказывали раньше.</p>
         <div class="ai-starter-list" id="ai-starter-list"></div>
       </div>
       <div class="form-group ai-attach">
@@ -702,6 +721,43 @@
             <label><input type="checkbox" value="fri"><span>Пт</span></label>
             <label><input type="checkbox" value="sat"><span>Сб</span></label>
             <label><input type="checkbox" value="sun"><span>Вс</span></label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Погода (#72): по этим полям в плане появляются прогноз и советы -->
+      <div class="profile-section">Погода и место тренировок</div>
+      <p class="hint">По этим данным в плане появляются прогноз на неделю и советы: что надеть и где бежать.</p>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label for="pr-city">Город для прогноза</label>
+          <div class="city-row">
+            <input type="text" id="pr-city" placeholder="Найти город, например: Казань"
+                   onkeydown="cityKeydown(event)">
+            <button class="btn-sm" onclick="searchCity()">Найти</button>
+            <button class="btn-sm" onclick="useMyLocation()">📍 Моё местоположение</button>
+          </div>
+          <div id="pr-city-results" class="city-results"></div>
+          <div id="pr-location" class="location-line"></div>
+          <div id="pr-location-note" class="hint" style="margin:4px 0 0"></div>
+        </div>
+        <div class="form-group">
+          <label for="pr-run-time">Обычно бегаю в</label>
+          <input type="time" id="pr-run-time">
+        </div>
+        <div class="form-group">
+          <label for="pr-cold">Как переношу холод</label>
+          <select id="pr-cold">
+            <option value="">Обычно</option>
+            <option value="cold">Мёрзну быстрее других</option>
+            <option value="warm">Мне быстро жарко</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>Где ещё можно тренироваться, кроме улицы</label>
+          <div class="day-picker" id="pr-venues">
+            <label><input type="checkbox" value="treadmill"><span>Дорожка в зале</span></label>
+            <label><input type="checkbox" value="manege"><span>Манеж</span></label>
           </div>
         </div>
       </div>
@@ -1077,6 +1133,7 @@
         <div class="card-title" id="day-sheet-title" style="margin:0"></div>
         <button class="btn-sm" onclick="closeDaySheet()" style="color:var(--text-muted);font-size:16px">✕</button>
       </div>
+      <div id="day-sheet-wx"></div>
       <div class="form-group">
         <label for="day-sheet-text">Тренировка по плану</label>
         <textarea id="day-sheet-text" rows="3" placeholder="Например: 8 км легко. Пусто — отдых"></textarea>
@@ -1097,15 +1154,16 @@
         <div class="card-title" id="coach-day-title" style="margin:0"></div>
         <button class="btn-sm" onclick="coachCloseDay()" style="color:var(--text-muted);font-size:16px">✕</button>
       </div>
+      <div id="coach-day-wx"></div>
       <div class="form-group">
         <label for="coach-day-text">Тренировка по плану</label>
         <textarea id="coach-day-text" rows="3" placeholder="Например: 8 км легко. Пусто — отдых"></textarea>
       </div>
-      <div class="form-group" style="margin-top:10px">
+      <div class="form-group" id="coach-day-note-row" style="margin-top:10px">
         <label for="coach-day-note">Комментарий</label>
         <input type="text" id="coach-day-note" maxlength="150" placeholder="Необязательно — увидит спортсмен">
       </div>
-      <p class="hint" style="margin:8px 0 0">Сохранение создаёт новую версию плана спортсмена, прежняя остаётся в истории. Спортсмен увидит сообщение о правке в диалоге.</p>
+      <p class="hint" id="coach-day-hint" style="margin:8px 0 0">Сохранение создаёт новую версию плана спортсмена, прежняя остаётся в истории. Спортсмен увидит сообщение о правке в диалоге.</p>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn-primary" id="coach-day-save" onclick="coachSaveDay()">Сохранить</button>
         <button class="btn-sm" onclick="coachCloseDay()">Отмена</button>
@@ -1147,6 +1205,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=53"></script>
+<script src="app.js?v=55"></script>
 </body>
 </html>

@@ -137,6 +137,48 @@ def test_athlete_profile_rejects_unknown_days(storage_module):
     assert "sex" in errors3
 
 
+# ── Поля погоды (#72) ─────────────────────────────────────────────────────────
+
+def test_weather_fields_default_to_empty(storage_module, fake_bucket):
+    profile, _, _ = storage_module.read_athlete_profile(fake_bucket, SUB)
+    assert (profile["location"], profile["run_time"], profile["venues"],
+            profile["cold_sensitivity"]) == (None, "", [], "")
+
+
+def test_weather_fields_are_cleaned(storage_module):
+    profile, errors = storage_module.clean_athlete_profile({
+        "location": {"name": "  Санкт-Петербург  ", "lat": 59.93863, "lon": 30.31413},
+        "run_time": " 07:30 ", "venues": ["manege", "treadmill"], "cold_sensitivity": "cold"})
+    assert errors == {}
+    assert profile["location"] == {"name": "Санкт-Петербург", "lat": 59.94, "lon": 30.31}
+    assert profile["run_time"] == "07:30"
+    assert profile["venues"] == ["treadmill", "manege"]       # порядок константы
+    assert profile["cold_sensitivity"] == "cold"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("location", "Москва"),
+    ("location", {"name": "", "lat": 55.75, "lon": 37.62}),
+    ("location", {"name": "x" * 81, "lat": 55.75, "lon": 37.62}),
+    ("location", {"name": "Москва", "lat": 91, "lon": 37.62}),
+    ("location", {"name": "Москва", "lat": 55.75, "lon": float("nan")}),
+    ("location", {"name": "Москва", "lat": True, "lon": 37.62}),
+    ("location", {"name": "Москва", "lat": "55.75", "lon": 37.62}),
+    ("run_time", "7:30"), ("run_time", "24:00"), ("run_time", 730),
+    ("venues", "manege"), ("venues", ["manege", "pool"]),
+    ("cold_sensitivity", "hot"),
+])
+def test_weather_fields_reject_garbage(storage_module, field, value):
+    _, errors = storage_module.clean_athlete_profile({field: value})
+    assert field in errors
+
+
+@pytest.mark.parametrize("value", [None, "", {}])
+def test_empty_location_means_no_forecast(storage_module, value):
+    profile, errors = storage_module.clean_athlete_profile({"location": value})
+    assert errors == {} and profile["location"] is None
+
+
 def test_athlete_profile_versions_are_immutable(storage_module, fake_bucket):
     profile, _ = storage_module.clean_athlete_profile(FILLED_PROFILE)
     v1 = storage_module.write_athlete_version(fake_bucket, SUB, profile, "первое заполнение")

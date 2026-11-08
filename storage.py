@@ -26,15 +26,19 @@ from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
 from compliance import (DEFAULT as UNDATED, anchor_source,
                         current_week_idx, plan_compliance,
                         planned_for_date, to_date, week_days, week_window)
-from domain import (DIST_LABEL_KM, FEEL_LABELS, HR_ZONE_BOUNDS, PLAN_DAYS,
+from domain import (DIST_LABEL_KM, FEEL_LABELS, HR_ZONE_BOUNDS, MEMORY_FACTS_MAX,
+                    MEMORY_KIND_LABELS, MEMORY_OPS_MAX, MEMORY_TEXT_MAX, PLAN_DAYS,
                     TYPE_LABELS, parse_time_to_sec, personal_bests)
+from history import monthly_summary, past_plan_candidates, past_plans
 from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
                   ZONE_GAP_CAP_SEC, axes, clean_hist_entry, format_duration,
                   hr_histogram, run_hist_entry, threshold_for, weekly_load,
                   zone_seconds)
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
-                        format_context_for_llm, format_plan_window,
-                        format_run_focus)
+                        format_context_for_llm, format_memory_block,
+                        format_plan_window, format_run_focus)
+from weather import (COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time,
+                     weather_report)
 
 def get_storage_client():
     return gcs.Client()
@@ -88,6 +92,9 @@ def p_ai_msg_prefix(sub, tid):     return f"{p_ai_root(sub)}{tid}/m/"
 def p_ai_msg(sub, tid, msg_id):    return f"{p_ai_msg_prefix(sub, tid)}{msg_id}.json"
 def p_ai_applied_prefix(sub, tid): return f"{p_ai_root(sub)}{tid}/applied/"
 def p_ai_applied(sub, tid, msg_id): return f"{p_ai_applied_prefix(sub, tid)}{msg_id}.json"
+# Память ИИ-тренера (#80): один документ с версиями, общий для всех разборов.
+def p_ai_memory_manifest(sub):     return f"{upfx(sub)}ai_coach/memory/manifest.json"
+def p_ai_memory_ver(sub, v):       return f"{upfx(sub)}ai_coach/memory/v{v}/memory.json"
 
 # Legacy (глобальные, до multi-user) — только для миграции/ленивого fallback
 LEGACY_RUNS = "runs.json"
@@ -484,7 +491,46 @@ def empty_athlete_profile():
     profile["available_days"] = []
     profile["hr_zones_custom"] = None       # None — зоны считаются от HRmax
     profile["threshold_pace_sec"] = None    # None — порог оценивается по «Стартам» (#66)
+    # Погода (#72): место прогноза, час тренировки, площадки и чувствительность к холоду
+    profile["location"] = None
+    profile["run_time"] = ""
+    profile["venues"] = []
+    profile["cold_sensitivity"] = ""
     return profile
+
+
+# Поля, появившиеся в профиле после #32. Клиент, который о них не знает,
+# присылает профиль без них, а POST заменяет профиль целиком: такое поле берётся
+# из текущей версии (api.h_profile_post). Явный null или пустое значение сбрасывает.
+LATE_PROFILE_FIELDS = ("threshold_pace_sec", "location", "run_time", "venues",
+                       "cold_sensitivity")
+
+
+def clean_location(value):
+    """Место для прогноза (#72): ({name, lat, lon} или None, ошибка или None).
+
+    Координаты округляются до 0,01° (~1 км): прогнозу точнее не нужно, а
+    точка «Моё местоположение» не должна указывать на дом.
+    """
+    if value in (None, "", {}):
+        return None, None
+    if not isinstance(value, dict):
+        return None, "ожидается объект {name, lat, lon}"
+    name = value.get("name")
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    if not name:
+        return None, "укажите название места"
+    if len(name) > LOCATION_NAME_MAX:
+        return None, f"название длиннее {LOCATION_NAME_MAX} символов"
+    coords = []
+    for key, limit in (("lat", 90), ("lon", 180)):
+        number = value.get(key)
+        # Сравнение отсекает NaN и бесконечность; bool — не координата.
+        if isinstance(number, bool) or not isinstance(number, (int, float)) \
+                or not -limit <= number <= limit:
+            return None, "координаты вне допустимого диапазона"
+        coords.append(round(number, 2))
+    return {"name": name, "lat": coords[0], "lon": coords[1]}, None
 
 
 def clean_threshold_pace(value):
@@ -615,6 +661,36 @@ def clean_athlete_profile(raw):
     profile["threshold_pace_sec"], pace_error = clean_threshold_pace(raw.get("threshold_pace_sec"))
     if pace_error:
         errors["threshold_pace_sec"] = pace_error
+
+    profile["location"], location_error = clean_location(raw.get("location"))
+    if location_error:
+        errors["location"] = location_error
+
+    run_time = raw.get("run_time")
+    run_time = run_time.strip() if isinstance(run_time, str) else run_time
+    profile["run_time"] = ""
+    if run_time not in (None, ""):
+        # parse_run_time молча подставляет время по умолчанию — здесь это ошибка
+        hh, mm = parse_run_time(run_time)
+        if not isinstance(run_time, str) or run_time != f"{hh:02d}:{mm:02d}":
+            errors["run_time"] = "ожидается время ЧЧ:ММ"
+        else:
+            profile["run_time"] = run_time
+
+    raw_venues = raw.get("venues") or []
+    if not isinstance(raw_venues, list):
+        errors["venues"] = "ожидается список"
+        raw_venues = []
+    unknown = [str(v) for v in raw_venues if v not in VENUES]
+    if unknown:
+        errors["venues"] = "неизвестные площадки: " + ", ".join(unknown)
+    profile["venues"] = [v for v in VENUES if v in raw_venues]
+
+    sensitivity = raw.get("cold_sensitivity") or ""
+    if sensitivity not in COLD_SENSITIVITY:
+        errors["cold_sensitivity"] = "допустимо: cold, warm или пусто"
+        sensitivity = ""
+    profile["cold_sensitivity"] = sensitivity
 
     return profile, errors
 
@@ -2162,6 +2238,22 @@ def build_plan_compliance(bucket, sub, plan_id):
     return result
 
 
+def build_plan_weather(bucket, sub, plan_id):
+    """Погода и советы к дням плана (#72); None — плана нет.
+
+    Читающая операция, как и план/факт: в GCS ничего не пишется, прогноз
+    живёт только в памяти инстанса.
+    """
+    plan = find_plan(read_plans_index(bucket, sub), plan_id)
+    if not plan:
+        return None
+    profile = read_athlete_profile(bucket, sub)[0]
+    report = weather_report(profile, read_plan_weeks(bucket, sub, plan_id),
+                            plan.get("plan_start"))
+    report["plan_id"] = plan_id
+    return report
+
+
 def compute_hr_drift(details):
     """Возвращает рост среднего пульса от первой половины тренировки ко второй, в %.
     + значит пульс рос (норма для длительной, риск при коротких).
@@ -2369,9 +2461,34 @@ def coach_load_view(load):
     }
 
 
+_WEATHER_DAY_KEYS = ("date", "field", "week_idx", "workout", "kind", "weather", "level",
+                     "why", "flags", "venue", "clothing", "notes")
+
+
+def coach_weather_view(report):
+    """Погода к плану спортсмена для тренера (#72) — собрана заново по белому
+    списку. Координат места здесь нет по построению: тренеру хватает города."""
+    location = report.get("location")
+    return {
+        "plan_id": report.get("plan_id"),
+        "status": report.get("status"),
+        "source": report.get("source"),
+        "run_time": report.get("run_time"),
+        "today": report.get("today"),
+        "location": {"name": location.get("name", "")} if isinstance(location, dict) else None,
+        "days": [_pick(d, _WEATHER_DAY_KEYS) for d in report.get("days") or []],
+    }
+
+
+LLM_RACES_DAYS = 730           # забеги в контексте — за два года (#81)
+LLM_RACES_MAX = 10
+
+
 def build_llm_context(bucket, sub):
     """Собирает компактный богатый контекст для LLM: активный план и его пробежки."""
-    active_plan = get_active_plan(bucket, sub)
+    today = datetime.utcnow().date()
+    plans_index = read_plans_index(bucket, sub)
+    active_plan = find_plan(plans_index, plans_index.get("active_plan_id"))
     plan_id = active_plan["id"] if active_plan else None
 
     # Runs активного плана (#25)
@@ -2399,8 +2516,9 @@ def build_llm_context(bucket, sub):
     # Races
     all_races = read_races(bucket, sub)
     active_races = [r for r in all_races if not r.get("deleted", False)]
-    active_races.sort(key=lambda r: r.get("date", ""), reverse=True)
-    last_races = active_races[:3]
+    active_races.sort(key=lambda r: str(r.get("date", "")), reverse=True)
+    since = (today - timedelta(days=LLM_RACES_DAYS)).isoformat()
+    last_races = [r for r in active_races if str(r.get("date", "")) >= since][:LLM_RACES_MAX]
 
     # Нагрузка (#66) — по всем пробежкам, а не по плану: устаёт организм, а не
     # план. Сбой расчёта не роняет ход ИИ: модель получит «нагрузка недоступна».
@@ -2410,6 +2528,21 @@ def build_llm_context(bucket, sub):
     except Exception:
         logging.exception("load: нагрузка для контекста ИИ не посчитана")
         training_load = None
+
+    # История (#81): месяцы за год по всем пробежкам и итоги прошлых планов.
+    # Недели читаются только у прошлых планов, попавших в сводку. Сбой, как и
+    # у нагрузки, ход не роняет.
+    try:
+        candidates = past_plan_candidates(plans_index, today)
+        history = {
+            "months": monthly_summary(all_runs, (training_load or {}).get("runs"), today),
+            "plans": past_plans(candidates,
+                                {p["id"]: read_plan_weeks(bucket, sub, p["id"]) for p in candidates},
+                                all_runs, all_races),
+        }
+    except Exception:
+        logging.exception("history: история для контекста ИИ не посчитана")
+        history = None
 
     # Plan (недели активного плана)
     plan = None
@@ -2421,6 +2554,15 @@ def build_llm_context(bucket, sub):
             if plan_data:
                 plan = plan_data["weeks"]
                 plan_version = plan_data["version"]
+
+    # Погода (#72) к дням активного плана. Сбой провайдера не роняет ход ИИ:
+    # блока прогноза в промпте просто не будет.
+    weather = None
+    if profile.get("location"):
+        try:
+            weather = weather_report(profile, plan or [], (active_plan or {}).get("plan_start"))
+        except Exception:
+            logging.exception("weather: прогноз для контекста ИИ не собран")
 
     week_idx = current_plan_week_idx(active_plan.get("plan_start") if active_plan else None,
                                      len(plan) if plan else 0, weeks=plan)
@@ -2463,6 +2605,8 @@ def build_llm_context(bucket, sub):
         "profile_derived": athlete_derived(profile, all_races),
         "profile_version": profile_version,
         "load": training_load,
+        "history": history,
+        "weather": weather,
         "personal_bests": personal_bests(all_races),
         "last_runs": last_runs,
         "last_races": last_races,
@@ -3235,6 +3379,9 @@ def ai_history(messages, window=AI_HISTORY_WINDOW):
                 "summary": proposal["summary"],
                 "changes": [{k: c[k] for k in ("week", "day", "text", "reason")}
                             for c in proposal["changes"]]}
+        memory = _memory_envelope(message.get("memory_changes"))
+        if memory:          # и что записала в память (#80)
+            data["memory"] = memory
         return json.dumps(data, ensure_ascii=False)
 
     return [{"role": "user", "content": m["text"]} if m["role"] == "athlete" else
@@ -3331,7 +3478,8 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
 
     Контекст пересобирается на каждый ход: между репликами спортсмен мог
     добавить пробежку или поправить план. run — пробежка, прикреплённая к
-    новому вопросу.
+    новому вопросу. Память (#80) общая для всех разборов и тоже читается
+    заново: её могли поправить в другом разборе или руками.
     """
     ctx = build_llm_context(bucket, sub)
     own = {r.get("id"): r for r in read_runs(bucket, sub) if not r.get("deleted", False)}
@@ -3340,11 +3488,15 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
     blocks = [format_run_focus(build_run_focus(bucket, sub, own[rid], ctx))
               for rid in focus_ids]
     window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
+    memory, memory_version = read_ai_memory(bucket, sub)
     instructions = coach_chat_instructions(with_proposals=bool(window))
     data = coach_chat_data(format_context_for_llm(ctx), blocks,
-                           format_plan_window(window) if window else "")
+                           format_plan_window(window) if window else "",
+                           format_memory_block(memory_facts(memory)))
     return {
         "ctx": ctx,
+        "memory": memory,
+        "memory_version": memory_version,
         "focus_run_ids": focus_ids,
         "plan_window": window,
         "instructions": instructions,
@@ -3529,6 +3681,284 @@ def apply_ai_proposal(bucket, sub, thread_id, msg_id, applied_by="api", today=No
     }
     create_json(bucket, p_ai_applied(sub, thread_id, msg_id), marker)
     return marker
+
+
+# ── Память ИИ-тренера (#80) ───────────────────────────────────────────────────
+# Факты, которые тренер выносит из разборов: что спортсмен рассказал сам и о
+# чём договорились. Документ один на спортсмена и общий для всех разборов.
+# Хранится версиями, как профиль: любое изменение — новый объект версии,
+# прошлые не трогаются. Скрытый факт остаётся в документе со status hidden;
+# в текущей версии держим последние AI_MEMORY_HIDDEN_KEEP скрытых, более
+# старые остаются в прошлых версиях.
+
+AI_MEMORY_HIDDEN_KEEP = 50
+AI_MEMORY_HISTORY_LIMIT = 50
+MEMORY_EDIT_OPS = ("add", "edit", "hide", "restore")
+_MEMORY_FACT_ID_RE = re.compile(r"^m[1-9][0-9]{0,5}$")
+_MEMORY_OP_WORDS = {"add": "добавлено", "edit": "изменено", "hide": "скрыто",
+                    "restore": "возвращено"}
+
+
+class MemoryStale(VersionStale):
+    """Правка памяти сделана поверх версии, которая уже не текущая."""
+
+
+def _memory_doc(payload):
+    """Документ памяти {next_id, facts} из payload версии; нет или битый — пустой."""
+    payload = payload if isinstance(payload, dict) else {}
+    facts = [dict(f) for f in payload.get("facts") or []
+             if isinstance(f, dict) and _MEMORY_FACT_ID_RE.match(str(f.get("id")))
+             and isinstance(f.get("text"), str) and _memory_kind(f.get("kind"))]
+    taken = max((int(f["id"][1:]) for f in facts), default=0)
+    next_id = payload.get("next_id")
+    if type(next_id) is not int or next_id <= taken:
+        next_id = taken + 1
+    return {"next_id": next_id, "facts": facts}
+
+
+def memory_facts(doc, status="active"):
+    return [f for f in doc["facts"] if f.get("status") == status]
+
+
+def read_ai_memory(bucket, sub):
+    """(документ памяти, номер текущей версии). Памяти ещё нет — пустая и 0."""
+    manifest = _read_json(bucket, p_ai_memory_manifest(sub))
+    if not manifest:
+        return _memory_doc(None), 0
+    return (_memory_doc(_read_json(bucket, manifest["gcs_object_path"])),
+            manifest["current_version"])
+
+
+def _memory_kind(value):
+    return value if isinstance(value, str) and value in MEMORY_KIND_LABELS else None
+
+
+def _memory_items(value):
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _memory_ref(value):
+    """id факта, как его вернула модель: «m3» или «[m3]»."""
+    return value.strip().strip("[]").strip() if isinstance(value, str) else None
+
+
+def clean_memory_ops(raw, facts):
+    """Изменения памяти из ответа модели, сверенные с фактами; [] — менять нечего.
+
+    raw — {"add": [{kind, text}], "edit": [{id, text}], "forget": [{id}]},
+    facts — активные факты. Модель может сослаться на факт, которого нет,
+    вернуть пустой текст, чужой вид или то, что уже записано. Такое
+    отбрасывается молча: ответ тренера от этого не страдает. Факт меняется
+    одной операцией за ход, всего их не больше MEMORY_OPS_MAX. Забытое идёт
+    первым: оно освобождает место под новое.
+    """
+    if not isinstance(raw, dict):
+        return []
+    active = {f["id"]: f for f in facts}
+    known = {f["text"].casefold() for f in facts}
+    ops, touched = [], set()
+    for item in _memory_items(raw.get("forget")):
+        fact_id = _memory_ref(item.get("id"))
+        if fact_id in active and fact_id not in touched:
+            touched.add(fact_id)
+            ops.append({"op": "hide", "id": fact_id})
+    for item in _memory_items(raw.get("edit")):
+        fact_id, text = _memory_ref(item.get("id")), _one_line(item.get("text"), MEMORY_TEXT_MAX)
+        fact = active.get(fact_id)
+        if not fact or fact_id in touched or not text:
+            continue
+        kind = _memory_kind(item.get("kind")) or fact["kind"]
+        if (text, kind) == (fact["text"], fact["kind"]):
+            continue
+        touched.add(fact_id)
+        ops.append({"op": "edit", "id": fact_id, "kind": kind, "text": text})
+    for item in _memory_items(raw.get("add")):
+        text, kind = _one_line(item.get("text"), MEMORY_TEXT_MAX), _memory_kind(item.get("kind"))
+        if not text or not kind or text.casefold() in known:
+            continue
+        known.add(text.casefold())
+        ops.append({"op": "add", "kind": kind, "text": text})
+    return ops[:MEMORY_OPS_MAX]
+
+
+def clean_memory_edit(body, doc):
+    """Правка памяти спортсменом → операция для apply_memory_ops.
+
+    AICoachError: invalid_fact — нет такой операции, пустой или длинный
+    текст, чужой вид; fact_not_found — факта нет или он не в том состоянии;
+    memory_full — места под ещё один активный факт нет.
+    """
+    op, kind = body.get("op"), body.get("kind")
+    if op not in MEMORY_EDIT_OPS or (kind is not None and not _memory_kind(kind)):
+        raise AICoachError("invalid_fact")
+    full = len(memory_facts(doc)) >= MEMORY_FACTS_MAX
+    if op in ("add", "edit"):
+        text = body.get("text")
+        text = " ".join(text.split()) if isinstance(text, str) else ""
+        if not text or len(text) > MEMORY_TEXT_MAX:
+            raise AICoachError("invalid_fact")
+    if op == "add":
+        if kind is None:
+            raise AICoachError("invalid_fact")
+        if full:
+            raise AICoachError("memory_full")
+        return {"op": "add", "kind": kind, "text": text}
+
+    fact = next((f for f in doc["facts"] if f["id"] == body.get("id")), None)
+    if not fact or fact.get("status") != ("hidden" if op == "restore" else "active"):
+        raise AICoachError("fact_not_found")
+    if op == "edit":
+        return {"op": "edit", "id": fact["id"], "kind": kind or fact["kind"], "text": text}
+    if op == "restore" and full:
+        raise AICoachError("memory_full")
+    return {"op": op, "id": fact["id"]}
+
+
+def apply_memory_ops(doc, ops, role, now, thread_id=None):
+    """(новый документ, изменения) — чистая функция; изменений нет — [].
+
+    Изменения считаются по тому документу, поверх которого пишем: пока
+    модель думала, факт могли скрыть, а память — заполнить. Операция,
+    которая к документу уже не подходит, пропускается.
+    """
+    facts = [dict(f) for f in doc["facts"]]
+    by_id = {f["id"]: f for f in facts}
+    next_id = doc["next_id"]
+    changes = []
+
+    def has_room():
+        return sum(1 for f in facts if f.get("status") == "active") < MEMORY_FACTS_MAX
+
+    def note(op, fact, **extra):
+        changes.append({"op": op, "id": fact["id"], "kind": fact["kind"],
+                        "text": fact["text"], **extra})
+
+    for op in ops:
+        fact = by_id.get(op.get("id"))
+        status = fact.get("status") if fact else None
+        if op["op"] == "add" and has_room():
+            fact = {"id": f"m{next_id}", "kind": op["kind"], "text": op["text"],
+                    "status": "active", "source": role, "source_thread_id": thread_id,
+                    "created_at": now, "updated_at": now}
+            next_id += 1
+            facts.append(fact)
+            by_id[fact["id"]] = fact
+            note("add", fact)
+        elif op["op"] == "edit" and status == "active" \
+                and (op["text"], op["kind"]) != (fact["text"], fact["kind"]):
+            old = fact["text"]
+            fact.update(kind=op["kind"], text=op["text"], updated_at=now, updated_by=role)
+            note("edit", fact, old=old)
+        elif op["op"] == "hide" and status == "active":
+            fact.update(status="hidden", hidden_at=now, hidden_by=role)
+            note("hide", fact)
+        elif op["op"] == "restore" and status == "hidden" and has_room():
+            fact.update(status="active", restored_at=now)
+            fact.pop("hidden_at", None)
+            fact.pop("hidden_by", None)
+            note("restore", fact)
+
+    hidden = sorted((f for f in facts if f.get("status") == "hidden"),
+                    key=lambda f: f.get("hidden_at") or "")
+    dropped = {f["id"] for f in hidden[:-AI_MEMORY_HIDDEN_KEEP]}
+    return {"next_id": next_id, "facts": [f for f in facts if f["id"] not in dropped]}, changes
+
+
+def _memory_reason(role, changes):
+    """«ИИ-тренер: добавлено 2, скрыто 1» — change_reason версии памяти."""
+    counts = [f"{word} {n}" for op, word in _MEMORY_OP_WORDS.items()
+              if (n := sum(1 for c in changes if c["op"] == op))]
+    return ("ИИ-тренер" if role == "ai" else "Спортсмен") + ": " + ", ".join(counts)
+
+
+def write_ai_memory(bucket, sub, ops, role, created_by="api", base_version=None,
+                    thread_id=None):
+    """Новая версия памяти с изменениями ops → её payload; None — писать нечего.
+
+    Без base_version изменения ложатся на версию, текущую в момент записи:
+    claim перечитывает её сам, поэтому повтор commit_version после чужой
+    записи не теряет ни её, ни наших изменений. Так пишет модель. Правка
+    спортсмена идёт с base_version, и поверх устаревшей версии это
+    MemoryStale. В payload лежат и сами изменения — по ним история
+    показывает, что именно поменялось.
+    """
+    now = datetime.utcnow().isoformat() + "Z"
+
+    def claim(version, current):
+        prev = _read_json(bucket, p_ai_memory_ver(sub, current)) if current else None
+        doc, changes = apply_memory_ops(_memory_doc(prev), ops, role, now, thread_id)
+        if not changes:
+            raise _Unchanged(prev)
+        path = p_ai_memory_ver(sub, version)
+        payload = {"version": version, "is_current": True, "created_at": now,
+                   "created_by": created_by, "author": role,
+                   "change_reason": _memory_reason(role, changes),
+                   "supersedes_version": current or None,
+                   "source_thread_id": thread_id, "changes": changes, **doc}
+        if not create_json(bucket, path, payload):
+            return None
+        manifest = {"current_version": version, "gcs_object_path": path,
+                    "updated_at": now, "created_by": created_by, "author": role,
+                    "checksum": hashlib.sha256(_dumps(payload).encode()).hexdigest()}
+        return manifest, payload
+
+    try:
+        return commit_version(bucket, p_ai_memory_manifest(sub), claim,
+                              base_version=base_version, stale=MemoryStale)
+    except _Unchanged:
+        return None
+
+
+def memory_view(doc, version):
+    """Память для спортсмена: активные и скрытые факты, виды и пределы."""
+    hidden = sorted(memory_facts(doc, "hidden"), key=lambda f: f.get("hidden_at") or "",
+                    reverse=True)
+    return {"version": version, "facts": memory_facts(doc), "hidden": hidden,
+            "kinds": [{"id": kind, "label": label} for kind, label in MEMORY_KIND_LABELS.items()],
+            "limits": {"facts": MEMORY_FACTS_MAX, "text": MEMORY_TEXT_MAX}}
+
+
+def read_ai_memory_history(bucket, sub, limit=AI_MEMORY_HISTORY_LIMIT):
+    """Версии памяти от новых к старым: кто, когда и что поменял.
+
+    Как у профиля, читается окно последних версий; версии, не попавшие в
+    манифест (#35), в историю не входят.
+    """
+    manifest = _read_json(bucket, p_ai_memory_manifest(sub))
+    if not manifest:
+        return []
+    current = manifest["current_version"]
+    numbers = list(range(max(1, current - limit + 1), current + 1))
+    payloads = dict(zip(numbers, _load_json_objects(
+        bucket, [p_ai_memory_ver(sub, v) for v in numbers], skip_broken=True)))
+    history = []
+    for version in version_chain(payloads, current):
+        data = payloads[version]
+        if not isinstance(data, dict):
+            continue
+        history.append({
+            "version": data.get("version", version),
+            "created_at": data.get("created_at"),
+            "author": data.get("author"),
+            "change_reason": data.get("change_reason", ""),
+            "source_thread_id": data.get("source_thread_id"),
+            "changes": data.get("changes") or [],
+            "facts": len(memory_facts(_memory_doc(data))),
+        })
+    return history
+
+
+def _memory_envelope(changes):
+    """Изменения памяти в том виде, в каком их пишет модель (для ai_history)."""
+    memory = {}
+    for change in changes or []:
+        if change.get("op") == "add":
+            memory.setdefault("add", []).append({"kind": change["kind"], "text": change["text"]})
+        elif change.get("op") == "edit":
+            memory.setdefault("edit", []).append({"id": change["id"], "text": change["text"]})
+        elif change.get("op") == "hide":
+            memory.setdefault("forget", []).append({"id": change["id"]})
+    return memory
 
 
 # ── Legacy → per-user миграция (админ, одноразово, идемпотентно) ──────────────

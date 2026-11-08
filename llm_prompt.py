@@ -6,8 +6,10 @@
 """
 from datetime import datetime
 
-from domain import (DIST_LABEL_KM, FEEL_LABELS, PLAN_DAYS, PLAN_PHASE_LABELS,
+from domain import (DIST_LABEL_KM, FEEL_LABELS, MEMORY_FACTS_MAX, MEMORY_KIND_LABELS,
+                    MEMORY_OPS_MAX, MEMORY_TEXT_MAX, PLAN_DAYS, PLAN_PHASE_LABELS,
                     SEX_LABELS, TYPE_LABELS)
+from weather import deg
 
 def plural_ru(number, one, few, many):
     """«1 тренировка», «3 тренировки», «5 тренировок» — промпт читает человек тоже."""
@@ -108,6 +110,19 @@ def format_profile_block(profile, derived, bests):
     if schedule:
         lines.append("Расписание: " + "; ".join(schedule))
 
+    # Погода (#72): где ещё можно бегать и когда. Город и координаты в промпт
+    # не идут — модели хватает прогноза.
+    conditions = []
+    venues = [VENUE_RU[v] for v in profile.get("venues") or [] if v in VENUE_RU]
+    if venues:
+        conditions.append("кроме улицы — " + ", ".join(venues))
+    if profile.get("run_time"):
+        conditions.append(f"обычно бегает в {profile['run_time']}")
+    if profile.get("cold_sensitivity") in COLD_RU:
+        conditions.append(COLD_RU[profile["cold_sensitivity"]])
+    if conditions:
+        lines.append("Условия: " + "; ".join(conditions))
+
     if bests:
         lines.append("Личные рекорды: " + ", ".join(
             f"{b['km']:g} км {b['time']}" + (f" ({b['date']})" if b.get("date") else "")
@@ -119,6 +134,39 @@ def format_profile_block(profile, derived, bests):
         lines.append(f"От спортсмена: {profile['notes']}")
 
     return lines
+
+VENUE_RU = {"treadmill": "дорожка в зале", "manege": "манеж"}
+COLD_RU = {"cold": "мёрзнет быстрее других", "warm": "быстро перегревается"}
+
+
+def format_weather_block(weather):
+    """Прогноз к дням плана (#72): погода в час тренировки и совет по правилам.
+
+    Совет — не приказ модели: она видит, что предлагают правила, и может
+    объяснить или поправить это в ответе. Без прогноза блока нет.
+    """
+    if not weather or weather.get("status") != "ok" or not weather.get("days"):
+        return []
+    day_ru = dict(PLAN_DAYS)
+    lines = [f"Прогноз погоды (в {weather.get('run_time')}, по месту бега):"]
+    for day in weather["days"]:
+        w, r = day["weather"], day["weather"]["at_run"]
+        parts = [f"{w['summary']}, {deg(r['t'])} (ощущается {deg(r['feels'])})",
+                 f"ветер {r['wind']} м/с"]
+        if r.get("precip_mm"):
+            parts.append(f"осадки {r['precip_mm']:g} мм")
+        when = f"{day_ru.get(day['field'], day['field'])} {day['date'][8:]}.{day['date'][5:7]}"
+        line = f"  - {when}: " + ", ".join(parts)
+        if day.get("workout"):
+            line += f"; в плане «{day['workout']}»"
+        venue = day.get("venue")
+        if venue:
+            line += f" → {venue['label']}" + (f" ({venue['why']})" if venue.get("why") else "")
+        elif day.get("level") != "ok" and day.get("why"):
+            line += f"; {day['why']}"
+        lines.append(line)
+    return lines
+
 
 def _week_days_str(week):
     """Строка тренировок недели по дням; пустые/отсутствующие дни пропускаются."""
@@ -256,6 +304,84 @@ def format_load_block(load):
     return lines
 
 
+def _hms(seconds):
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    return f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours else _mmss(seconds)
+
+
+def _history_month(row):
+    head = f"  - {row['month']}" + (" (текущий, неполный)" if row["partial"] else "")
+    if not row["runs"]:
+        return f"{head}: нет пробежек"
+    runs = row["runs"]
+    parts = [f"{row['km']:g} км, {runs} {plural_ru(runs, 'пробежка', 'пробежки', 'пробежек')}, "
+             f"самая длинная {row['longest_km']:g} км"]
+    easy = []
+    if row["easy_pace_sec"]:
+        easy.append(f"темп {_mmss(row['easy_pace_sec'])}/км")
+    if row["easy_hr"]:
+        easy.append(f"пульс {row['easy_hr']}")
+    if easy:
+        parts.append("лёгкие: " + ", ".join(easy))
+    load = []
+    for key, name in (("ext", "rTSS"), ("int", "TRIMP")):
+        unknown = row[key + "_unknown"]
+        if row[key] is None or unknown == runs:
+            continue
+        load.append(f"{name} {'не меньше ' if unknown else ''}{row[key]}")
+    if load:
+        parts.append(", ".join(load))
+    if row["hard"]:
+        parts.append(f"тяжело или плохо: {row['hard']}")
+    return f"{head}: " + "; ".join(parts)
+
+
+def _history_plan(plan):
+    head = f"  - «{plan['race_name'] or 'без названия'}», старт {plan['race_date']}"
+    if plan["target_time"]:
+        head += f", цель {plan['target_time']}"
+    totals = plan["compliance"]
+    if totals is None:
+        done = "выполнение не посчитать: план без дат" if plan["weeks"] else "недель в плане нет"
+    elif totals["pct"] is not None:
+        done = f"выполнение {totals['pct']}% ({totals['actual_km']:g} из {totals['planned_km']:g} км)"
+    else:
+        done = (f"факт {totals['actual_km']:g} км, план не меньше {totals['planned_km']:g} км "
+                "(точнее из текста плана не вывести)")
+    result = plan["result"]
+    if result and result.get("seconds"):
+        km = DIST_LABEL_KM.get(result.get("dist_label"))
+        outcome = f"результат {_hms(result['seconds'])}" + (f" на {round(km, 1):g} км" if km else "") \
+            + f" ({result['date']})"
+    else:
+        outcome = "результата в «Стартах» нет"
+    return f"{head} — {done}; {outcome}"
+
+
+def format_history_block(history):
+    """Долгая история (#81): месяцы за год и итоги прошлых планов.
+
+    Фон, а не основание для решений на неделю: ближайшие недели модель
+    видит в блоках нагрузки и выполнения. Нагрузка месяца — «не меньше»,
+    если у части пробежек её не посчитать, как в блоке нагрузки.
+    """
+    if history is None:
+        return ["История: посчитать не удалось."]
+    months = history.get("months") or []
+    if not months:
+        lines = ["История по месяцам: пробежек нет."]
+    else:
+        lines = ["История по месяцам (все пробежки, до 12 месяцев; месяцы до первой "
+                 "пробежки в приложении не показаны):"]
+        lines.extend(_history_month(row) for row in months)
+    plans = history.get("plans") or []
+    if plans:
+        lines.append("Прошлые планы (последние, с гонкой в прошлом):")
+        lines.extend(_history_plan(plan) for plan in plans)
+    return lines
+
+
 def format_context_for_llm(ctx):
     """Превращает контекст в текстовый user prompt."""
     lines = []
@@ -287,6 +413,12 @@ def format_context_for_llm(ctx):
         lines.append("План следующей недели:")
         lines.append("  " + _week_days_str(nw))
 
+    # Контекст, собранный до #72, ключа weather не знает — блока тогда нет.
+    weather_block = format_weather_block(ctx.get("weather"))
+    if weather_block:
+        lines.append("")
+        lines.extend(weather_block)
+
     compliance_block = format_compliance_block(ctx.get("compliance"))
     if compliance_block:
         lines.append("")
@@ -296,6 +428,10 @@ def format_context_for_llm(ctx):
     if "load" in ctx:
         lines.append("")
         lines.extend(format_load_block(ctx["load"]))
+    # И история (#81) — так же: в старом контексте её нет вовсе.
+    if "history" in ctx:
+        lines.append("")
+        lines.extend(format_history_block(ctx["history"]))
 
     lines.append("")
     lines.append("Последние 14 тренировок (сначала свежие):")
@@ -323,7 +459,7 @@ def format_context_for_llm(ctx):
 
     if ctx["last_races"]:
         lines.append("")
-        lines.append("Последние забеги:")
+        lines.append("Забеги за 2 года (сначала свежие):")
         for race in ctx["last_races"]:
             label = race.get("dist_label", "")
             km = DIST_LABEL_KM.get(label, "?")
@@ -359,12 +495,14 @@ COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер, �
 - Смотри на общую картину: тренд, восстановление, соответствие цели. Не делай выводов по одному показателю.
 - Главный приоритет — долгосрочный прогресс без травм. Риск травмы, накопленное утомление или неадекватная нагрузка важнее амбиций по результату.
 - Нагрузку читай по двум осям: rTSS по темпу — сколько работы сделано, TRIMP по пульсу — чего она стоила организму. Отношение к обычной оценивай с учётом фазы плана: на разгрузке и подводке «ниже обычного» — норма, а резкий рост — повод для осторожности, а не для похвалы. Выросла цена работы (пульс выше при той же работе) — спроси про сон, жару, болезнь и самочувствие, а не добавляй нагрузку.
+- История по месяцам и итоги прошлых планов — фон: по ним видно тренд объёма и аэробной формы, перерывы и как прошли прошлые подготовки. Решения на ближайшие недели принимай по нагрузке и выполнению плана, а не по годовым цифрам.
 
 Правила:
 - Опирайся на данные спортсмена ниже. Если для вывода данных не хватает — скажи об этом прямо и спроси недостающее, не додумывай цифры. То, что в данных уже есть, не переспрашивай.
 - Учитывай профиль: возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
-- По тренировкам у тебя есть темп, средний и максимальный пульс, каденс, набор высоты, круги, дрейф пульса, время в пульсовых зонах, недельная нагрузка по темпу (rTSS) и по пульсу (TRIMP) с отношением к обычной, цена работы, ощущения и заметки спортсмена. Других показателей часов (HRV, training effect, время восстановления, готовность к тренировке и т. п.) в данных нет: учитывай их, только если спортсмен сам о них написал, и не требуй их.
+- По тренировкам у тебя есть темп, средний и максимальный пульс, каденс, набор высоты, круги, дрейф пульса, время в пульсовых зонах, недельная нагрузка по темпу (rTSS) и по пульсу (TRIMP) с отношением к обычной, цена работы, помесячная история за год, ощущения и заметки спортсмена. Других показателей часов (HRV, training effect, время восстановления, готовность к тренировке и т. п.) в данных нет: учитывай их, только если спортсмен сам о них написал, и не требуй их.
 - Жару, ветер, недосып и стресс учитывай по заметкам спортсмена, рельеф — по набору высоты. Если тренировка вышла заметно хуже ожидаемого без видимой причины — спроси о них.
+- Прогноз погоды на ближайшие дни, если он есть в данных, учитывай в советах о месте и времени тренировки. При опасной погоде (гроза, гололёд, сильный мороз или жара) предложи провести тренировку в помещении или переставить её на другой день — с учётом доступных дней.
 - Ты не врач и диагнозов не ставишь. При жалобах на боль или тревожных симптомах советуй снизить нагрузку и обратиться к специалисту.
 - Отвечай на заданный вопрос и конкретно: темпы, пульс, километры, дни недели. Без шаблонных фраз. Не пересказывай данные, которые спортсмен и так видит.
 - Каждую корректировку объясняй: почему именно она. Сорванную или выполненную хуже плана тренировку не компенсируй дополнительной нагрузкой.
@@ -379,6 +517,14 @@ COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер, �
 - Опиши структуру подготовки словами: фазы, ключевые тренировки и цель каждой, диапазоны темпа и пульса, восстановление.
 - План целиком в этом диалоге не составляется и не заменяется: правки возможны только в ближайших неделях и только так, как описано в формате ответа.
 
+Память:
+- Блок «Что ты помнишь о спортсмене» в данных ниже — твоя память, общая для всех разборов. Опирайся на неё так же, как на остальные данные, и не переспрашивай то, что в ней уже есть.
+- Запоминай то, что пригодится в следующих разговорах и чего нет в данных приложения: здоровье и самочувствие (боль, травмы, болезни), обстоятельства (отпуск, командировки, смена графика, где бегает), предпочтения (что любит и чего не любит, когда удобно тренироваться), ваши договорённости и решения.
+- Не записывай то, что уже есть в данных: план, пробежки, профиль, рекорды. Не записывай оценок личности: спортсмен видит свою память и может её править.
+- Пиши коротко, одной фразой, с датами, если они важны: «С 10 по 20 ноября в отпуске, бегать сможет только на дорожке».
+- Факт изменился — уточни его, устарел или не подтвердился — забудь. Память почти заполнена — объединяй похожие факты.
+- Говори, что запомнил, только если действительно передал это в memory.
+
 Как писать:
 - По-русски.
 - Разбор тренировки и корректировку плана строй по разделам: **Вывод** (1–2 предложения), **Что видно по данным** (выводы из цифр, а не их пересказ), **Главная проблема или сильная сторона**, **Что делать дальше**, **Корректировка плана**. Раздел, которому нечего сказать, пропускай.
@@ -386,12 +532,12 @@ COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер, �
 - Для выделения годятся **жирный** и списки с «- »."""
 
 COACH_CHAT_REPLY_FORMAT = """Формат ответа — СТРОГО JSON без текста до или после:
-{"reply": "текст ответа спортсмену"}"""
+{"reply": "текст ответа спортсмену", "memory": null}"""
 
 # Формат с правками плана. Используется, только когда модели показана таблица
 # «План: что можно менять» — без неё адресовать правку нечем.
 COACH_CHAT_PROPOSAL_FORMAT = """Формат ответа — СТРОГО JSON без текста до или после:
-{"reply": "текст ответа спортсмену", "proposal": null}
+{"reply": "текст ответа спортсмену", "proposal": null, "memory": null}
 
 Когда нужно изменить план, вместо null передай правки:
 {"reply": "...", "proposal": {"summary": "что меняется и зачем, одной фразой", "changes": [{"week": 6, "day": "wed", "text": "новый текст ячейки", "reason": "почему"}]}}
@@ -401,6 +547,18 @@ COACH_CHAT_PROPOSAL_FORMAT = """Формат ответа — СТРОГО JSON 
 - week — номер недели, day — код дня (mon, tue, wed, thu, fri, sat, sun) из таблицы «План: что можно менять». Менять можно только дни этой таблицы, не помеченные как прошедшие.
 - text — новое содержимое ячейки целиком, в том же стиле, что остальной план. Пустая строка — день отдыха.
 - Не больше 14 правок. В reply объясни их словами: спортсмен увидит карточку «было → стало» и сам решит, применять ли. Не пиши, что план уже изменён."""
+
+# Правки памяти (#80) — в обоих форматах: память есть всегда, даже пустая.
+COACH_CHAT_MEMORY_FORMAT = """Когда нужно изменить память, вместо null в "memory" передай изменения — любые из трёх списков:
+{"memory": {"add": [{"kind": "health", "text": "факт одной фразой"}], "edit": [{"id": "m3", "text": "новый текст факта целиком"}], "forget": [{"id": "m5"}]}}
+
+Правила для memory:
+- kind — вид факта: %(kinds)s.
+- id — номер факта из блока «Что ты помнишь о спортсмене»; других фактов нет.
+- Не больше %(ops)d изменений за ответ. В памяти помещается %(facts)d фактов, факт — до %(text)d символов.
+- На большинство сообщений memory — null.""" % {
+    "kinds": ", ".join(f"{kind} ({label})" for kind, label in MEMORY_KIND_LABELS.items()),
+    "ops": MEMORY_OPS_MAX, "facts": MEMORY_FACTS_MAX, "text": MEMORY_TEXT_MAX}
 
 
 def format_plan_window(window):
@@ -505,28 +663,48 @@ def format_run_focus(focus):
     return "\n".join(lines)
 
 
+def format_memory_block(facts):
+    """Память тренера (#80): активные факты с id, на которые ссылаются правки.
+
+    Дата — когда факт записан или последний раз уточнён: по ней модель
+    решает, не устарел ли он. Факты сгруппированы по виду.
+    """
+    order = list(MEMORY_KIND_LABELS)
+    lines = ["=== Что ты помнишь о спортсмене (общая память всех разборов) ==="]
+    for fact in sorted(facts, key=lambda f: order.index(f["kind"])):
+        when = str(fact.get("updated_at") or fact.get("created_at") or "")[:10]
+        lines.append(f"[{fact['id']}] {when}, {MEMORY_KIND_LABELS[fact['kind']]}: {fact['text']}")
+    lines.append(f"(фактов {len(facts)} из {MEMORY_FACTS_MAX})" if facts else "Память пока пуста.")
+    return "\n".join(lines)
+
+
 def coach_chat_instructions(with_proposals):
     """Неизменная часть системного промпта: роль, правила и формат ответа.
 
     Формат с правками плана даётся, только когда модели показана таблица
-    недель, открытых для правок: без неё адресовать правку нечем.
+    недель, открытых для правок: без неё адресовать правку нечем. Правки
+    памяти (#80) возможны всегда.
     """
     return "\n\n".join([
         COACH_CHAT_SYSTEM_PROMPT,
-        COACH_CHAT_PROPOSAL_FORMAT if with_proposals else COACH_CHAT_REPLY_FORMAT])
+        COACH_CHAT_PROPOSAL_FORMAT if with_proposals else COACH_CHAT_REPLY_FORMAT,
+        COACH_CHAT_MEMORY_FORMAT])
 
 
-def coach_chat_data(context_text, focus_blocks=(), plan_window_text=""):
+def coach_chat_data(context_text, focus_blocks=(), plan_window_text="", memory_text=""):
     """Данные спортсмена для системного промпта хода.
 
     Они идут в системную часть, а не репликой: так история диалога остаётся
     чистым чередованием вопросов и ответов, а контекст каждый ход
     подставляется актуальный, не тот, что был на момент первого вопроса.
 
-    focus_blocks — подробные блоки пробежек, которые спортсмен выбрал для
-    разбора; последняя в списке прикреплена позже всех.
+    memory_text — память тренера (#80), сразу за данными. focus_blocks —
+    подробные блоки пробежек, которые спортсмен выбрал для разбора;
+    последняя в списке прикреплена позже всех.
     """
     parts = ["=== Данные спортсмена на момент сообщения ===\n" + context_text]
+    if memory_text:
+        parts.append(memory_text)
     if plan_window_text:
         parts.append(plan_window_text)
     if focus_blocks:

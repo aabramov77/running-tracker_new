@@ -308,6 +308,49 @@ def parse_planned_day(text):
     return {"kind": KM, "km": km, "exact": True}
 
 
+# ── Тип тренировки дня (#72) ─────────────────────────────────────────────────
+#
+# Нужен советам по погоде: интервалы на гололёде уводят в манеж, а лёгкий бег
+# под дождём оставляют на улице. Ошибка здесь стоит одного неточного совета,
+# поэтому разбор простой — по словам, без попытки понять структуру ячейки.
+
+WORKOUT_REST = "rest"
+WORKOUT_RACE = "race"
+WORKOUT_QUALITY = "quality"
+WORKOUT_LONG = "long"
+WORKOUT_EASY = "easy"
+
+_RACE_RE = re.compile(r"старт|забег|соревн|\brace\b", re.IGNORECASE)
+_LONG_RE = re.compile(r"длит|\blong\b|\blsd\b", re.IGNORECASE)
+# Работа на скорости: «темповый», «в темпе ПАНО», «фартлек», «отрезки», горки.
+# Целевой темп в ячейке («8 км по 5:05–5:15») — тоже работа, а не трусца.
+_QUALITY_RE = re.compile(
+    r"интервал|темпов|\bв темпе\b|пано|фартлек|отрез|повтор|горк|"
+    r"tempo|interval|threshold|fartlek|\bпо \d{1,2}:\d{2}", re.IGNORECASE)
+
+# Объём, начиная с которого лёгкий бег считается длительной
+LONG_RUN_KM = 16
+
+
+def workout_kind(text):
+    """Ячейка дня плана → rest | race | long | quality | easy.
+
+    Длительная проверяется раньше работы на скорости: «длительная 25 км,
+    последние 3 в темпе» остаётся длительной — её не уводят в манеж.
+    """
+    parsed = parse_planned_day(text)
+    if parsed["kind"] == REST:
+        return WORKOUT_REST
+    raw = text.strip()
+    if _RACE_RE.search(raw):
+        return WORKOUT_RACE
+    if _LONG_RE.search(raw) or (parsed["km"] or 0) >= LONG_RUN_KM:
+        return WORKOUT_LONG
+    if _INTERVAL_RE.search(raw) or _QUALITY_RE.search(raw):
+        return WORKOUT_QUALITY
+    return WORKOUT_EASY
+
+
 # ── Сопоставление ────────────────────────────────────────────────────────────
 
 DONE = "done"

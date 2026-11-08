@@ -19,32 +19,34 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
 from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
-                     FitTokenInvalid, LLMRefused, LLMTruncated, PlansIndexBusy,
-                     PlanStale, RaceStale, RegistrationClosed, RunStale,
-                     StorageBusy, UsageBusy, RACE_FIELDS, RUN_FIELDS,
+                     FitTokenInvalid, LLMRefused, LLMTruncated, MemoryStale,
+                     PlansIndexBusy, PlanStale, RaceStale, RegistrationClosed, RunStale,
+                     StorageBusy, UsageBusy, LATE_PROFILE_FIELDS, RACE_FIELDS, RUN_FIELDS,
                      _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
                      apply_ai_proposal,
                      archive_ai_thread, archive_plan,
                      build_ai_turn,
-                     build_plan_compliance, call_llm,
+                     build_plan_compliance, build_plan_weather, call_llm,
                      chat_unread, mark_chat_read, read_chat,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
-                     clean_effort, clean_plan_meta, clean_plan_weeks,
+                     clean_effort, clean_memory_edit, clean_memory_ops,
+                     clean_plan_meta, clean_plan_weeks,
                      clean_proposal, clean_race, clean_run,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
+                     coach_weather_view,
                      create_ai_thread, create_plan,
                      current_coach, delete_race, delete_run,
                      find_own_run, find_plan, get_active_plan,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
-                     mark_proposal_states, mask_key,
+                     mark_proposal_states, mask_key, memory_facts, memory_view,
                      migrate_all_entity_history, migrate_legacy_to_user,
                      my_coach, notify_plan_change,
                      parse_coach_reply, parse_fit_file, plan_author, plan_meta_unchanged,
-                     read_advice_usage, read_ai_messages,
-                     read_ai_thread, read_athlete_history,
+                     read_advice_usage, read_ai_memory, read_ai_memory_history,
+                     read_ai_messages, read_ai_thread, read_athlete_history,
                      read_athlete_profile,
                      read_llm_config_full, read_plan_history, read_plan_state,
                      read_plans_index,
@@ -55,8 +57,9 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      save_plan_weeks, save_race, save_run, set_active_plan,
                      set_coach_flag, set_coach_plan_edit, set_user_coach,
                      set_user_status, update_plan_meta,
-                     write_athlete_version, write_llm_config_version,
+                     write_ai_memory, write_athlete_version, write_llm_config_version,
                      write_parsed_fit_to_tmp)
+from weather import clean_geocode_query, geocode
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -306,6 +309,15 @@ def h_coach_plan_compliance(c):
     if result is None:
         return jresp({"error": "plan not found"}, 404)
     return jresp(result, 200)
+
+
+def h_coach_plan_weather(c):
+    """Погода к плану спортсмена (#72): хватает права на просмотр. Город —
+    без координат, их убирает белый список coach_weather_view."""
+    result = build_plan_weather(c.bucket, _coached_athlete(c), c.args[1])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(coach_weather_view(result), 200)
 
 
 def h_coach_runs(c):
@@ -750,6 +762,7 @@ def h_ai_message_post(c):
     if failure:
         release_advice_usage(c.bucket, c.sub)
         return failure
+    memory = _remember(c, thread, turn, envelope.get("memory"))
 
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
@@ -775,11 +788,31 @@ def h_ai_message_post(c):
         "based_on_plan_version": ctx.get("plan_version"),
         "based_on_profile_version": ctx.get("profile_version", 0),
         "based_on_runs": [r.get("id") for r in ctx["last_runs"]],
+        "based_on_memory_version": turn["memory_version"],
         **({"proposal": proposal} if proposal else {}),
+        **({"memory_changes": memory["changes"], "memory_version": memory["version"]}
+           if memory else {}),
     })
     if proposal:
         answer = {**answer, "proposal_state": "open"}
     return jresp({"messages": [question, answer], "usage": usage}, 201)
+
+
+def _remember(c, thread, turn, raw):
+    """Изменения памяти из ответа модели → новая версия памяти или None (#80).
+
+    К этому моменту ответ получен и попытка списана, поэтому сбой записи
+    памяти ход не роняет: ответ уходит спортсмену без изменений памяти.
+    """
+    ops = clean_memory_ops(raw, memory_facts(turn["memory"]))
+    if not ops:
+        return None
+    try:
+        return write_ai_memory(c.bucket, c.sub, ops, "ai", created_by=c.email,
+                               thread_id=thread["id"])
+    except Exception:
+        logging.exception("ai memory: изменения из ответа модели не записаны")
+        return None
 
 
 def h_ai_proposal_apply(c):
@@ -796,6 +829,43 @@ def h_ai_proposal_apply(c):
     if not applied:
         return jresp({"error": "message not found"}, 404)
     return jresp({"applied": applied}, 201)
+
+
+# ── Память ИИ-тренера (#80) ───────────────────────────────────────────────────
+# Только своя память: путь строится от c.sub, тренеру-человеку маршрутов нет.
+
+def h_ai_memory_get(c):
+    return jresp(memory_view(*read_ai_memory(c.bucket, c.sub)), 200)
+
+
+def h_ai_memory_post(c):
+    """Правка памяти спортсменом: add / edit / hide / restore поверх
+    base_version. Каждая — новая версия памяти, прежние остаются."""
+    body = c.body()
+    base_version, bad = _base_version(body)
+    if bad:
+        return bad
+    if base_version is None:
+        return jresp({"error": "Missing base_version"}, 400)
+    doc, version = read_ai_memory(c.bucket, c.sub)
+    if base_version != version:
+        return jresp({"error": "memory_stale"}, 409)
+    try:
+        op = clean_memory_edit(body, doc)
+    except AICoachError as e:
+        return jresp({"error": str(e)}, 404 if str(e) == "fact_not_found" else 400)
+    try:
+        written = write_ai_memory(c.bucket, c.sub, [op], "athlete", created_by=c.email,
+                                  base_version=base_version)
+    except MemoryStale:
+        return jresp({"error": "memory_stale"}, 409)
+    if not written:             # правка ничего не поменяла — версии нет
+        return jresp(memory_view(doc, version), 200)
+    return jresp(memory_view(written, written["version"]), 201)
+
+
+def h_ai_memory_history(c):
+    return jresp({"versions": read_ai_memory_history(c.bucket, c.sub)}, 200)
 
 
 def h_profile_history(c):
@@ -824,18 +894,31 @@ def h_profile_post(c):
     profile, errors = clean_athlete_profile(source)
     if errors:
         return validation_failed(errors)
-    # Клиент до #66 поля порога не знает, а POST заменяет профиль целиком:
-    # без этого сохранение из старой вкладки молча стёрло бы порог. Явный
-    # null или пустая строка по-прежнему его сбрасывают.
-    if isinstance(source, dict) and "threshold_pace_sec" not in source:
-        profile["threshold_pace_sec"] = \
-            read_athlete_profile(c.bucket, c.sub)[0].get("threshold_pace_sec")
+    # Клиент до #66 не знает поля порога, до #72 — полей погоды, а POST
+    # заменяет профиль целиком: без этого сохранение из старой вкладки молча
+    # стёрло бы их. Явный null или пустое значение по-прежнему сбрасывают.
+    missing = [f for f in LATE_PROFILE_FIELDS if f not in source]
+    if missing:
+        current = read_athlete_profile(c.bucket, c.sub)[0]
+        profile.update({f: current.get(f) for f in missing})
     payload = write_athlete_version(
         c.bucket, c.sub, profile,
         change_reason=clean_change_reason(body.get("change_reason")),
         created_by=c.email)
     return jresp(profile_response(c.bucket, c.sub, profile,
                                   payload["version"], payload["created_at"]), 201)
+
+
+def h_weather_geocode(c):
+    """Поиск места для прогноза (#72) — через сервер, чтобы браузер не ходил
+    к стороннему сервису сам и не светил ему адрес пользователя."""
+    query, error = clean_geocode_query(c.request.args.get("q"))
+    if error:
+        return validation_failed({"q": error})
+    found = geocode(query)
+    if found is None:
+        return jresp({"error": "geocoder_unavailable"}, 502)
+    return jresp({"results": found}, 200)
 
 
 def h_races_get(c):
@@ -1009,6 +1092,13 @@ def h_plan_compliance(c):
     return jresp(result, 200)
 
 
+def h_plan_weather(c):
+    result = build_plan_weather(c.bucket, c.sub, c.args[0])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(result, 200)
+
+
 def h_plan_weeks_post(c):
     plan_id = c.args[0]
     if not find_plan(read_plans_index(c.bucket, c.sub), plan_id):
@@ -1142,6 +1232,7 @@ ROUTES = [
     ("POST",   r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",      h_coach_plan_weeks_post, False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/history$",    h_coach_plan_history,    False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weather$",    h_coach_plan_weather,    False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
     ("GET",    r"^/coach/athletes/([\w-]+)/load$",                      h_coach_load,            False),
@@ -1168,10 +1259,14 @@ ROUTES = [
     ("POST",   r"^/ai-coach/threads/([\w-]+)/archive$",    h_ai_thread_archive, False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages$",   h_ai_message_post,   False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages/([\w-]+)/apply$", h_ai_proposal_apply, False),
+    ("GET",    r"^/ai-coach/memory$",                      h_ai_memory_get,     False),
+    ("POST",   r"^/ai-coach/memory$",                      h_ai_memory_post,    False),
+    ("GET",    r"^/ai-coach/memory/history$",              h_ai_memory_history, False),
 
     ("GET",    r"^/profile$",                    h_profile_get,          False),
     ("POST",   r"^/profile$",                    h_profile_post,         False),
     ("GET",    r"^/profile/history$",            h_profile_history,      False),
+    ("GET",    r"^/weather/geocode$",            h_weather_geocode,      False),
 
     ("GET",    r"^/races$",                      h_races_get,            False),
     ("POST",   r"^/races$",                      h_races_post,           False),
@@ -1189,6 +1284,7 @@ ROUTES = [
     ("POST",   r"^/plans/([\w-]+)/weeks$",       h_plan_weeks_post,      False),
     ("GET",    r"^/plans/([\w-]+)/history$",     h_plan_history,         False),
     ("GET",    r"^/plans/([\w-]+)/compliance$",  h_plan_compliance,      False),
+    ("GET",    r"^/plans/([\w-]+)/weather$",     h_plan_weather,         False),
 
     ("GET",    r"^/plan$",                       h_active_plan_weeks_get,  False),
     ("POST",   r"^/plan$",                       h_active_plan_weeks_post, False),

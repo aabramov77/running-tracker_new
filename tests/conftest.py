@@ -214,6 +214,22 @@ def _reset_registry_cache(storage_module):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _offline_weather(monkeypatch):
+    """Погода (#72) в тестах в сеть не ходит: иначе контекст ИИ и маршруты
+    плана дёргали бы Open-Meteo. Тест, которому нужен прогноз, подменяет
+    _http_get сам. Кэши модуля глобальные — сбрасываем, как кэш реестра."""
+    import weather
+
+    def offline(url, params):
+        raise RuntimeError("сеть в тестах выключена")
+
+    monkeypatch.setattr(weather, "_http_get", offline)
+    weather._forecast_cache.clear()
+    weather._geocode_cache.clear()
+    yield
+
+
 @pytest.fixture
 def fake_bucket():
     return FakeBucket()

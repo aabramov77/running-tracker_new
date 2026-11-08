@@ -387,6 +387,7 @@ async function switchPlan(planId) {
     if (!res.ok) throw await apiError(res);     // в том числе plans_busy (#60)
     cancelPlanEdit();
     COMPLIANCE = null;      // факт прежнего плана к новому не относится
+    WEATHER = null;         // и советы к его дням (#72)
     await loadPlans();
     await loadPlan();       // недели нового активного плана
     renderAll();
@@ -604,6 +605,7 @@ async function loadPlan() {
       renderPlan();
       applyProfileToHeader();  // «план N недель» зависит от длины плана
       loadCompliance();        // план/факт — отдельным запросом, не блокирует таблицу
+      loadWeather();           // погода (#72) — тоже отдельно
     } else if (!PLAN) {
       document.getElementById('plan-body').innerHTML =
         `<tr><td colspan="${PLAN_COLSPAN}" style="text-align:center;opacity:.5">⚠ Нет данных плана</td></tr>`;
@@ -1009,6 +1011,136 @@ function renderComplianceNote() {
   }
 }
 
+// ── Погода и советы к тренировке (#72) ──
+// Прогноз и правила — на бэкенде, здесь только отрисовка. К дням плана погода
+// привязывается по датам из план/факта: у плана без дат её нет, как и
+// тренировки на экране «Сегодня».
+let WEATHER = null;
+
+async function loadWeather() {
+  const pid = activePlanId();
+  if (!pid) { WEATHER = null; return; }
+  try {
+    const res = await fetch(`${API_URL}plans/${pid}/weather`, { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    const data = res.ok ? await res.json() : null;
+    // План могли переключить, пока запрос был в пути — чужой ответ не берём.
+    WEATHER = (data && data.plan_id === activePlanId()) ? data : null;
+  } catch (e) {
+    WEATHER = null;
+  }
+  renderPlan();
+}
+
+// Дни прогноза по дате; пусто, если прогноза нет.
+function weatherByDate(report) {
+  const map = {};
+  if (report && report.status === 'ok') (report.days || []).forEach(d => { map[d.date] = d; });
+  return map;
+}
+
+// Прогноз на день недели плана: дата — из недель план/факта.
+function dayWeather(weeks, report, idx, field) {
+  const day = (((weeks || [])[idx] || {}).days || []).find(d => d.field === field);
+  return day ? weatherByDate(report)[day.date] || null : null;
+}
+
+const VENUE_ICON = { outdoor: '🏃', manege: '🏟', treadmill: '🏠', move: '↪' };
+const WX_ZONES = [['head', 'Голова'], ['top', 'Верх'], ['bottom', 'Низ'], ['hands', 'Руки'], ['feet', 'Обувь']];
+// Подпись источника — условие бесплатного тарифа Open-Meteo
+const WX_SOURCE = '<a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a>';
+
+function wxDeg(v) {
+  const n = Math.round(Number(v));
+  return n > 0 ? `+${n}°` : n < 0 ? `−${-n}°` : '0°';
+}
+
+// Место дня со значком. Причина есть, когда правила увели с улицы или
+// погода на улице тяжёлая.
+function wxVenueHtml(day) {
+  const v = day.venue;
+  if (!v) return '';
+  return `${VENUE_ICON[v.code] || ''} ${escapeHtml(v.label)}${v.why ? ' — ' + escapeHtml(v.why) : ''}`;
+}
+
+// Кратко — в строке дня недели на телефоне; подробности в листе дня.
+function wxShortHtml(day) {
+  if (!day) return '';
+  const parts = [`${escapeHtml(day.weather.icon)} ${wxDeg(day.weather.at_run.t)}`];
+  const venue = wxVenueHtml(day);
+  if (venue) parts.push(venue);
+  else if (day.why) parts.push(escapeHtml(day.why));
+  return `<div class="pw-wx wx-${escapeHtml(day.level)}">${parts.join(' · ')}</div>`;
+}
+
+// Одежда одной строкой для ячейки таблицы: обычные кроссовки не называем.
+function wxWearText(c) {
+  if (!c) return '';
+  return [c.top, c.bottom, c.hands, c.head, c.feet === 'кроссовки' ? '' : c.feet, ...(c.extra || [])]
+    .filter(Boolean).join(', ');
+}
+
+// Ячейка строки «Погода» под неделей в таблице плана.
+function wxCellHtml(day) {
+  if (!day) return '';
+  const r = day.weather.at_run;
+  const venue = wxVenueHtml(day);
+  const wear = wxWearText(day.clothing);
+  return `<div class="wx-cell wx-${escapeHtml(day.level)}">
+      <div class="wx-t">${escapeHtml(day.weather.icon)} ${wxDeg(r.t)}</div>
+      <div class="wx-sub">ощ. ${wxDeg(r.feels)}${r.wind >= 5 ? `, ${Number(r.wind)} м/с` : ''}</div>
+      ${venue ? `<div class="wx-venue">${venue}</div>` : ''}
+      ${wear ? `<div class="wx-wear">${escapeHtml(wear)}</div>` : ''}
+    </div>`;
+}
+
+// Полностью — лист дня и экран «Сегодня»: погода, место, одежда по зонам, пометки.
+function wxDetailHtml(day) {
+  if (!day) return '';
+  const w = day.weather, r = w.at_run, c = day.clothing;
+  const meta = [`днём ${wxDeg(w.t_min)}…${wxDeg(w.t_max)}`,
+    `ветер ${Number(r.wind)} м/с` + (r.gusts > r.wind ? `, порывы ${Number(r.gusts)}` : '')];
+  if (r.precip_mm > 0 || r.precip_prob > 0) meta.push(`осадки ${Number(r.precip_mm)} мм, ${Number(r.precip_prob)}%`);
+  if (r.uv >= 3) meta.push(`УФ ${Number(r.uv)}`);
+  const zones = c ? WX_ZONES.filter(([k]) => c[k])
+    .map(([k, label]) => `<div><span>${label}</span>${escapeHtml(c[k])}</div>`).join('') : '';
+  const extra = c && (c.extra || []).length ? `<div><span>Ещё</span>${escapeHtml(c.extra.join(', '))}</div>` : '';
+  const notes = (day.notes || []).map(n => `<li>${escapeHtml(n)}</li>`).join('');
+  const venue = wxVenueHtml(day);
+  return `<div class="wx-detail wx-${escapeHtml(day.level)}">
+      <div class="wx-head">${escapeHtml(w.icon)} ${escapeHtml(w.summary)} · в ${escapeHtml(r.time)} ${wxDeg(r.t)}
+        <span>(ощущается ${wxDeg(r.feels)})</span></div>
+      <div class="wx-meta">${escapeHtml(meta.join(' · '))}</div>
+      ${venue ? `<div class="wx-venue">${venue}</div>` : ''}
+      ${zones || extra ? `<div class="wx-zones">${zones}${extra}</div>` : ''}
+      ${notes ? `<ul class="wx-notes">${notes}</ul>` : ''}
+      <div class="wx-src">Прогноз: ${WX_SOURCE}</div>
+    </div>`;
+}
+
+// Подсказка над планом: города нет — где его указать; прогноз не пришёл —
+// что его сейчас нет. Подсказку о городе можно скрыть насовсем.
+function weatherHintKey() { return ck('running_tracker_wx_hint_hidden'); }
+
+function hideWeatherHint() {
+  try { localStorage.setItem(weatherHintKey(), '1'); } catch (e) {}
+  renderWeatherNote();
+}
+
+function renderWeatherNote() {
+  const el = document.getElementById('plan-weather-note');
+  let hidden = false;
+  try { hidden = localStorage.getItem(weatherHintKey()) === '1'; } catch (e) {}
+  const status = (!planEditMode && PLAN?.length && WEATHER) ? WEATHER.status : null;
+  const html = status === 'no_location' && !hidden
+    ? '🌦 Укажите город в <a href="#" onclick="showTab(\'profile\');return false">профиле</a> — '
+      + 'в плане появятся прогноз и советы, что надеть и где бежать. '
+      + '<a href="#" onclick="hideWeatherHint();return false">Скрыть</a>'
+    : status === 'unavailable' ? '🌦 Прогноз погоды сейчас недоступен — советы появятся, когда он загрузится.' : '';
+  el.innerHTML = html;
+  el.style.display = html ? 'block' : 'none';
+}
+
 // План рисуется в трёх местах: таблица, неделя списком дней и экран
 // «Сегодня» на телефоне (#48). Обновляются всегда вместе.
 function renderPlan() {
@@ -1019,6 +1151,7 @@ function renderPlan() {
 
 function renderPlanTable() {
   const body = document.getElementById('plan-body');
+  renderWeatherNote();
 
   // ── Режим конструктора (может быть 0 строк) ──
   if (planEditMode) {
@@ -1037,7 +1170,7 @@ function renderPlanTable() {
 
   // ── Обычный просмотр ──
   renderComplianceNote();
-  body.innerHTML = planViewRowsHtml(PLAN, compliantWeeks(), getCurrentWeek());
+  body.innerHTML = planViewRowsHtml(PLAN, compliantWeeks(), getCurrentWeek(), WEATHER);
 }
 
 // Строки конструктора плана. Как и planViewRowsHtml, зависит только от
@@ -1106,8 +1239,23 @@ function plannedKmLabel(week) {
 
 // Строки таблицы плана с план/фактом. Зависит только от аргументов, поэтому
 // ею же рисуется план спортсмена на экране тренера (#44).
-//   plan  — недели плана; weeks — недели compliance или null; cw — индекс текущей.
-function planViewRowsHtml(plan, weeks, cw) {
+//   plan  — недели плана; weeks — недели compliance или null; cw — индекс текущей;
+//   weather — ответ /weather или null (#72).
+function planViewRowsHtml(plan, weeks, cw, weather) {
+  const wx = weatherByDate(weather);
+  // Строка «Погода» под неделей (#72) — в тех же колонках дней. Прошедшие дни
+  // и дни без прогноза пустые; неделя без единого дня с прогнозом — без строки.
+  const wxRow = byField => {
+    const days = PLAN_DAYS.map(([f]) => wx[byField[f]?.date]);
+    if (!days.some(Boolean)) return '';
+    const where = weather.location?.name ? ` · ${escapeHtml(weather.location.name)}` : '';
+    return `<tr class="wx-row">
+      <td colspan="4" class="wx-label">🌦 Погода на ${escapeHtml(weather.run_time)}${where}
+        <div class="wx-src">${WX_SOURCE}</div></td>
+      ${days.map(d => `<td>${wxCellHtml(d)}</td>`).join('')}
+    </tr>`;
+  };
+
   const kmCell = (week, past) => {
     if (!week) return '<td></td>';
     const planned = plannedKmLabel(week);
@@ -1147,7 +1295,7 @@ function planViewRowsHtml(plan, weeks, cw) {
       <td><span class="badge ${PLAN_BADGE[r.type]||''}">${PLAN_TYPE_LABEL[r.type]||escapeHtml(r.type||'')}</span><br><span style="font-size:11px;opacity:.7">${escapeHtml(r.accent ?? '')}</span></td>
       ${kmCell(week, past)}
       ${PLAN_DAYS.map(([f]) => dayCell(r[f], f, dayFactHtml(byField[f], past))).join('')}
-    </tr>`;
+    </tr>${wxRow(byField)}`;
   }).join('');
 }
 
@@ -1163,7 +1311,7 @@ function renderPlanWeek() {
   const cw = getCurrentWeek();
   const idx = Math.max(0, Math.min(PLAN.length - 1, planWeekIdx ?? cw));
   el.innerHTML = planWeekHtml(PLAN, compliantWeeks(), cw, idx,
-    { onStep: 'planWeekStep', onToday: 'planWeekToday', onDay: 'openDaySheet' });
+    { onStep: 'planWeekStep', onToday: 'planWeekToday', onDay: 'openDaySheet', weather: WEATHER });
 }
 
 function planWeekStep(delta) {
@@ -1176,7 +1324,10 @@ function planWeekToday() { planWeekIdx = null; renderPlanWeek(); }
 // аргументов: тем же кодом план спортсмена смотрит и правит тренер (#62).
 //   onStep, onToday, onDay — имена обработчиков «‹ ›», «К текущей неделе» и
 //   тапа по дню; без onDay дни только для просмотра.
-function planWeekHtml(plan, weeks, cw, idx, { onStep, onToday, onDay }) {
+//   onView — тап по дню без права правки: открывает лист ради погоды (#72);
+//   weather — ответ /weather или null.
+function planWeekHtml(plan, weeks, cw, idx, { onStep, onToday, onDay, onView, weather }) {
+  const wx = weatherByDate(weather);
   const r = plan[idx];
   const week = weeks ? weeks[idx] : null;
   const past = idx <= cw;
@@ -1200,10 +1351,12 @@ function planWeekHtml(plan, weeks, cw, idx, { onStep, onToday, onDay }) {
     const date = day ? `${day.date.slice(8)}.${day.date.slice(5, 7)}` : '';
     // Сегодняшний и будущие дни текущей недели ещё не пропущены
     const pending = day && day.status === 'missed' && day.date >= today;
-    const open = onDay ? ` onclick="${onDay}(${idx},'${f}')"` : '';
+    const forecast = day ? wx[day.date] : null;
+    const handler = onDay ? onDay : (forecast && onView);
+    const open = handler ? ` onclick="${handler}(${idx},'${f}')"` : '';
     return `<div class="pw-day${day && day.date === today ? ' today' : ''}"${open}>
         <div class="pw-dow">${label[f]}<span>${escapeHtml(date)}</span></div>
-        <div class="pw-text">${escapeHtml(r[f] || '') || '<span class="pw-rest">—</span>'}</div>
+        <div class="pw-text">${escapeHtml(r[f] || '') || '<span class="pw-rest">—</span>'}${wxShortHtml(forecast)}</div>
         <div class="pw-fact">${dayFactHtml(day, past && !pending)}</div>
       </div>`;
   }).join('');
@@ -1242,6 +1395,8 @@ function openDaySheet(idx, field) {
   document.getElementById('day-sheet-title').textContent =
     `${Object.fromEntries(PLAN_DAYS)[field]} · неделя ${r.w ?? idx + 1}`;
   document.getElementById('day-sheet-text').value = dayEdit.was;
+  document.getElementById('day-sheet-wx').innerHTML =
+    wxDetailHtml(dayWeather(compliantWeeks(), WEATHER, idx, field));
   dayNote('');
   document.getElementById('day-sheet').classList.add('active');
 }
@@ -1306,10 +1461,13 @@ function renderToday() {
         : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>'}
     </div>`;
 
+  // Погода на сегодня (#72) — в любой ветке, где для плана есть прогноз
+  const wxToday = wxDetailHtml(weatherByDate(WEATHER)[today]);
   const hero = (meta, title, sub, actions) => `<div class="card today-hero">
       <div class="today-when">${meta}</div>
       <div class="today-title">${title}</div>
       ${sub ? `<div class="today-sub">${sub}</div>` : ''}
+      ${wxToday}
       <div class="today-actions">${actions}</div>
     </div>`;
   const recordBtn = `<button class="btn-primary" onclick="openAddSheet()">Записать</button>`;
@@ -2830,6 +2988,7 @@ const PROFILE_FIELD_MAP = {
   vo2max: 'pr-vo2max', years_running: 'pr-years-running',
   weekly_km_typical: 'pr-weekly-km', sessions_per_week: 'pr-sessions',
   long_run_day: 'pr-long-run-day', injuries: 'pr-injuries', notes: 'pr-notes',
+  run_time: 'pr-run-time', cold_sensitivity: 'pr-cold',
 };
 
 // Подписи для сообщений валидации с бэка (там приходят коды полей)
@@ -2841,6 +3000,8 @@ const PROFILE_FIELD_LABELS = {
   long_run_day: 'День длительной', available_days: 'Доступные дни',
   injuries: 'Травмы и ограничения', notes: 'Заметки',
   hr_zones_custom: 'Пульсовые зоны', threshold_pace_sec: 'Пороговый темп',
+  location: 'Город для прогноза', run_time: 'Время тренировки', venues: 'Где тренироваться',
+  cold_sensitivity: 'Холод',
 };
 
 const PB_LABELS = {'4.2km':'4,2 км','5km':'5 км','10km':'10 км','HM':'Полумарафон','M':'Марафон'};
@@ -2875,6 +3036,93 @@ function fillProfileForm(profile) {
   // #66: хранится в секундах на км, вводится и показывается как «м:сс»
   const pace = profile.threshold_pace_sec;
   document.getElementById('pr-threshold-pace').value = pace > 0 ? secondsToTime(pace) : '';
+  // #72: место прогноза — объектом, площадки — списком
+  PROFILE_LOCATION = profile.location || null;
+  CITY_RESULTS = [];
+  document.getElementById('pr-city').value = '';
+  document.getElementById('pr-city-results').innerHTML = '';
+  renderLocation('');
+  const venues = profile.venues || [];
+  profileVenueBoxes().forEach(cb => { cb.checked = venues.includes(cb.value); });
+}
+
+// ── Погода: место прогноза (#72) ──
+// Поле города — только поиск. Выбранное место показано строкой ниже и уходит
+// на сервер с «Сохранить»: так набранный, но не найденный город не подменит
+// координаты прежнего.
+let PROFILE_LOCATION = null;
+let CITY_RESULTS = [];
+
+function profileVenueBoxes() {
+  return Array.from(document.querySelectorAll('#pr-venues input[type=checkbox]'));
+}
+
+function renderLocation(note) {
+  const loc = PROFILE_LOCATION;
+  document.getElementById('pr-location').innerHTML = loc
+    ? `📍 <b>${escapeHtml(loc.name)}</b>
+       <span class="hint" style="margin:0">${Number(loc.lat).toFixed(2)}, ${Number(loc.lon).toFixed(2)}</span>
+       <button class="btn-sm" onclick="clearLocation()">Убрать</button>`
+    : '<span class="hint" style="margin:0">Место не выбрано — прогноза в плане не будет.</span>';
+  document.getElementById('pr-location-note').textContent = note || '';
+}
+
+// Enter в поле города — поиск, а не отправка чего-то ещё
+function cityKeydown(event) {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  searchCity();
+}
+
+async function searchCity() {
+  const q = document.getElementById('pr-city').value.trim();
+  const box = document.getElementById('pr-city-results');
+  if (q.length < 2) { box.innerHTML = '<div class="hint">Введите хотя бы две буквы</div>'; return; }
+  box.innerHTML = '<div class="hint">Ищем…</div>';
+  try {
+    const res = await fetch(`${API_URL}weather/geocode?q=${encodeURIComponent(q)}`, { headers: authHeaders() });
+    if (res.status === 401) { handleAuthError(); return; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error === 'geocoder_unavailable' ? 'поиск сейчас недоступен' : 'HTTP ' + res.status);
+    CITY_RESULTS = data.results || [];
+    box.innerHTML = CITY_RESULTS.length
+      ? CITY_RESULTS.map((c, i) => `<button class="city-option" onclick="pickCity(${i})">
+          <b>${escapeHtml(c.name)}</b> <span>${escapeHtml([c.admin1, c.country].filter(Boolean).join(', '))}</span>
+        </button>`).join('')
+      : '<div class="hint">Ничего не нашлось — проверьте название</div>';
+  } catch (e) {
+    box.innerHTML = `<div class="hint">⚠ ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function pickCity(i) {
+  const c = CITY_RESULTS[i];
+  if (!c) return;
+  PROFILE_LOCATION = { name: c.name, lat: c.lat, lon: c.lon };
+  CITY_RESULTS = [];
+  document.getElementById('pr-city').value = '';
+  document.getElementById('pr-city-results').innerHTML = '';
+  renderLocation('Сохраните профиль, чтобы прогноз появился в плане');
+}
+
+function useMyLocation() {
+  if (!navigator.geolocation) { renderLocation('Браузер не умеет определять местоположение — найдите город'); return; }
+  renderLocation('Определяем местоположение…');
+  navigator.geolocation.getCurrentPosition(pos => {
+    // Прогнозу хватает ~1 км, точнее координаты не храним
+    const round = v => Math.round(v * 100) / 100;
+    PROFILE_LOCATION = { name: 'Моё местоположение',
+                         lat: round(pos.coords.latitude), lon: round(pos.coords.longitude) };
+    renderLocation('Сохраните профиль, чтобы прогноз появился в плане');
+  }, err => renderLocation(err.code === 1
+    ? 'Доступ к местоположению запрещён — найдите город по названию'
+    : 'Не удалось определить местоположение — найдите город по названию'),
+  { timeout: 10000, maximumAge: 10 * 60 * 1000 });
+}
+
+function clearLocation() {
+  PROFILE_LOCATION = null;
+  renderLocation('Сохраните профиль, чтобы убрать прогноз из плана');
 }
 
 // Подсказка у порогового темпа: оценка по «Стартам» — видна и при ручном пороге.
@@ -2898,6 +3146,8 @@ function collectProfileForm() {
   // null — зоны считает сервер. Поле шлём всегда: POST заменяет профиль целиком.
   body.hr_zones_custom = PROFILE_ZONES_MANUAL ? zoneInputs().map(input => input.value.trim()) : null;
   body.threshold_pace_sec = document.getElementById('pr-threshold-pace').value.trim();   // «м:сс» (#66)
+  body.location = PROFILE_LOCATION;     // null — прогноз не нужен (#72)
+  body.venues = profileVenueBoxes().filter(cb => cb.checked).map(cb => cb.value);
   return body;
 }
 
@@ -3071,6 +3321,7 @@ async function saveProfile() {
     applyProfileResponse(data);
     flashProfileMsg('✓ Сохранено', true);
     loadTrainingLoad();   // зоны, пульс покоя и порог меняют нагрузку (#66)
+    loadWeather();        // город, время и площадки меняют советы (#72)
   } catch (e) {
     flashProfileMsg('⚠ ' + e.message, false);
   } finally {
@@ -3205,12 +3456,16 @@ const AI_STARTERS = [
 // ответила.
 const AICOACH = { threads: [], thread: null, messages: [], usage: null,
                   pending: null, loading: false, applying: false, session: 0 };
+// Память тренера (#80): data — ответ GET /ai-coach/memory, по его version
+// идут правки; editing — id факта, который правится на месте.
+const AIMEM = { data: null, open: false, editing: null, showHidden: false, busy: false };
 const AI_DAY_LABELS = Object.fromEntries(PLAN_DAYS);    // mon → «Пн»
 
 function aiReset() {
   AICOACH.session++;
   Object.assign(AICOACH, { threads: [], thread: null, messages: [], usage: null,
                            pending: null, loading: false, applying: false });
+  Object.assign(AIMEM, { data: null, open: false, editing: null, showHidden: false, busy: false });
 }
 
 async function aiFetch(path, { method = 'GET', body = null } = {}) {
@@ -3299,7 +3554,8 @@ function aiMessageHtml(m) {
   const mine = m.role === 'athlete';
   const chip = m.run_id ? aiRunChipHtml(m.run_id, m.run_title || 'тренировка') : '';
   const proposal = m.proposal ? aiProposalHtml(m) : '';
-  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+  const memory = m.memory_changes && m.memory_changes.length ? aiMemoryChangesHtml(m.memory_changes) : '';
+  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}${memory}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
 }
 
 function aiRenderRunChoices() {
@@ -3361,6 +3617,8 @@ function openAiCoachTab() {
   aiRenderRunChoices();
   aiRender(false);
   aiLoadThreads();
+  aiMemoryRender();
+  aiMemoryLoad();         // #80: число фактов видно и у свёрнутой карточки
 }
 
 async function aiLoadThreads() {
@@ -3444,6 +3702,7 @@ async function aiSend(preset = null) {
     AICOACH.pending = null;
     aiRender();
     aiLoadThreads();
+    if ((data.messages || []).some(m => m.memory_changes)) aiMemoryLoad();   // тренер что-то запомнил
   } catch (e) {
     if (AICOACH.session !== session) return;
     AICOACH.pending = null;
@@ -3519,6 +3778,198 @@ async function aiArchiveThread(id) {
   }
   if (AICOACH.thread && AICOACH.thread.id === id) aiNewThread();
   aiLoadThreads();
+}
+
+// ── Память ИИ-тренера (#80) ──
+// Общая для всех разборов: тренер пишет в неё сам, спортсмен правит, скрывает
+// и добавляет своё. Каждая правка уходит с base_version — версией, которую
+// спортсмен видел; разошлась — сервер отвечает memory_stale, и карточка
+// перечитывается. Скрытый факт остаётся в истории и возвращается кнопкой.
+const AI_MEMORY_CHANGE_LABELS = { add: '📝 Запомнил', edit: '✎ Уточнил', hide: '🗑 Забыл' };
+
+function aiMemoryKindLabel(kind) {
+  const found = ((AIMEM.data && AIMEM.data.kinds) || []).find(k => k.id === kind);
+  const label = found ? found.label : 'прочее';
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function aiMemoryNote(text, ok) {
+  flashMsg(document.getElementById('ai-mem-msg'), text, ok, ok ? 2500 : 0);
+}
+
+function aiMemoryErrorText(e) {
+  if (e.code === 'memory_full') return 'Память заполнена — скройте лишние факты';
+  if (e.code === 'invalid_fact') return 'Факт пустой или длиннее 300 символов';
+  if (e.code === 'fact_not_found') return 'Этого факта уже нет — показана свежая память';
+  return aiErrorText(e);
+}
+
+async function aiMemoryLoad() {
+  const who = userSub;
+  try {
+    const data = await aiFetch('memory');
+    if (userSub !== who) return;          // за время запроса вошёл другой человек
+    AIMEM.data = data;
+    aiMemoryRender();
+  } catch (e) {
+    if (!e.handled && AIMEM.open) aiMemoryNote('Не удалось загрузить память тренера');
+  }
+}
+
+function aiMemoryToggle() {
+  AIMEM.open = !AIMEM.open;
+  aiMemoryRender();
+  if (AIMEM.open && !AIMEM.data) aiMemoryLoad();
+}
+
+function aiMemoryToggleHidden() {
+  AIMEM.showHidden = !AIMEM.showHidden;
+  aiMemoryRender();
+}
+
+// Строка «Запомнил: …» под ответом тренера: карточка раскрывается и
+// перечитывается — в ней уже есть то, что он только что записал.
+function aiMemoryShow() {
+  AIMEM.open = true;
+  aiMemoryRender();
+  aiMemoryLoad();
+  document.getElementById('ai-mem-body').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function aiMemoryChangesHtml(changes) {
+  return '<div class="ai-mem-changes" onclick="aiMemoryShow()" title="Открыть память тренера">'
+    + changes.map(c => `<div>${AI_MEMORY_CHANGE_LABELS[c.op] || '📝 Запомнил'}: ${escapeHtml(c.text)}</div>`).join('')
+    + '</div>';
+}
+
+function aiMemoryFactHtml(f) {
+  const id = escapeHtml(f.id);
+  const iso = String(f.updated_at || f.created_at || '');
+  const date = iso.length >= 10 ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : '';
+  if (AIMEM.editing === f.id) {
+    return `<div class="ai-mem-fact editing">
+      <input type="text" id="ai-mem-edit" maxlength="300" value="${escapeHtml(f.text)}" onkeydown="aiMemoryEditKey(event, '${id}')">
+      <div class="ai-mem-actions">
+        <button class="btn-primary" onclick="aiMemorySave('${id}')">Сохранить</button>
+        <button class="btn-sm" onclick="aiMemoryEdit(null)">Отмена</button>
+      </div>
+    </div>`;
+  }
+  const who = f.source === 'athlete' ? 'вы' : 'тренер';
+  return `<div class="ai-mem-fact">
+    <div class="ai-mem-text">${escapeHtml(f.text)}<span class="ai-mem-meta">${who} · ${escapeHtml(date)}</span></div>
+    <div class="ai-mem-actions">
+      <button class="btn-sm" title="Поправить" aria-label="Поправить" onclick="aiMemoryEdit('${id}')">✎</button>
+      <button class="btn-sm" title="Скрыть" aria-label="Скрыть" onclick="aiMemoryHide('${id}')" style="color:var(--c-danger)">✕</button>
+    </div>
+  </div>`;
+}
+
+function aiMemoryRender() {
+  const data = AIMEM.data;
+  const facts = data ? data.facts || [] : [];
+  const hidden = data ? data.hidden || [] : [];
+  document.getElementById('ai-mem-count').textContent = data ? `· ${facts.length}` : '';
+  const toggle = document.getElementById('ai-mem-toggle');
+  toggle.textContent = AIMEM.open ? 'Свернуть' : 'Показать';
+  toggle.setAttribute('aria-expanded', String(AIMEM.open));
+  document.getElementById('ai-mem-body').style.display = AIMEM.open ? '' : 'none';
+  if (!AIMEM.open) return;
+
+  const list = document.getElementById('ai-mem-list');
+  if (!data) { list.innerHTML = '<div class="empty">Загрузка…</div>'; return; }
+  list.innerHTML = facts.length
+    ? data.kinds.map(k => {
+        const group = facts.filter(f => f.kind === k.id);
+        return group.length
+          ? `<div class="ai-mem-kind">${escapeHtml(aiMemoryKindLabel(k.id))}</div>` + group.map(aiMemoryFactHtml).join('')
+          : '';
+      }).join('')
+    : '<div class="empty">Тренер пока ничего не запомнил. Расскажите ему о себе в разборе или добавьте факт сами.</div>';
+
+  const select = document.getElementById('ai-mem-kind');
+  if (!select.options.length) {
+    select.innerHTML = data.kinds.map(k =>
+      `<option value="${escapeHtml(k.id)}">${escapeHtml(aiMemoryKindLabel(k.id))}</option>`).join('');
+  }
+  const full = facts.length >= data.limits.facts;
+  const input = document.getElementById('ai-mem-text');
+  input.disabled = full;
+  input.placeholder = full ? `Память заполнена (${data.limits.facts}) — скройте лишнее` : 'Что тренеру стоит помнить';
+  document.getElementById('ai-mem-add-btn').disabled = full || AIMEM.busy;
+
+  document.getElementById('ai-mem-hidden').innerHTML = !hidden.length ? ''
+    : `<button class="btn-sm" onclick="aiMemoryToggleHidden()">${AIMEM.showHidden ? 'Свернуть скрытые' : `Скрытые (${hidden.length})`}</button>`
+      + (AIMEM.showHidden ? hidden.map(f => `<div class="ai-mem-fact is-hidden">
+          <div class="ai-mem-text">${escapeHtml(f.text)}<span class="ai-mem-meta">${escapeHtml(aiMemoryKindLabel(f.kind))}</span></div>
+          <div class="ai-mem-actions"><button class="btn-sm" ${full ? 'disabled title="Память заполнена"' : ''} onclick="aiMemoryRestore('${escapeHtml(f.id)}')">Вернуть</button></div>
+        </div>`).join('') : '');
+}
+
+// Правка памяти → true, если сервер её принял. Ответ — уже новая память.
+async function aiMemoryPost(body) {
+  if (!AIMEM.data || AIMEM.busy) return false;
+  AIMEM.busy = true;
+  aiMemoryNote('');
+  try {
+    AIMEM.data = await aiFetch('memory', { method: 'POST',
+                                           body: { ...body, base_version: AIMEM.data.version } });
+    if (body.id && body.id === AIMEM.editing) AIMEM.editing = null;
+    return true;
+  } catch (e) {
+    if (e.handled) return false;
+    aiMemoryNote(e.code === 'memory_stale'
+      ? 'Память успела измениться — показана свежая, повторите правку' : aiMemoryErrorText(e));
+    if (e.code === 'memory_stale' || e.code === 'fact_not_found') {
+      AIMEM.editing = null;
+      await aiMemoryLoad();
+    }
+    return false;
+  } finally {
+    AIMEM.busy = false;
+    aiMemoryRender();
+  }
+}
+
+async function aiMemoryAdd() {
+  const input = document.getElementById('ai-mem-text');
+  const text = input.value.trim();
+  if (!text) return;
+  const kind = document.getElementById('ai-mem-kind').value;
+  if (await aiMemoryPost({ op: 'add', kind, text })) {
+    input.value = '';
+    aiMemoryNote('Тренер будет это помнить', true);
+  }
+}
+
+function aiMemoryKey(event) {
+  if (event.key === 'Enter') { event.preventDefault(); aiMemoryAdd(); }
+}
+
+function aiMemoryEdit(id) {
+  AIMEM.editing = id;
+  aiMemoryRender();
+  const input = document.getElementById('ai-mem-edit');
+  if (input) input.focus();
+}
+
+function aiMemoryEditKey(event, id) {
+  if (event.key === 'Enter') { event.preventDefault(); aiMemorySave(id); }
+  if (event.key === 'Escape') aiMemoryEdit(null);
+}
+
+async function aiMemorySave(id) {
+  const text = document.getElementById('ai-mem-edit').value.trim();
+  if (!text) { aiMemoryNote('Пустой факт не сохранить — его можно скрыть'); return; }
+  await aiMemoryPost({ op: 'edit', id, text });
+}
+
+async function aiMemoryHide(id) {
+  if (await aiMemoryPost({ op: 'hide', id })) aiMemoryNote('Скрыто — вернуть можно из «Скрытых»', true);
+}
+
+async function aiMemoryRestore(id) {
+  await aiMemoryPost({ op: 'restore', id });
 }
 
 // Кнопку не передаём: активные пункты ищутся по имени вкладки, потому что у
@@ -3802,6 +4253,7 @@ async function saveMyCoach() {
 // офлайн-синхронизацию, а чужой план — в свой конструктор.
 const COACH = { athletes: [], athlete: null, plans: [], activePlanId: null, planId: null,
                 weeks: [], base: null, compliance: null, runs: [], runScope: 'plan', error: '',
+                weather: null,    // погода к открытому плану (#72)
                 // Правка плана (#60): черновик недель, загруженный файл, форма гонки.
                 // draftToken меняется, когда черновик подменяют целиком (см. coachCollect).
                 // draftClean — черновик сразу после открытия редактора, для coachDirty.
@@ -4078,6 +4530,39 @@ function coachOpenDay(idx, field) {
   document.getElementById('coach-day-note').value = '';
   const btn = document.getElementById('coach-day-save');
   btn.disabled = false; btn.textContent = 'Сохранить';
+  coachDaySheetMode(false);
+  document.getElementById('coach-day-wx').innerHTML = wxDetailHtml(coachDayWeather(idx, field));
+  coachDayMsg('');
+  document.getElementById('coach-day-sheet').classList.add('active');
+}
+
+// Прогноз на день плана спортсмена (#72); у плана без дат его нет.
+function coachDayWeather(idx, field) {
+  const c = COACH.compliance;
+  return c && c.dated ? dayWeather(c.weeks, COACH.weather, idx, field) : null;
+}
+
+// Лист дня у тренера — правка или только просмотр.
+function coachDaySheetMode(view) {
+  document.getElementById('coach-day-text').readOnly = view;
+  ['coach-day-note-row', 'coach-day-hint', 'coach-day-save'].forEach(id => {
+    document.getElementById(id).style.display = view ? 'none' : '';
+  });
+}
+
+// Тренер без права правки открывает день ради погоды (#72): лист только
+// для чтения, сохранить из него нечего.
+function coachViewDay(idx, field) {
+  const r = COACH.weeks[idx];
+  const day = r ? coachDayWeather(idx, field) : null;
+  if (!day) return;
+  COACH.dayEdit = { athlete: COACH.athlete, planId: COACH.planId, idx, field,
+                    was: r[field] || '', readOnly: true };
+  document.getElementById('coach-day-title').textContent =
+    `${Object.fromEntries(PLAN_DAYS)[field]} · неделя ${r.w ?? idx + 1}`;
+  document.getElementById('coach-day-text').value = COACH.dayEdit.was;
+  coachDaySheetMode(true);
+  document.getElementById('coach-day-wx').innerHTML = wxDetailHtml(day);
   coachDayMsg('');
   document.getElementById('coach-day-sheet').classList.add('active');
 }
@@ -4247,6 +4732,7 @@ async function coachSaveRace() {
     const compliance = await coachGet(`plans/${coachEnc(planId)}/compliance`);
     if (COACH.athlete !== athlete || COACH.planId !== planId) return;
     COACH.compliance = compliance;
+    coachLoadWeather(athlete, planId);   // и тренировки по датам в советах (#72)
     renderCoachAthlete();
   } catch (e) {
     if (e.editRevoked) coachCloseRaceForm();
@@ -4468,7 +4954,8 @@ async function selectCoachPlan(planId) {
   const athlete = COACH.athlete;
   coachStopEdit();
   if (COACH.raceForm === 'edit') coachCloseRaceForm();
-  Object.assign(COACH, { planId, weeks: [], base: null, compliance: null, error: 'Загрузка…' });
+  Object.assign(COACH, { planId, weeks: [], base: null, compliance: null, weather: null,
+                         error: 'Загрузка…' });
   renderCoachAthlete();
   try {
     const [state, compliance] = await Promise.all([
@@ -4483,10 +4970,22 @@ async function selectCoachPlan(planId) {
     COACH.base = bare ? null : { plan_id: state.plan_id, version: state.version };
     COACH.compliance = compliance;
     COACH.error = '';
+    coachLoadWeather(athlete, planId);
   } catch (e) {
     if (e.accessLost) return;
     COACH.error = '⚠ Не удалось загрузить план';
   }
+  renderCoachAthlete();
+}
+
+// Погода к плану спортсмена (#72) — отдельным запросом: её сбой план не ломает.
+async function coachLoadWeather(athlete, planId) {
+  let weather = null;
+  try {
+    weather = await coachGet(`plans/${coachEnc(planId)}/weather`);
+  } catch (e) {}
+  if (COACH.athlete !== athlete || COACH.planId !== planId) return;
+  COACH.weather = weather;
   renderCoachAthlete();
 }
 
@@ -4639,7 +5138,7 @@ function renderCoachPlanTable() {
   const c = COACH.compliance;
   const dated = !!(c && c.dated);
   body.innerHTML = COACH.weeks.length
-    ? planViewRowsHtml(COACH.weeks, dated ? c.weeks : null, c ? c.current_week : -1)
+    ? planViewRowsHtml(COACH.weeks, dated ? c.weeks : null, c ? c.current_week : -1, COACH.weather)
     : coachEmptyPlanHtml();
 }
 
@@ -4655,7 +5154,8 @@ function renderCoachPlanWeek() {
   const cw = c.current_week;
   const idx = Math.max(0, Math.min(COACH.weeks.length - 1, COACH.weekIdx ?? cw));
   el.innerHTML = planWeekHtml(COACH.weeks, c.dated ? c.weeks : null, cw, idx,
-    { onStep: 'coachWeekStep', onToday: 'coachWeekToday', onDay: coachPlanEditable() ? 'coachOpenDay' : '' });
+    { onStep: 'coachWeekStep', onToday: 'coachWeekToday', onDay: coachPlanEditable() ? 'coachOpenDay' : '',
+      onView: 'coachViewDay', weather: COACH.weather });
 }
 
 function renderCoachChart() {
