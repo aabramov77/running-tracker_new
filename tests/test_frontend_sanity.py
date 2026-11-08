@@ -602,7 +602,7 @@ def test_coach_screen_keeps_out_of_own_data():
     assert "showCoachRunDetail" in section, "секция тренера найдена не целиком"
     assert "localStorage" not in section
     for own in ("runs", "PLAN", "PLANS", "COMPLIANCE", "ACTIVE_PLAN", "races",
-                "dayEdit", "planWeekIdx", "planWeekPlanId", "LOAD"):
+                "dayEdit", "planWeekIdx", "planWeekPlanId", "LOAD", "WEATHER"):
         assert not re.search(rf"(?<![.\w]){own}\s*=[^=]", section), f"запись в {own}"
     # и чужой план не уходит в свои функции записи (#60) и свой лист дня (#62)
     for own_write in ("postPlanWeeks", "savePlanEdits", "rememberPlan", "loadPlan()",
@@ -1391,3 +1391,19 @@ def test_weather_credits_the_provider():
     assert "https://open-meteo.com/" in js
     assert "WX_SOURCE" in _js_section(js, "function wxDetailHtml(", "\n}\n")
     assert "WX_SOURCE" in _js_section(js, "function planViewRowsHtml(", "\n}\n")
+
+
+def test_coach_gets_weather_for_the_athletes_plan():
+    """Погода у тренера (#72): своя переменная, свой маршрут, лист дня
+    без права правки — только для просмотра."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "coachLoadWeather(athlete, planId);" in _js_section(js, "async function selectCoachPlan(", "\n}\n")
+    assert "COACH.weather" in _fn(js, "renderCoachPlanTable")
+    week = _fn(js, "renderCoachPlanWeek")
+    assert "onView: 'coachViewDay'" in week and "weather: COACH.weather" in week
+    view = _fn(js, "coachViewDay")
+    assert "readOnly: true" in view and "coachDaySheetMode(true)" in view
+    assert "coachDaySheetMode(false)" in _fn(js, "coachOpenDay")
+    html = INDEX.read_text(encoding="utf-8")
+    for el in ("coach-day-wx", "coach-day-note-row", "coach-day-hint", "coach-day-save"):
+        assert f'id="{el}"' in html, el

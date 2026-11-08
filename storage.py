@@ -2461,6 +2461,25 @@ def coach_load_view(load):
     }
 
 
+_WEATHER_DAY_KEYS = ("date", "field", "week_idx", "workout", "kind", "weather", "level",
+                     "why", "flags", "venue", "clothing", "notes")
+
+
+def coach_weather_view(report):
+    """Погода к плану спортсмена для тренера (#72) — собрана заново по белому
+    списку. Координат места здесь нет по построению: тренеру хватает города."""
+    location = report.get("location")
+    return {
+        "plan_id": report.get("plan_id"),
+        "status": report.get("status"),
+        "source": report.get("source"),
+        "run_time": report.get("run_time"),
+        "today": report.get("today"),
+        "location": {"name": location.get("name", "")} if isinstance(location, dict) else None,
+        "days": [_pick(d, _WEATHER_DAY_KEYS) for d in report.get("days") or []],
+    }
+
+
 LLM_RACES_DAYS = 730           # забеги в контексте — за два года (#81)
 LLM_RACES_MAX = 10
 
@@ -2536,6 +2555,15 @@ def build_llm_context(bucket, sub):
                 plan = plan_data["weeks"]
                 plan_version = plan_data["version"]
 
+    # Погода (#72) к дням активного плана. Сбой провайдера не роняет ход ИИ:
+    # блока прогноза в промпте просто не будет.
+    weather = None
+    if profile.get("location"):
+        try:
+            weather = weather_report(profile, plan or [], (active_plan or {}).get("plan_start"))
+        except Exception:
+            logging.exception("weather: прогноз для контекста ИИ не собран")
+
     week_idx = current_plan_week_idx(active_plan.get("plan_start") if active_plan else None,
                                      len(plan) if plan else 0, weeks=plan)
     current_week = plan[week_idx] if plan and 0 <= week_idx < len(plan) else None
@@ -2578,6 +2606,7 @@ def build_llm_context(bucket, sub):
         "profile_version": profile_version,
         "load": training_load,
         "history": history,
+        "weather": weather,
         "personal_bests": personal_bests(all_races),
         "last_runs": last_runs,
         "last_races": last_races,

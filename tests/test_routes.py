@@ -817,7 +817,7 @@ def test_run_hidden_by_athlete_is_hidden_from_the_coach(api, patched_api, fake_b
 
 def test_coach_gets_404_for_unknown_plan_of_own_athlete(api, patched_api, fake_bucket):
     _coached(api, patched_api, fake_bucket)
-    for tail in ("weeks", "compliance"):
+    for tail in ("weeks", "compliance", "weather"):
         path = f"/coach/athletes/u1/plans/no-such-plan/{tail}"
         assert _status(api(FakeRequest("GET", path), **COACH)) == 404
 
@@ -1576,3 +1576,38 @@ def test_plan_weather_gives_advice_for_plan_days(api, patched_api, fake_bucket, 
         (_local_today().isoformat(), "quality", 0)
     assert today["venue"]["code"] == "outdoor" and today["clothing"]["top"]
     assert athlete_data() == before                         # погода в GCS не пишется
+
+
+# ── Погода у тренера (#72) ────────────────────────────────────────────────────
+
+def _coached_with_weather(api, patched_api, fake_bucket, monkeypatch):
+    _coached(api, patched_api, fake_bucket)
+    plan_id = _plan_for_this_week(patched_api, fake_bucket)
+    assert _status(api(FakeRequest("POST", "/profile", {"profile": WEATHER_PROFILE}))) == 201
+    _forecast_online(monkeypatch)
+    return plan_id
+
+
+def test_coach_sees_weather_with_the_city_but_without_coordinates(api, patched_api,
+                                                                   fake_bucket, monkeypatch):
+    plan_id = _coached_with_weather(api, patched_api, fake_bucket, monkeypatch)
+    body, code, _ = api(FakeRequest("GET", f"/coach/athletes/u1/plans/{plan_id}/weather"), **COACH)
+    report = json.loads(body)
+    assert code == 200 and report["status"] == "ok"
+    assert report["location"] == {"name": "Москва"}
+    assert "55.75" not in body and "37.62" not in body
+    own = json.loads(api(FakeRequest("GET", f"/plans/{plan_id}/weather"))[0])
+    assert report["days"] == own["days"]
+
+
+def test_view_only_coach_sees_the_weather(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _coached_with_weather(api, patched_api, fake_bucket, monkeypatch)
+    assert _status(api(FakeRequest("POST", "/my/coach/plan-edit", {"allow": False}))) == 200
+    path = f"/coach/athletes/u1/plans/{plan_id}/weather"
+    assert _status(api(FakeRequest("GET", path), **COACH)) == 200
+
+
+def test_stranger_gets_no_weather_of_the_athlete(api, patched_api, fake_bucket, monkeypatch):
+    plan_id = _coached_with_weather(api, patched_api, fake_bucket, monkeypatch)
+    path = f"/coach/athletes/u1/plans/{plan_id}/weather"
+    assert _status(api(FakeRequest("GET", path), sub="x9", email="x9@example.com")) != 200

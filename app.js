@@ -4253,6 +4253,7 @@ async function saveMyCoach() {
 // офлайн-синхронизацию, а чужой план — в свой конструктор.
 const COACH = { athletes: [], athlete: null, plans: [], activePlanId: null, planId: null,
                 weeks: [], base: null, compliance: null, runs: [], runScope: 'plan', error: '',
+                weather: null,    // погода к открытому плану (#72)
                 // Правка плана (#60): черновик недель, загруженный файл, форма гонки.
                 // draftToken меняется, когда черновик подменяют целиком (см. coachCollect).
                 // draftClean — черновик сразу после открытия редактора, для coachDirty.
@@ -4529,6 +4530,39 @@ function coachOpenDay(idx, field) {
   document.getElementById('coach-day-note').value = '';
   const btn = document.getElementById('coach-day-save');
   btn.disabled = false; btn.textContent = 'Сохранить';
+  coachDaySheetMode(false);
+  document.getElementById('coach-day-wx').innerHTML = wxDetailHtml(coachDayWeather(idx, field));
+  coachDayMsg('');
+  document.getElementById('coach-day-sheet').classList.add('active');
+}
+
+// Прогноз на день плана спортсмена (#72); у плана без дат его нет.
+function coachDayWeather(idx, field) {
+  const c = COACH.compliance;
+  return c && c.dated ? dayWeather(c.weeks, COACH.weather, idx, field) : null;
+}
+
+// Лист дня у тренера — правка или только просмотр.
+function coachDaySheetMode(view) {
+  document.getElementById('coach-day-text').readOnly = view;
+  ['coach-day-note-row', 'coach-day-hint', 'coach-day-save'].forEach(id => {
+    document.getElementById(id).style.display = view ? 'none' : '';
+  });
+}
+
+// Тренер без права правки открывает день ради погоды (#72): лист только
+// для чтения, сохранить из него нечего.
+function coachViewDay(idx, field) {
+  const r = COACH.weeks[idx];
+  const day = r ? coachDayWeather(idx, field) : null;
+  if (!day) return;
+  COACH.dayEdit = { athlete: COACH.athlete, planId: COACH.planId, idx, field,
+                    was: r[field] || '', readOnly: true };
+  document.getElementById('coach-day-title').textContent =
+    `${Object.fromEntries(PLAN_DAYS)[field]} · неделя ${r.w ?? idx + 1}`;
+  document.getElementById('coach-day-text').value = COACH.dayEdit.was;
+  coachDaySheetMode(true);
+  document.getElementById('coach-day-wx').innerHTML = wxDetailHtml(day);
   coachDayMsg('');
   document.getElementById('coach-day-sheet').classList.add('active');
 }
@@ -4698,6 +4732,7 @@ async function coachSaveRace() {
     const compliance = await coachGet(`plans/${coachEnc(planId)}/compliance`);
     if (COACH.athlete !== athlete || COACH.planId !== planId) return;
     COACH.compliance = compliance;
+    coachLoadWeather(athlete, planId);   // и тренировки по датам в советах (#72)
     renderCoachAthlete();
   } catch (e) {
     if (e.editRevoked) coachCloseRaceForm();
@@ -4919,7 +4954,8 @@ async function selectCoachPlan(planId) {
   const athlete = COACH.athlete;
   coachStopEdit();
   if (COACH.raceForm === 'edit') coachCloseRaceForm();
-  Object.assign(COACH, { planId, weeks: [], base: null, compliance: null, error: 'Загрузка…' });
+  Object.assign(COACH, { planId, weeks: [], base: null, compliance: null, weather: null,
+                         error: 'Загрузка…' });
   renderCoachAthlete();
   try {
     const [state, compliance] = await Promise.all([
@@ -4934,10 +4970,22 @@ async function selectCoachPlan(planId) {
     COACH.base = bare ? null : { plan_id: state.plan_id, version: state.version };
     COACH.compliance = compliance;
     COACH.error = '';
+    coachLoadWeather(athlete, planId);
   } catch (e) {
     if (e.accessLost) return;
     COACH.error = '⚠ Не удалось загрузить план';
   }
+  renderCoachAthlete();
+}
+
+// Погода к плану спортсмена (#72) — отдельным запросом: её сбой план не ломает.
+async function coachLoadWeather(athlete, planId) {
+  let weather = null;
+  try {
+    weather = await coachGet(`plans/${coachEnc(planId)}/weather`);
+  } catch (e) {}
+  if (COACH.athlete !== athlete || COACH.planId !== planId) return;
+  COACH.weather = weather;
   renderCoachAthlete();
 }
 
@@ -5090,7 +5138,7 @@ function renderCoachPlanTable() {
   const c = COACH.compliance;
   const dated = !!(c && c.dated);
   body.innerHTML = COACH.weeks.length
-    ? planViewRowsHtml(COACH.weeks, dated ? c.weeks : null, c ? c.current_week : -1)
+    ? planViewRowsHtml(COACH.weeks, dated ? c.weeks : null, c ? c.current_week : -1, COACH.weather)
     : coachEmptyPlanHtml();
 }
 
@@ -5106,7 +5154,8 @@ function renderCoachPlanWeek() {
   const cw = c.current_week;
   const idx = Math.max(0, Math.min(COACH.weeks.length - 1, COACH.weekIdx ?? cw));
   el.innerHTML = planWeekHtml(COACH.weeks, c.dated ? c.weeks : null, cw, idx,
-    { onStep: 'coachWeekStep', onToday: 'coachWeekToday', onDay: coachPlanEditable() ? 'coachOpenDay' : '' });
+    { onStep: 'coachWeekStep', onToday: 'coachWeekToday', onDay: coachPlanEditable() ? 'coachOpenDay' : '',
+      onView: 'coachViewDay', weather: COACH.weather });
 }
 
 function renderCoachChart() {

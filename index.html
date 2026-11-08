@@ -1154,15 +1154,16 @@
         <div class="card-title" id="coach-day-title" style="margin:0"></div>
         <button class="btn-sm" onclick="coachCloseDay()" style="color:var(--text-muted);font-size:16px">✕</button>
       </div>
+      <div id="coach-day-wx"></div>
       <div class="form-group">
         <label for="coach-day-text">Тренировка по плану</label>
         <textarea id="coach-day-text" rows="3" placeholder="Например: 8 км легко. Пусто — отдых"></textarea>
       </div>
-      <div class="form-group" style="margin-top:10px">
+      <div class="form-group" id="coach-day-note-row" style="margin-top:10px">
         <label for="coach-day-note">Комментарий</label>
         <input type="text" id="coach-day-note" maxlength="150" placeholder="Необязательно — увидит спортсмен">
       </div>
-      <p class="hint" style="margin:8px 0 0">Сохранение создаёт новую версию плана спортсмена, прежняя остаётся в истории. Спортсмен увидит сообщение о правке в диалоге.</p>
+      <p class="hint" id="coach-day-hint" style="margin:8px 0 0">Сохранение создаёт новую версию плана спортсмена, прежняя остаётся в истории. Спортсмен увидит сообщение о правке в диалоге.</p>
       <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn-primary" id="coach-day-save" onclick="coachSaveDay()">Сохранить</button>
         <button class="btn-sm" onclick="coachCloseDay()">Отмена</button>

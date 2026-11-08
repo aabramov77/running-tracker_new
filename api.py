@@ -35,6 +35,7 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      clean_proposal, clean_race, clean_run,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
+                     coach_weather_view,
                      create_ai_thread, create_plan,
                      current_coach, delete_race, delete_run,
                      find_own_run, find_plan, get_active_plan,
@@ -308,6 +309,15 @@ def h_coach_plan_compliance(c):
     if result is None:
         return jresp({"error": "plan not found"}, 404)
     return jresp(result, 200)
+
+
+def h_coach_plan_weather(c):
+    """Погода к плану спортсмена (#72): хватает права на просмотр. Город —
+    без координат, их убирает белый список coach_weather_view."""
+    result = build_plan_weather(c.bucket, _coached_athlete(c), c.args[1])
+    if result is None:
+        return jresp({"error": "plan not found"}, 404)
+    return jresp(coach_weather_view(result), 200)
 
 
 def h_coach_runs(c):
@@ -1222,6 +1232,7 @@ ROUTES = [
     ("POST",   r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weeks$",      h_coach_plan_weeks_post, False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/history$",    h_coach_plan_history,    False),
     ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/compliance$", h_coach_plan_compliance, False),
+    ("GET",    r"^/coach/athletes/([\w-]+)/plans/([\w-]+)/weather$",    h_coach_plan_weather,    False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs$",                      h_coach_runs,            False),
     ("GET",    r"^/coach/athletes/([\w-]+)/runs/(\d+)/details$",        h_coach_run_details,     False),
     ("GET",    r"^/coach/athletes/([\w-]+)/load$",                      h_coach_load,            False),

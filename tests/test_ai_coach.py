@@ -1278,3 +1278,65 @@ def test_profile_block_prints_the_threshold_with_its_source(storage_module):
             in llm_prompt.format_profile_block({}, estimate, []))
     assert not [line for line in llm_prompt.format_profile_block({}, {}, [])
                 if line.startswith("Пороговый темп")]
+
+
+# ── Погода в контексте ИИ (#72) ───────────────────────────────────────────────
+
+def _with_location(storage_module, fake_bucket):
+    profile, _ = storage_module.clean_athlete_profile({
+        "location": {"name": "Москва", "lat": 55.75, "lon": 37.62},
+        "run_time": "07:30", "venues": ["manege"], "cold_sensitivity": "cold"})
+    storage_module.write_athlete_version(fake_bucket, SUB, profile, "город")
+
+
+def test_context_survives_a_weather_provider_failure(storage_module, fake_bucket):
+    """Сеть в тестах выключена — как упавший Open-Meteo: ход ИИ не падает."""
+    import llm_prompt
+    _with_location(storage_module, fake_bucket)
+    ctx = storage_module.build_llm_context(fake_bucket, SUB)
+    assert ctx["weather"]["status"] == "unavailable"
+    assert "Прогноз погоды" not in llm_prompt.format_context_for_llm(ctx)
+
+
+def test_context_without_city_has_no_weather(storage_module, fake_bucket):
+    assert storage_module.build_llm_context(fake_bucket, SUB)["weather"] is None
+
+
+def test_weather_block_in_prompt_without_place(storage_module, fake_bucket, monkeypatch):
+    import llm_prompt
+    import weather
+    from datetime import datetime, timedelta
+    from test_weather import raw_forecast
+    first = (datetime.utcnow() + timedelta(hours=3)).date() - timedelta(days=1)
+    monkeypatch.setattr(weather, "_http_get", lambda url, params: raw_forecast(first=first))
+    _with_location(storage_module, fake_bucket)
+    text = llm_prompt.format_context_for_llm(storage_module.build_llm_context(fake_bucket, SUB))
+    assert "Прогноз погоды (в 07:30, по месту бега):" in text
+    assert "пасмурно, +10° (ощущается +10°), ветер 2 м/с" in text
+    assert "Условия: кроме улицы — манеж; обычно бегает в 07:30; мёрзнет быстрее других" in text
+    # город и координаты модели не нужны
+    assert "Москва" not in text and "55.75" not in text and "37.62" not in text
+
+
+def test_old_context_without_weather_prints_no_block(storage_module, fake_bucket):
+    import llm_prompt
+    ctx = storage_module.build_llm_context(fake_bucket, SUB)
+    ctx.pop("weather")
+    assert "Прогноз погоды" not in llm_prompt.format_context_for_llm(ctx)
+
+
+def test_weather_block_shows_the_rule_advice():
+    import llm_prompt
+    day = {"date": "2026-11-10", "field": "tue", "workout": "6×800", "kind": "quality",
+           "level": "hard", "why": "скользко",
+           "venue": {"code": "manege", "label": "Манеж", "why": "скользко"},
+           "weather": {"summary": "небольшой снег",
+                       "at_run": {"t": -1, "feels": -5, "wind": 4, "precip_mm": 0.4}}}
+    rest = {**day, "date": "2026-11-11", "field": "wed", "workout": "", "kind": "rest",
+            "venue": None, "level": "danger", "why": "гроза"}
+    lines = llm_prompt.format_weather_block({"status": "ok", "run_time": "08:00",
+                                             "days": [day, rest]})
+    assert lines[1] == ("  - вт 10.11: небольшой снег, −1° (ощущается −5°), ветер 4 м/с, "
+                        "осадки 0.4 мм; в плане «6×800» → Манеж (скользко)")
+    assert lines[2].endswith("; гроза")
+    assert llm_prompt.format_weather_block({"status": "no_location", "days": []}) == []

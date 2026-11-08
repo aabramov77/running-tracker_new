@@ -9,6 +9,7 @@ from datetime import datetime
 from domain import (DIST_LABEL_KM, FEEL_LABELS, MEMORY_FACTS_MAX, MEMORY_KIND_LABELS,
                     MEMORY_OPS_MAX, MEMORY_TEXT_MAX, PLAN_DAYS, PLAN_PHASE_LABELS,
                     SEX_LABELS, TYPE_LABELS)
+from weather import deg
 
 def plural_ru(number, one, few, many):
     """«1 тренировка», «3 тренировки», «5 тренировок» — промпт читает человек тоже."""
@@ -109,6 +110,19 @@ def format_profile_block(profile, derived, bests):
     if schedule:
         lines.append("Расписание: " + "; ".join(schedule))
 
+    # Погода (#72): где ещё можно бегать и когда. Город и координаты в промпт
+    # не идут — модели хватает прогноза.
+    conditions = []
+    venues = [VENUE_RU[v] for v in profile.get("venues") or [] if v in VENUE_RU]
+    if venues:
+        conditions.append("кроме улицы — " + ", ".join(venues))
+    if profile.get("run_time"):
+        conditions.append(f"обычно бегает в {profile['run_time']}")
+    if profile.get("cold_sensitivity") in COLD_RU:
+        conditions.append(COLD_RU[profile["cold_sensitivity"]])
+    if conditions:
+        lines.append("Условия: " + "; ".join(conditions))
+
     if bests:
         lines.append("Личные рекорды: " + ", ".join(
             f"{b['km']:g} км {b['time']}" + (f" ({b['date']})" if b.get("date") else "")
@@ -120,6 +134,39 @@ def format_profile_block(profile, derived, bests):
         lines.append(f"От спортсмена: {profile['notes']}")
 
     return lines
+
+VENUE_RU = {"treadmill": "дорожка в зале", "manege": "манеж"}
+COLD_RU = {"cold": "мёрзнет быстрее других", "warm": "быстро перегревается"}
+
+
+def format_weather_block(weather):
+    """Прогноз к дням плана (#72): погода в час тренировки и совет по правилам.
+
+    Совет — не приказ модели: она видит, что предлагают правила, и может
+    объяснить или поправить это в ответе. Без прогноза блока нет.
+    """
+    if not weather or weather.get("status") != "ok" or not weather.get("days"):
+        return []
+    day_ru = dict(PLAN_DAYS)
+    lines = [f"Прогноз погоды (в {weather.get('run_time')}, по месту бега):"]
+    for day in weather["days"]:
+        w, r = day["weather"], day["weather"]["at_run"]
+        parts = [f"{w['summary']}, {deg(r['t'])} (ощущается {deg(r['feels'])})",
+                 f"ветер {r['wind']} м/с"]
+        if r.get("precip_mm"):
+            parts.append(f"осадки {r['precip_mm']:g} мм")
+        when = f"{day_ru.get(day['field'], day['field'])} {day['date'][8:]}.{day['date'][5:7]}"
+        line = f"  - {when}: " + ", ".join(parts)
+        if day.get("workout"):
+            line += f"; в плане «{day['workout']}»"
+        venue = day.get("venue")
+        if venue:
+            line += f" → {venue['label']}" + (f" ({venue['why']})" if venue.get("why") else "")
+        elif day.get("level") != "ok" and day.get("why"):
+            line += f"; {day['why']}"
+        lines.append(line)
+    return lines
+
 
 def _week_days_str(week):
     """Строка тренировок недели по дням; пустые/отсутствующие дни пропускаются."""
@@ -366,6 +413,12 @@ def format_context_for_llm(ctx):
         lines.append("План следующей недели:")
         lines.append("  " + _week_days_str(nw))
 
+    # Контекст, собранный до #72, ключа weather не знает — блока тогда нет.
+    weather_block = format_weather_block(ctx.get("weather"))
+    if weather_block:
+        lines.append("")
+        lines.extend(weather_block)
+
     compliance_block = format_compliance_block(ctx.get("compliance"))
     if compliance_block:
         lines.append("")
@@ -449,6 +502,7 @@ COACH_CHAT_SYSTEM_PROMPT = """Ты опытный беговой тренер, �
 - Учитывай профиль: возраст, пульсовые показатели, ограничения по здоровью и дни, доступные для тренировок. Не предлагай тренировки в недоступные дни. Оценочные значения помечены явно — не выдавай их за измеренные.
 - По тренировкам у тебя есть темп, средний и максимальный пульс, каденс, набор высоты, круги, дрейф пульса, время в пульсовых зонах, недельная нагрузка по темпу (rTSS) и по пульсу (TRIMP) с отношением к обычной, цена работы, помесячная история за год, ощущения и заметки спортсмена. Других показателей часов (HRV, training effect, время восстановления, готовность к тренировке и т. п.) в данных нет: учитывай их, только если спортсмен сам о них написал, и не требуй их.
 - Жару, ветер, недосып и стресс учитывай по заметкам спортсмена, рельеф — по набору высоты. Если тренировка вышла заметно хуже ожидаемого без видимой причины — спроси о них.
+- Прогноз погоды на ближайшие дни, если он есть в данных, учитывай в советах о месте и времени тренировки. При опасной погоде (гроза, гололёд, сильный мороз или жара) предложи провести тренировку в помещении или переставить её на другой день — с учётом доступных дней.
 - Ты не врач и диагнозов не ставишь. При жалобах на боль или тревожных симптомах советуй снизить нагрузку и обратиться к специалисту.
 - Отвечай на заданный вопрос и конкретно: темпы, пульс, километры, дни недели. Без шаблонных фраз. Не пересказывай данные, которые спортсмен и так видит.
 - Каждую корректировку объясняй: почему именно она. Сорванную или выполненную хуже плана тренировку не компенсируй дополнительной нагрузкой.
