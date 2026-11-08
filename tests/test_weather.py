@@ -281,6 +281,13 @@ def test_indoor_clothing_ignores_the_weather():
     assert wear(-20, venue="treadmill")["hands"] == ""
 
 
+def test_dark_note_names_sunrise_in_the_morning_and_sunset_in_the_evening():
+    morning = " ".join(w.advice_notes(w.day_weather(forecast(), TODAY, (7, 0)), c.WORKOUT_EASY, None))
+    evening = " ".join(w.advice_notes(w.day_weather(forecast(), TODAY, (17, 0)), c.WORKOUT_EASY, None))
+    assert "Темно (рассвет в 07:48)" in morning
+    assert "Темно (закат в 16:37)" in evening
+
+
 # ── Неделя целиком ────────────────────────────────────────────────────────────
 
 # Строка плана пн 02.11 – вс 08.11 и следующая

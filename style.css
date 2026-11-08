@@ -854,7 +854,8 @@ table.plan tr.wx-row:hover td { background: var(--bg-card); }
 .wx-detail .wx-meta { font-size: 12px; color: var(--text-muted); }
 .wx-detail .wx-venue { margin-top: 6px; font-weight: 500; }
 .wx-zones { display: grid; gap: 2px; margin-top: 6px; }
-.wx-zones span { display: inline-block; min-width: 64px; color: var(--text-muted); }
+.wx-zones div { display: grid; grid-template-columns: 64px 1fr; gap: 6px; }
+.wx-zones span { color: var(--text-muted); }
 .wx-notes { margin: 6px 0 0 18px; font-size: 12px; }
 .city-row { display: flex; gap: 6px; flex-wrap: wrap; }
 .city-row input { flex: 1; min-width: 160px; }

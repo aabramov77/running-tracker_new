@@ -410,9 +410,10 @@ def advice_notes(wx, kind, venue):
     if outdoor and "wind" in flags:
         notes.append("Ветер: первую половину — против ветра, обратно — по ветру")
     if outdoor and "dark" in flags:
-        sun = wx["public"]["sunrise"] if wx["public"]["at_run"]["time"] < "12:00" \
-            else wx["public"]["sunset"]
-        notes.append(f"Темно (рассвет/закат в {sun}): светлая одежда, светоотражатели")
+        public = wx["public"]
+        sun = f"рассвет в {public['sunrise']}" if public["at_run"]["time"] < "12:00" \
+            else f"закат в {public['sunset']}"
+        notes.append(f"Темно ({sun}): светлая одежда, светоотражатели")
     if outdoor and wx["cooler"]:
         notes.append(f"Прохладнее всего в {wx['cooler']['time']}: "
                      f"ощущается {deg(wx['cooler']['feels'])}")
