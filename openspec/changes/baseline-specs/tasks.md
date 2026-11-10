@@ -33,17 +33,17 @@
 
 ## 4. Волна 3 — тренер и интерфейс
 
-- [ ] 4.1 `coach-access` — проверка: `openspec validate baseline-specs --strict`
-- [ ] 4.2 `coach-plan-editing` — проверка: то же
-- [ ] 4.3 `coach-chat` — проверка: то же
-- [ ] 4.4 `landing-page` — проверка: то же
-- [ ] 4.5 `mobile-layout` — проверка: то же
-- [ ] 4.6 Сверка волны 3 с кодом — проверка: как в 2.9
-- [ ] 4.7 Ревью волны 3 пользователем — проверка: замечания внесены, волна закоммичена
+- [x] 4.1 `coach-access` — проверка: `openspec validate baseline-specs --strict`
+- [x] 4.2 `coach-plan-editing` — проверка: то же
+- [x] 4.3 `coach-chat` — проверка: то же
+- [x] 4.4 `landing-page` — проверка: то же
+- [x] 4.5 `mobile-layout` — проверка: то же
+- [x] 4.6 Сверка волны 3 с кодом — проверка: как в 2.9
+- [x] 4.7 Ревью волны 3 пользователем — проверка: замечания внесены, волна закоммичена
 
 ## 5. Итоговая проверка
 
-- [ ] 5.1 Весь change — проверка: `openspec validate baseline-specs --strict` без ошибок и предупреждений, в `specs/` 21 capability, каждая из proposal.md
+- [x] 5.1 Весь change — проверка: `openspec validate baseline-specs --strict` без ошибок и предупреждений, в `specs/` 21 capability, каждая из proposal.md
 
 ## Workflow follow-up
 
