@@ -1,0 +1,37 @@
+schema: spec-driven
+
+context: |
+  Language: Russian
+  All artifacts must be written in Russian.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  Проект: веб-трекер беговых тренировок (running-tracker).
+  Стек: фронтенд — статические index.html / app.js / style.css без сборщика;
+  бэкенд — Python Cloud Run Function (main.py, api.py, storage.py), тесты pytest.
+  Данные — в GCS bucket running-tracker-aabramov77.
+  Хранилище только append-only: без физического удаления и перезаписи,
+  каждая правка — новая версия, удаление — логическое (подробно в CLAUDE.md).
+  Фичи ведутся GitHub Issues в aabramov77/running-tracker_new; изменения
+  идут через ветку Dev, в main — только merge из Dev.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
