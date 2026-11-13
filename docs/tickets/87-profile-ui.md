@@ -3,15 +3,16 @@
 - Issue: https://github.com/aabramov77/running-tracker_new/issues/87
 - Ветка: `Dev`
 - Коммиты: `feat: #87 …`
-- PR: `Dev → main`, в теле `Closes #87`
-- OpenSpec: `openspec/changes/profile-ui-blocks/` — proposal, design, дельты
-  к спекам `athlete-profile`, `coach-access`, `llm-config`, tasks.
-  Требования и задачи ведутся там; этот файл — контекст, замеры и история
+- PR: [#88](https://github.com/aabramov77/running-tracker_new/pull/88) `Dev → main`, `Closes #87`
+- OpenSpec: change `profile-ui-blocks` в архиве —
+  `openspec/changes/archive/2026-11-13-profile-ui-blocks/` (proposal, design,
+  дельты, tasks). Требования — в основных спеках `athlete-profile`,
+  `coach-access`, `llm-config`; этот файл — контекст, замеры и история
   решений.
 - Статус: концепция согласована 2026-11-11 — «сводка + правка по блокам»,
   оформление через OpenSpec; 2026-11-13 — «Мой тренер» и «Настройки LLM»
-  тоже переводятся на блоки. Реализовано 2026-11-13 (см. «Реализация» в
-  конце файла); OpenSpec-change ждёт архивации после мержа в `main`.
+  тоже переводятся на блоки. Реализовано и смержено 2026-11-13 (см.
+  «Реализация» в конце файла), change заархивирован.
 
 ## Контекст
 
@@ -194,10 +195,10 @@ Issue: «Текущая реализация профиля достаточно
 ### Документация
 
 - `README.md` — разделы о профиле, тренере и настройке ИИ.
-- Спеки: семь новых требований в `athlete-profile`, по два — в
-  `coach-access` и `llm-config`. Дельты лежат в
-  `openspec/changes/profile-ui-blocks/specs/`; в основные спеки попадают
-  при архивации change.
+- Спеки: семь новых требований в `athlete-profile`, два — в
+  `coach-access`, три — в `llm-config`. При архивации change они перенесены
+  в основные спеки; дельты остались в
+  `openspec/changes/archive/2026-11-13-profile-ui-blocks/specs/`.
 
 ## Порядок работ
 
@@ -264,7 +265,8 @@ Issue: «Текущая реализация профиля достаточно
 
 ## Реализация
 
-Сделано 2026-11-13 по `openspec/changes/profile-ui-blocks/tasks.md`.
+Сделано 2026-11-13 по `tasks.md` change (теперь
+`openspec/changes/archive/2026-11-13-profile-ui-blocks/tasks.md`).
 Бэкенд, API и формат данных не менялись. `pytest`: 1526 passed, 1 skipped.
 
 ### Замер
