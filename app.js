@@ -176,6 +176,7 @@ function signOut() {
   LOAD = null;                // #66: и его нагрузка тоже
   endRunEdit(); endRaceEdit();  // #76: и его незаконченная правка
   resetHidden();                //       и его скрытые записи
+  profileReset();               // #87: и открытый блок профиля с введённым
   localStorage.removeItem('g_id_token');
   localStorage.removeItem(SIGNED_IN_BEFORE_KEY);   // #65: вышел сам — One Tap не навязываем
   if (window.google) google.accounts.id.disableAutoSelect();
@@ -184,6 +185,7 @@ function signOut() {
 
 function handleAuthError() {
   idToken = null; currentRole = null;
+  profileReset();   // #87: войти может другой — введённое в профиль ему не достаётся
   localStorage.removeItem('g_id_token');
   showLanding();
 }
@@ -1133,7 +1135,7 @@ function renderWeatherNote() {
   try { hidden = localStorage.getItem(weatherHintKey()) === '1'; } catch (e) {}
   const status = (!planEditMode && PLAN?.length && WEATHER) ? WEATHER.status : null;
   const html = status === 'no_location' && !hidden
-    ? '🌦 Укажите город в <a href="#" onclick="showTab(\'profile\');return false">профиле</a> — '
+    ? '🌦 Укажите город в <a href="#" onclick="showProfileBlock(\'weather\', \'pr-city\');return false">профиле</a> — '
       + 'в плане появятся прогноз и советы, что надеть и где бежать. '
       + '<a href="#" onclick="hideWeatherHint();return false">Скрыть</a>'
     : status === 'unavailable' ? '🌦 Прогноз погоды сейчас недоступен — советы появятся, когда он загрузится.' : '';
@@ -2979,7 +2981,7 @@ function updateModelOptions() {
     `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join('');
 }
 
-// ── Профиль спортсмена (#32) ──
+/// ── Профиль спортсмена (#32) ──
 
 const PROFILE_FIELD_MAP = {
   full_name: 'pr-full-name', birth_date: 'pr-birth-date', sex: 'pr-sex',
@@ -3018,6 +3020,231 @@ let PROFILE_ZONES_MANUAL = false;
 // что мы успешно загрузили: иначе неудачная загрузка + «Сохранить» затрут
 // заполненный профиль пустыми полями.
 let PROFILE_LOADED = false;
+
+// ── Профиль по блокам (#87) ──
+// Вкладка открывается сводкой: блоки показывают значения текстом.
+// «Изменить» раскрывает поля одного блока; на вкладке открыт не больше
+// одного блока. Блоки профиля пишутся тем же POST /profile, что и раньше:
+// поля закрытых блоков всегда равны последнему ответу сервера, поэтому
+// уходит весь профиль, а меняются только поля открытого блока. «Мой
+// тренер» и «Настройки LLM» — такие же блоки со своей записью.
+const PROFILE_BLOCKS = {
+  personal: { title: 'Личное', kind: 'profile', focus: 'pr-full-name',
+              fields: ['full_name', 'birth_date', 'sex', 'height_cm', 'weight_kg'] },
+  hr:       { title: 'Пульс и зоны', kind: 'profile', focus: 'pr-hr-max',
+              fields: ['hr_max', 'hr_threshold', 'hr_rest', 'hr_zones_custom'] },
+  pace:     { title: 'Порог и МПК', kind: 'profile', focus: 'pr-threshold-pace',
+              fields: ['threshold_pace_sec', 'vo2max'] },
+  training: { title: 'Режим тренировок', kind: 'profile', focus: 'pr-sessions',
+              fields: ['sessions_per_week', 'weekly_km_typical', 'years_running', 'long_run_day', 'available_days'] },
+  weather:  { title: 'Погода и место', kind: 'profile', focus: 'pr-city',
+              fields: ['location', 'run_time', 'cold_sensitivity', 'venues'] },
+  health:   { title: 'Здоровье и пожелания', kind: 'profile', focus: 'pr-injuries',
+              fields: ['injuries', 'notes'] },
+  coach:    { title: 'Мой тренер', kind: 'coach', focus: 'coach-select' },
+  llm:      { title: 'Настройки LLM', kind: 'llm', focus: 's-provider' },
+};
+
+// Куда ставить ошибку поля, у которого нет своего поля ввода в PROFILE_FIELD_MAP
+const PROFILE_ERROR_ANCHORS = {
+  available_days: 'pr-available-days', hr_zones_custom: 'pr-zone-editor',
+  threshold_pace_sec: 'pr-threshold-pace', location: 'pr-location', venues: 'pr-venues',
+};
+
+let PROFILE_SAVED = null;                         // профиль из последнего ответа сервера
+let PROFILE_META = { version: 0, updated_at: null };
+// Открытый блок: имя, снимок его полей при открытии и идёт ли запись
+let PROFILE_EDIT = { block: null, snapshot: null, saving: false };
+// Блок, который открыть, когда профиль загрузится: переход из других разделов
+let PROFILE_OPEN_AFTER_LOAD = null;
+let PROFILE_HINTS = [];
+
+function blockEl(block) {
+  return document.querySelector(`.pf-block[data-block="${block}"]`);
+}
+
+function profileEditKind() {
+  return PROFILE_EDIT.block ? PROFILE_BLOCKS[PROFILE_EDIT.block].kind : null;
+}
+
+// Поля блока, по которым видно, изменён ли он. Строка поиска города — не
+// значение профиля; поля ручных зон считаются, только пока зоны ручные.
+function profileBlockControls(block) {
+  return Array.from(blockEl(block).querySelectorAll('.pf-edit input, .pf-edit select, .pf-edit textarea'))
+    .filter(el => !el.hasAttribute('data-pf-skip')
+      && (PROFILE_ZONES_MANUAL || !ZONE_INPUT_IDS.includes(el.id)));
+}
+
+function blockSnapshot(block) {
+  const values = profileBlockControls(block).map(el => el.type === 'checkbox' ? el.checked : el.value);
+  if (block === 'hr') values.push(PROFILE_ZONES_MANUAL);
+  if (block === 'weather') values.push(PROFILE_LOCATION);
+  return JSON.stringify(values);
+}
+
+function profileBlockDirty() {
+  return !!PROFILE_EDIT.block && blockSnapshot(PROFILE_EDIT.block) !== PROFILE_EDIT.snapshot;
+}
+
+// Открыт и изменён блок этого вида: свежие данные с сервера его не затирают
+function profileHeldOpen(kind) {
+  return profileEditKind() === kind && profileBlockDirty();
+}
+
+function updateProfileBlockState() {
+  const block = PROFILE_EDIT.block;
+  if (!block) return;
+  const dirty = profileBlockDirty();
+  const el = blockEl(block);
+  el.classList.toggle('dirty', dirty);
+  el.querySelector('.pf-save').disabled = !dirty || PROFILE_EDIT.saving;
+}
+
+function setBlockSaving(on) {
+  PROFILE_EDIT.saving = on;
+  updateProfileBlockState();
+}
+
+function confirmDiscardProfileBlock() {
+  return !profileBlockDirty()
+    || confirm(`Изменения в блоке «${PROFILE_BLOCKS[PROFILE_EDIT.block].title}» не сохранены и пропадут. Продолжить?`);
+}
+
+function openProfileBlock(block, focusId) {
+  const def = PROFILE_BLOCKS[block];
+  if (!def) return;
+  if (def.kind === 'profile' && !PROFILE_LOADED) {
+    flashProfileMsg('⚠ Профиль не загружен — обновите страницу', false);
+    return;
+  }
+  if (PROFILE_EDIT.block !== block) {
+    if (PROFILE_EDIT.block) {
+      if (!confirmDiscardProfileBlock()) return;
+      discardProfileBlock();
+    }
+    blockEl(block).classList.add('editing');
+    PROFILE_EDIT = { block, snapshot: blockSnapshot(block), saving: false };
+    updateProfileBlockState();
+  }
+  revealProfileBlock(blockEl(block), document.getElementById(focusId || def.focus));
+}
+
+// Блок далеко или под шапкой — прокручиваем к его началу, затем фокус на поле
+function revealProfileBlock(el, target) {
+  const top = el.getBoundingClientRect().top;
+  if (top < 56 || top > window.innerHeight * 0.6) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  if (target && !target.disabled) target.focus({ preventScroll: true });
+}
+
+function closeProfileBlock() {
+  const block = PROFILE_EDIT.block;
+  if (!block) return;
+  clearBlockErrors(block);
+  blockEl(block).classList.remove('editing', 'dirty');
+  PROFILE_EDIT = { block: null, snapshot: null, saving: false };
+}
+
+// Вернуть полям открытого блока сохранённые значения и закрыть его
+function discardProfileBlock() {
+  const kind = profileEditKind();
+  if (kind === 'coach') document.getElementById('coach-select').value = myCoach ? myCoach.sub : '';
+  else if (kind === 'llm') fillLlmForm();
+  else if (kind === 'profile' && PROFILE_SAVED) {
+    fillProfileForm(PROFILE_SAVED);
+    renderHrZones();
+    renderProfileDerived();
+  }
+  closeProfileBlock();
+}
+
+function cancelProfileBlock() {
+  if (!confirmDiscardProfileBlock()) return;
+  discardProfileBlock();
+}
+
+// Выход и смена пользователя: открытая правка и данные прежнего — не следующему
+function profileReset() {
+  closeProfileBlock();
+  PROFILE_LOADED = false;
+  PROFILE_SAVED = null;
+  PROFILE_OPEN_AFTER_LOAD = null;
+  LLM_CFG = null;
+  document.getElementById('s-api-key').value = '';
+}
+
+// Переход к блоку из других разделов: открыть, когда профиль загрузится
+function showProfileBlock(block, focusId) {
+  PROFILE_OPEN_AFTER_LOAD = { block, focusId };
+  showTab('profile');
+}
+
+function openPendingProfileBlock() {
+  const pending = PROFILE_OPEN_AFTER_LOAD;
+  PROFILE_OPEN_AFTER_LOAD = null;
+  if (pending) openProfileBlock(pending.block, pending.focusId);
+}
+
+function profileChangeReason(block) {
+  const title = PROFILE_BLOCKS[block].title;
+  return 'Профиль: ' + title[0].toLowerCase() + title.slice(1);
+}
+
+// ── Ошибки у полей (#87) ──
+
+function showFieldError(anchor, message) {
+  anchor.classList.add('invalid');
+  const err = document.createElement('p');
+  err.className = 'field-error';
+  err.dataset.for = anchor.id;
+  err.textContent = message;
+  const host = anchor.closest('.form-group');
+  if (host) host.appendChild(err);
+  else anchor.insertAdjacentElement('afterend', err);
+}
+
+// Правка поля снимает его ошибку; target — само поле или что-то внутри составного
+function clearFieldErrorFrom(target) {
+  document.querySelectorAll('#tab-profile .field-error').forEach(err => {
+    const anchor = document.getElementById(err.dataset.for);
+    if (!anchor || anchor === target || anchor.contains(target)) {
+      err.remove();
+      if (anchor) anchor.classList.remove('invalid');
+    }
+  });
+}
+
+function clearBlockErrors(block) {
+  const el = blockEl(block);
+  el.querySelectorAll('.field-error').forEach(err => err.remove());
+  el.querySelectorAll('.invalid').forEach(node => node.classList.remove('invalid'));
+}
+
+// validation_failed: ошибка — под своим полем открытого блока. Поле из
+// другого блока (границы блоков это исключают) — строкой у кнопок.
+function showProfileErrors(fields) {
+  const open = blockEl(PROFILE_EDIT.block);
+  const elsewhere = [];
+  Object.entries(fields).forEach(([field, message]) => {
+    const anchor = document.getElementById(PROFILE_ERROR_ANCHORS[field] || PROFILE_FIELD_MAP[field] || '');
+    if (anchor && open && open.contains(anchor)) showFieldError(anchor, message);
+    else elsewhere.push(`${PROFILE_FIELD_LABELS[field] || field} — ${message}`);
+  });
+  if (elsewhere.length) flashProfileMsg('⚠ ' + elsewhere.join('; '), false);
+}
+
+// Правка в открытом блоке: снять ошибку с поля и пересчитать «изменён ли
+// блок». Один обработчик на вкладку вместо oninput у каждого поля.
+function onProfileTabInput(event) {
+  clearFieldErrorFrom(event.target);
+  updateProfileBlockState();
+}
+
+// Клик по строке сводки открывает блок с фокусом на её поле
+function onProfileTabClick(event) {
+  const row = event.target.closest('.pf-row[data-focus]');
+  const block = row && row.closest('.pf-block');
+  if (block && !block.classList.contains('editing')) openProfileBlock(block.dataset.block, row.dataset.focus);
+}
 
 function profileDayBoxes() {
   return Array.from(document.querySelectorAll('#pr-available-days input[type=checkbox]'));
@@ -3067,6 +3294,13 @@ function renderLocation(note) {
   document.getElementById('pr-location-note').textContent = note || '';
 }
 
+// Выбор, определение и удаление места — правка блока «Погода и место» (#87)
+function locationChanged(note) {
+  renderLocation(note);
+  clearFieldErrorFrom(document.getElementById('pr-location'));
+  updateProfileBlockState();
+}
+
 // Enter в поле города — поиск, а не отправка чего-то ещё
 function cityKeydown(event) {
   if (event.key !== 'Enter') return;
@@ -3102,7 +3336,7 @@ function pickCity(i) {
   CITY_RESULTS = [];
   document.getElementById('pr-city').value = '';
   document.getElementById('pr-city-results').innerHTML = '';
-  renderLocation('Сохраните профиль, чтобы прогноз появился в плане');
+  locationChanged('Нажмите «Сохранить», чтобы прогноз появился в плане');
 }
 
 function useMyLocation() {
@@ -3113,7 +3347,7 @@ function useMyLocation() {
     const round = v => Math.round(v * 100) / 100;
     PROFILE_LOCATION = { name: 'Моё местоположение',
                          lat: round(pos.coords.latitude), lon: round(pos.coords.longitude) };
-    renderLocation('Сохраните профиль, чтобы прогноз появился в плане');
+    locationChanged('Нажмите «Сохранить», чтобы прогноз появился в плане');
   }, err => renderLocation(err.code === 1
     ? 'Доступ к местоположению запрещён — найдите город по названию'
     : 'Не удалось определить местоположение — найдите город по названию'),
@@ -3122,7 +3356,7 @@ function useMyLocation() {
 
 function clearLocation() {
   PROFILE_LOCATION = null;
-  renderLocation('Сохраните профиль, чтобы убрать прогноз из плана');
+  locationChanged('Нажмите «Сохранить», чтобы убрать прогноз из плана');
 }
 
 // Подсказка у порогового темпа: оценка по «Стартам» — видна и при ручном пороге.
@@ -3182,6 +3416,8 @@ function setZonesManual(on) {
     fillZoneInputs(auto.map(z => z.from));
   }
   renderHrZones();
+  clearFieldErrorFrom(document.getElementById('pr-zone-editor'));
+  updateProfileBlockState();
 }
 
 function renderHrZones() {
@@ -3190,11 +3426,20 @@ function renderHrZones() {
   if (PROFILE_ZONES_MANUAL) { updateZoneEditor(); return; }
 
   const zones = (PROFILE_DERIVED && PROFILE_DERIVED.hr_zones_auto) || [];
-  document.getElementById('pr-zones-chips').innerHTML = zones.map(z =>
-    `<span class="hr-zone">${escapeHtml(z.name)} <b>${escapeHtml(z.from)}–${escapeHtml(z.to)}</b></span>`).join('');
+  document.getElementById('pr-zones-chips').innerHTML = hrZoneChips(zones);
   document.getElementById('pr-zones-auto-hint').textContent = zones.length
     ? 'Рассчитаны от максимального пульса — ориентир, не медицинская рекомендация. Обновляются после сохранения.'
-    : 'Укажите максимальный пульс или дату рождения и сохраните профиль — зоны рассчитаются сами. Или задайте их вручную.';
+    : 'Укажите максимальный пульс или дату рождения и сохраните — зоны рассчитаются сами. Или задайте их вручную.';
+}
+
+// Зоны «Z2 аэробная 106–123»; short — «Z2 106–123» с полным названием в
+// подсказке (сводка, #87). У ручной Z5 без известного HRmax верха нет.
+function hrZoneChips(zones, short = false) {
+  return zones.map(z => {
+    const name = String(z.name ?? '');
+    return `<span class="hr-zone" title="${escapeHtml(name)}">${escapeHtml(short ? name.split(' ')[0] : name)} `
+      + `<b>${escapeHtml(z.from)}${z.to != null ? '–' + escapeHtml(z.to) : '+'}</b></span>`;
+  }).join('');
 }
 
 // Возраст и ИМТ пересчитываем на лету — арифметика в одну строку.
@@ -3217,25 +3462,175 @@ function profileBmiLocal() {
   return Math.round(w / Math.pow(h / 100, 2) * 10) / 10;
 }
 
+// Возраст и ИМТ под полями «Личного» — пока их правят
 function renderProfileDerived() {
-  const el = document.getElementById('profile-derived');
   const bits = [];
   const age = profileAgeLocal();
   if (age !== null) bits.push(`Возраст: <b>${age}</b>`);
   const bmi = profileBmiLocal();
-  if (bmi !== null) bits.push(`ИМТ: <b>${bmi}</b>`);
-
-  if (PROFILE_DERIVED && PROFILE_DERIVED.hr_max_estimated) {
-    bits.push(`HRmax: <b>~${escapeHtml(PROFILE_DERIVED.hr_max_estimated)}</b> <span class="hint">(оценка по возрасту)</span>`);
-  }
-
-  // Зоны живут в своей секции формы — renderHrZones.
-  el.innerHTML = bits.length
-    ? `<div class="derived-row">${bits.join('<span class="derived-sep">·</span>')}</div>` : '';
+  if (bmi !== null) bits.push(`ИМТ: <b>${pfNum(bmi)}</b>`);
+  document.getElementById('pf-personal-calc').innerHTML = bits.join('<span class="derived-sep">·</span>');
 }
 
 // Живой пересчёт при вводе (вызывается из oninput)
 function updateProfileHints() { renderProfileDerived(); }
+
+// ── Сводка блоков (#87) ──
+
+// Строка сводки. Текст и пояснение экранируются здесь: вызывающий передаёт
+// данные как есть. Пустой текст — «не указано» (или своё missing).
+function pfRow(label, text, { note = '', missing = 'не указано', focus = '', clamp = false } = {}) {
+  const value = (text === '' || text === null || text === undefined)
+    ? `<span class="pf-missing">${escapeHtml(missing)}</span>` : escapeHtml(text);
+  const tail = note ? `<span class="pf-note"> · ${escapeHtml(note)}</span>` : '';
+  return `<div class="pf-row"${focus ? ` data-focus="${escapeHtml(focus)}"` : ''}>`
+    + `<span class="pf-label">${escapeHtml(label)}</span>`
+    + `<span class="pf-val${clamp ? ' pf-clamp' : ''}">${value}${tail}</span></div>`;
+}
+
+// 74.5 → «74,5 кг»; пусто → ''
+function pfNum(value, unit) {
+  if (value === null || value === undefined || value === '') return '';
+  return String(value).replace('.', ',') + (unit ? ' ' + unit : '');
+}
+
+// '2026-11-02…' → '02.11.2026'
+function pfDate(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : '';
+}
+
+// 1 год, 2 года, 5 лет; дробное — как «2,5 года»
+function ruPlural(n, one, few, many) {
+  if (!Number.isInteger(n)) return few;
+  const d = n % 10, h = n % 100;
+  return d === 1 && h !== 11 ? one : d >= 2 && d <= 4 && (h < 12 || h > 14) ? few : many;
+}
+
+// Подпись варианта из самого списка: формулировки живут в разметке один раз
+function selectLabel(id, value) {
+  const option = value ? Array.from(document.getElementById(id).options).find(o => o.value === value) : null;
+  return option ? option.textContent.trim() : '';
+}
+
+function checkedLabels(boxes, values) {
+  return boxes.filter(cb => (values || []).includes(cb.value))
+    .map(cb => cb.parentElement.textContent.trim()).join(', ');
+}
+
+function renderProfileView() {
+  renderProfileHead();
+  const p = PROFILE_SAVED;
+  if (!p) return;                 // «Загрузка…» или сообщение о сбое остаются
+  const d = PROFILE_DERIVED || {};
+
+  document.getElementById('pf-personal-view').innerHTML =
+    pfRow('ФИО', p.full_name, { focus: 'pr-full-name' })
+    + pfRow('Дата рождения', pfDate(p.birth_date),
+            { note: d.age != null ? `${d.age} ${ruPlural(d.age, 'год', 'года', 'лет')}` : '', focus: 'pr-birth-date' })
+    + pfRow('Пол', selectLabel('pr-sex', p.sex), { focus: 'pr-sex' })
+    + pfRow('Рост и вес', [pfNum(p.height_cm, 'см'), pfNum(p.weight_kg, 'кг')].filter(Boolean).join(' · '),
+            { note: d.bmi ? `ИМТ ${pfNum(d.bmi)}` : '', focus: p.height_cm ? 'pr-weight-kg' : 'pr-height-cm' });
+
+  const zones = d.hr_zones || [];
+  document.getElementById('pr-hr-max').placeholder =
+    d.hr_max_estimated ? `оценка ~${d.hr_max_estimated}` : 'например, 185';
+  document.getElementById('pf-hr-view').innerHTML =
+    pfRow('Максимальный', pfNum(p.hr_max, 'уд/мин'),
+          { note: d.hr_max_estimated ? `оценка по возрасту ~${d.hr_max_estimated}` : '', focus: 'pr-hr-max' })
+    + pfRow('ПАНО', pfNum(p.hr_threshold, 'уд/мин'), { focus: 'pr-hr-threshold' })
+    + pfRow('Пульс покоя', pfNum(p.hr_rest, 'уд/мин'), { focus: 'pr-hr-rest' })
+    + pfRow('Зоны', zones.length ? (d.hr_zones_source === 'manual' ? 'заданы вручную' : 'от максимального пульса') : '',
+            { missing: 'нет', note: zones.length ? '' : 'нужен максимальный пульс или дата рождения',
+              focus: d.hr_zones_source === 'manual' ? 'pr-zone-1' : 'pr-hr-max' })
+    + (zones.length ? `<div class="hr-zones">${hrZoneChips(zones, true)}</div>` : '');
+
+  const basis = d.threshold_basis;
+  const paceNote = d.threshold_source === 'manual' ? 'задан вручную'
+    : d.threshold_source === 'races' && basis
+      ? `оценка по забегу ${PB_LABELS[basis.dist_label] || basis.dist_label} ${basis.time} от ${pfDate(basis.date)}`
+        + (basis.stale ? ', забег старше года' : '')
+      : 'добавьте результат забега в «Стартах» — порог оценится сам';
+  document.getElementById('pf-pace-view').innerHTML =
+    pfRow('Пороговый темп', d.threshold_pace_sec ? `${secondsToTime(d.threshold_pace_sec)}/км` : '',
+          { note: paceNote, focus: 'pr-threshold-pace' })
+    + pfRow('МПК', pfNum(p.vo2max), { focus: 'pr-vo2max' });
+
+  const sessions = Number(p.sessions_per_week);
+  const days = checkedLabels(profileDayBoxes(), p.available_days).toLowerCase();
+  const longDay = selectLabel('pr-long-run-day', p.long_run_day).toLowerCase();
+  const years = Number(p.years_running);
+  document.getElementById('pf-training-view').innerHTML =
+    pfRow('В неделю', [p.sessions_per_week != null && p.sessions_per_week !== ''
+                         ? `${sessions} ${ruPlural(sessions, 'тренировка', 'тренировки', 'тренировок')}` : '',
+                       pfNum(p.weekly_km_typical, 'км')].filter(Boolean).join(' · '), { focus: 'pr-sessions' })
+    + pfRow('Дни', days, { note: [days ? '' : 'можно в любой день', longDay ? `длительная — ${longDay}` : '']
+                                   .filter(Boolean).join(' · '),
+                           focus: 'pr-day-mon' })
+    + pfRow('Стаж', p.years_running != null && p.years_running !== ''
+                      ? `${pfNum(years)} ${ruPlural(years, 'год', 'года', 'лет')}` : '', { focus: 'pr-years-running' });
+
+  const loc = p.location;
+  const venues = checkedLabels(profileVenueBoxes(), p.venues);
+  document.getElementById('pf-weather-view').innerHTML =
+    pfRow('Город', loc ? loc.name : '', { note: loc ? '' : 'без него прогноза в плане не будет', focus: 'pr-city' })
+    + pfRow('Обычно бегаю в', p.run_time, { note: p.run_time ? '' : 'прогноз — на 08:00', focus: 'pr-run-time' })
+    + pfRow('Холод', p.cold_sensitivity ? selectLabel('pr-cold', p.cold_sensitivity) : '',
+            { note: p.cold_sensitivity ? '' : 'одежда без поправки', focus: 'pr-cold' })
+    + pfRow('Кроме улицы', venues, { note: venues ? '' : 'советы — только про улицу', focus: 'pr-venue-treadmill' });
+
+  document.getElementById('pf-health-view').innerHTML =
+    pfRow('Травмы', p.injuries, { focus: 'pr-injuries', clamp: true })
+    + pfRow('Для тренера', p.notes, { focus: 'pr-notes', clamp: true });
+}
+
+function renderProfileHead() {
+  const p = PROFILE_SAVED;
+  const d = PROFILE_DERIVED || {};
+  document.getElementById('pf-head-name').textContent = (p && p.full_name) || 'Профиль спортсмена';
+  const meta = [];
+  if (p && d.age != null) meta.push(`${d.age} ${ruPlural(d.age, 'год', 'года', 'лет')}`);
+  if (p) meta.push(PROFILE_META.version
+    ? `версия ${PROFILE_META.version}${PROFILE_META.updated_at ? ' от ' + pfDate(PROFILE_META.updated_at) : ''}`
+    : 'профиль ещё не заполнен');
+  document.getElementById('profile-version').textContent = meta.join(' · ');
+  renderProfileHints();
+}
+
+// «Стоит заполнить» (#87): чего не хватает приложению — по ответу
+// GET /profile, по важности. В шапке — первые две.
+function profileHints() {
+  const p = PROFILE_SAVED;
+  if (!p) return [];
+  const d = PROFILE_DERIVED || {};
+  const hints = [];
+  if (!d.hr_max_effective) hints.push({ block: 'hr', focus: 'pr-hr-max',
+    text: 'Укажите максимальный пульс или дату рождения — появятся пульсовые зоны и нагрузка по пульсу.' });
+  if (!d.threshold_source) hints.push({ block: 'pace', focus: 'pr-threshold-pace',
+    text: 'Укажите пороговый темп или добавьте забег в «Стартах» — появится нагрузка по темпу.' });
+  if (!p.location) hints.push({ block: 'weather', focus: 'pr-city',
+    text: 'Выберите город — в плане появятся прогноз и советы, что надеть и где бежать.' });
+  if (d.hr_max_estimated) hints.push({ block: 'hr', focus: 'pr-hr-max',
+    text: `Максимальный пульс оценён по возрасту (~${d.hr_max_estimated}). Измеренный сделает зоны точнее.` });
+  if (d.hr_max_effective && !p.hr_rest) hints.push({ block: 'hr', focus: 'pr-hr-rest',
+    text: p.sex ? 'Укажите пульс покоя — нагрузка по пульсу посчитается точнее.'
+                : 'Укажите пульс покоя и пол — нагрузка по пульсу посчитается точнее.' });
+  else if (d.hr_max_effective && !p.sex) hints.push({ block: 'personal', focus: 'pr-sex',
+    text: 'Укажите пол — нагрузка по пульсу посчитается точнее.' });
+  return hints.slice(0, 2);
+}
+
+function renderProfileHints() {
+  PROFILE_HINTS = profileHints();
+  document.getElementById('pf-hints').innerHTML = PROFILE_HINTS.map((h, i) =>
+    `<button class="pf-hint" onclick="openProfileHint(${i})"><span>💡 ${escapeHtml(h.text)}</span><b>Указать</b></button>`
+  ).join('');
+}
+
+function openProfileHint(i) {
+  const hint = PROFILE_HINTS[i];
+  if (hint) openProfileBlock(hint.block, hint.focus);
+}
 
 function renderPersonalBests(bests) {
   const el = document.getElementById('profile-pb');
@@ -3252,82 +3647,116 @@ function renderPersonalBests(bests) {
 }
 
 function applyProfileResponse(data) {
-  fillProfileForm(data.profile || {});
+  PROFILE_SAVED = data.profile || {};
+  PROFILE_META = { version: data.version || 0, updated_at: data.updated_at || null };
+  fillProfileForm(PROFILE_SAVED);
   PROFILE_DERIVED = data.derived || null;
   renderProfileDerived();
   renderHrZones();
   renderThresholdHint();
   renderPersonalBests(data.personal_bests);
-  const label = document.getElementById('profile-version');
-  label.textContent = data.version
-    ? `версия ${data.version}${data.updated_at ? ' · ' + data.updated_at.slice(0, 10) : ''}`
-    : 'ещё не заполнен';
+  renderProfileView();
+  // Открытый неизменённый блок остаётся открытым — сверяем уже с новыми значениями
+  if (profileEditKind() === 'profile') {
+    PROFILE_EDIT.snapshot = blockSnapshot(PROFILE_EDIT.block);
+    updateProfileBlockState();
+  }
 }
 
-function flashProfileMsg(text, ok, sticky) {
-  const msg = document.getElementById('profile-msg');
-  msg.style.display = 'inline';
-  msg.style.color = ok ? 'var(--c-accent)' : 'var(--c-danger)';
-  msg.textContent = text;
-  if (sticky) return;   // условие не пройдёт само — сообщение не прячем
-  setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, ok ? 2500 : 6000);
+// Сообщение у блока профиля (по умолчанию — открытого), без него — в шапке
+function flashProfileMsg(text, ok, sticky, block = PROFILE_EDIT.block) {
+  const el = block && PROFILE_BLOCKS[block].kind === 'profile'
+    ? blockEl(block).querySelector('.pf-msg') : document.getElementById('profile-msg');
+  flashMsg(el, text, ok, sticky ? 0 : (ok ? 2500 : 6000));
 }
 
+// Без загруженного профиля блоки профиля не открываются: «Сохранить»
+// затёрло бы заполненный профиль пустыми полями
 function setProfileSaveEnabled(enabled) {
-  const btn = document.getElementById('profile-save-btn');
-  btn.disabled = !enabled;
-  btn.title = enabled ? '' : 'Профиль не загружен — сохранение затёрло бы данные';
+  document.querySelectorAll('.pf-block[data-kind="profile"] .pf-edit-btn').forEach(btn => {
+    btn.disabled = !enabled;
+    btn.title = enabled ? '' : 'Профиль не загружен — правка затёрла бы данные';
+  });
 }
 
 async function loadProfile() {
+  // #87: изменённый, но не сохранённый блок свежими данными не перезаполняем
+  if (profileHeldOpen('profile')) { openPendingProfileBlock(); return; }
+  const wasLoaded = PROFILE_LOADED;
   PROFILE_LOADED = false;
   setProfileSaveEnabled(false);
   try {
     const res = await fetch(API_URL + 'profile', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    applyProfileResponse(await res.json());
+    const data = await res.json();
+    if (profileHeldOpen('profile')) {           // пока шёл запрос, блок успели изменить
+      PROFILE_LOADED = wasLoaded;
+      setProfileSaveEnabled(wasLoaded);
+      return;
+    }
+    applyProfileResponse(data);
     PROFILE_LOADED = true;
     setProfileSaveEnabled(true);
+    flashMsg(document.getElementById('profile-msg'), '', true);
   } catch (e) {
+    if (profileEditKind() === 'profile') closeProfileBlock();
     document.getElementById('profile-pb').innerHTML =
       '<div class="empty">Не удалось загрузить профиль</div>';
-    flashProfileMsg('⚠ Профиль не загрузился — сохранение отключено, чтобы не затереть данные. Обновите страницу.', false, true);
+    if (!PROFILE_SAVED) {
+      document.querySelectorAll('.pf-block[data-kind="profile"] .pf-view > div').forEach(el => {
+        el.innerHTML = '<div class="hint">Не удалось загрузить профиль</div>';
+      });
+    }
+    flashProfileMsg('⚠ Профиль не загрузился — правка отключена, чтобы не затереть данные. Обновите страницу.', false, true);
   }
+  openPendingProfileBlock();
 }
 
+// Сохраняет открытый блок профиля. Уходит весь профиль (POST /profile
+// заменяет его целиком), меняются только поля блока; в истории версий —
+// причина с названием блока.
 async function saveProfile() {
   if (!PROFILE_LOADED) {
     flashProfileMsg('⚠ Профиль не загружен — обновите страницу', false);
     return;
   }
-  const btn = document.getElementById('profile-save-btn');
-  btn.disabled = true; btn.textContent = 'Сохраняем…';
+  const block = PROFILE_EDIT.block;
+  if (profileEditKind() !== 'profile' || !profileBlockDirty() || PROFILE_EDIT.saving) return;
+  const btn = blockEl(block).querySelector('.pf-save');
+  clearBlockErrors(block);
+  setBlockSaving(true);
+  btn.textContent = 'Сохраняем…';
   try {
     const res = await fetch(API_URL + 'profile', {
       method: 'POST',
       headers: authHeaders({'Content-Type':'application/json'}),
-      body: JSON.stringify({ profile: collectProfileForm() }),
+      body: JSON.stringify({ profile: collectProfileForm(), change_reason: profileChangeReason(block) }),
     });
     if (res.status === 401) { handleAuthError(); return; }
     const data = await res.json().catch(() => ({}));
     if (res.status === 400 && data.error === 'validation_failed') {
-      const problems = Object.entries(data.fields || {})
-        .map(([f, m]) => `${PROFILE_FIELD_LABELS[f] || f} — ${m}`).join('; ');
-      flashProfileMsg('⚠ ' + problems, false);
+      showProfileErrors(data.fields || {});
       return;
     }
     if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+    closeProfileBlock();
     applyProfileResponse(data);
-    flashProfileMsg('✓ Сохранено', true);
+    flashProfileMsg('✓ Сохранено', true, false, block);
     loadTrainingLoad();   // зоны, пульс покоя и порог меняют нагрузку (#66)
     loadWeather();        // город, время и площадки меняют советы (#72)
   } catch (e) {
-    flashProfileMsg('⚠ ' + e.message, false);
+    flashProfileMsg('⚠ ' + e.message, false, false, block);
   } finally {
-    btn.disabled = false; btn.textContent = 'Сохранить';
+    btn.textContent = 'Сохранить';
+    if (PROFILE_EDIT.block === block) setBlockSaving(false);
   }
 }
+
+const PROFILE_TAB = document.getElementById('tab-profile');
+PROFILE_TAB.addEventListener('input', onProfileTabInput);
+PROFILE_TAB.addEventListener('change', onProfileTabInput);
+PROFILE_TAB.addEventListener('click', onProfileTabClick);
 
 async function showLlmPreview() {
   const overlay = document.getElementById('llm-preview-overlay');
@@ -3350,44 +3779,73 @@ function closeLlmPreview(event) {
   document.getElementById('llm-preview-overlay').classList.remove('active');
 }
 
+// Ответ GET /config/llm — по нему рисуются сводка блока «Настройки LLM» и
+// форма (#87). Ключа в нём нет, только маска; { error: true } — не загрузился.
+let LLM_CFG = null;
+
 async function loadLlmSettings() {
   if (currentRole !== 'admin') return;  // не-админ не дёргает admin-only /config/llm
-  // Дефолтно — anthropic, модели заполняем
-  updateModelOptions();
-  document.getElementById('s-api-key').value = '';
-  document.getElementById('s-key-current').textContent = '';
+  if (profileHeldOpen('llm')) return;   // #87: введённое в открытую форму не затираем
   try {
     const res = await fetch(API_URL + 'config/llm', { headers: authHeaders() });
     if (res.status === 401) { handleAuthError(); return; }
-    if (!res.ok) return;
-    const cfg = await res.json();
-    if (cfg.configured) {
-      document.getElementById('s-provider').value = cfg.provider;
-      updateModelOptions();
-      document.getElementById('s-model').value = cfg.model;
-      if (cfg.effort) document.getElementById('s-effort').value = cfg.effort;
-      document.getElementById('s-key-current').textContent = `(текущий: ${cfg.api_key_masked})`;
-      document.getElementById('s-api-key').placeholder = 'оставьте пустым чтобы не менять ключ';
-    }
-  } catch (e) {}
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    LLM_CFG = await res.json();
+  } catch (e) {
+    LLM_CFG = { error: true };
+  }
+  if (profileHeldOpen('llm')) return;   // пока шёл запрос, форму успели изменить
+  fillLlmForm();
+  renderLlmView();
+}
+
+// Форма — из сохранённого конфига. Поле ключа всегда пустое: сервер ключ не
+// отдаёт, а требует при каждой записи.
+function fillLlmForm() {
+  const cfg = LLM_CFG && LLM_CFG.configured ? LLM_CFG : null;
+  document.getElementById('s-provider').value = cfg ? cfg.provider : Object.keys(LLM_MODELS)[0];
+  updateModelOptions();
+  if (cfg) document.getElementById('s-model').value = cfg.model;
+  document.getElementById('s-effort').value = (cfg && cfg.effort) || 'medium';
+  document.getElementById('s-api-key').value = '';
+  document.getElementById('s-key-current').textContent = cfg ? `(текущий: ${cfg.api_key_masked})` : '';
+}
+
+function renderLlmView() {
+  const cfg = LLM_CFG;
+  const el = document.getElementById('pf-llm-view');
+  document.getElementById('llm-test-btn').disabled = !(cfg && cfg.configured);
+  if (!cfg) { el.innerHTML = '<div class="hint">Загрузка…</div>'; return; }
+  if (cfg.error) { el.innerHTML = '<div class="hint">Не удалось загрузить настройки модели</div>'; return; }
+  if (!cfg.configured) {
+    el.innerHTML = pfRow('Модель', '', { missing: 'не настроено', note: 'ИИ-тренер не ответит, пока модель не настроена' });
+    return;
+  }
+  const model = (LLM_MODELS[cfg.provider] || []).find(m => m.id === cfg.model);
+  el.innerHTML = pfRow('Провайдер', selectLabel('s-provider', cfg.provider) || cfg.provider)
+    + pfRow('Модель', model ? model.label : cfg.model)
+    + pfRow('Глубина рассуждения', selectLabel('s-effort', cfg.effort) || cfg.effort)
+    + pfRow('Ключ', cfg.api_key_masked);
 }
 
 async function saveLlmConfig() {
   const provider = document.getElementById('s-provider').value;
   const model = document.getElementById('s-model').value;
-  const apiKeyInput = document.getElementById('s-api-key').value.trim();
+  const keyInput = document.getElementById('s-api-key');
+  const apiKeyInput = keyInput.value.trim();
   const effort = document.getElementById('s-effort').value;
   const msg = document.getElementById('settings-msg');
+  if (PROFILE_EDIT.saving) return;
+  clearBlockErrors('llm');
 
   // Если ключ не введён — берём текущий с бэка (нельзя — нет реального ключа на фронте).
-  // Поэтому требуем ввод ключа.
+  // Поэтому требуем ввод ключа; ошибка — под полем (#87).
   if (!apiKeyInput) {
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)';
-    msg.textContent = '⚠ Введите API-ключ';
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 3000);
+    showFieldError(keyInput, 'Введите API-ключ');
     return;
   }
 
+  setBlockSaving(true);
   try {
     const res = await fetch(API_URL + 'config/llm', {
       method: 'POST',
@@ -3399,15 +3857,14 @@ async function saveLlmConfig() {
       const err = await res.json().catch(() => ({error: 'HTTP ' + res.status}));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-accent)';
-    msg.textContent = '✓ Сохранено';
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 2500);
-    document.getElementById('s-api-key').value = '';
+    keyInput.value = '';
+    closeProfileBlock();
+    flashMsg(msg, '✓ Сохранено', true, 2500);
     await loadLlmSettings();
   } catch (e) {
-    msg.style.display = 'inline'; msg.style.color = 'var(--c-danger)';
-    msg.textContent = '⚠ ' + e.message;
-    setTimeout(() => { msg.style.display = 'none'; msg.style.color = ''; }, 5000);
+    flashMsg(msg, '⚠ ' + e.message, false, 5000);
+  } finally {
+    if (profileEditKind() === 'llm') setBlockSaving(false);
   }
 }
 
@@ -4117,9 +4574,20 @@ function renderMyCoach(coaches) {
   select.value = myCoach ? myCoach.sub : '';
   const empty = !options.length;
   select.disabled = empty;
-  document.getElementById('coach-save-btn').disabled = empty;
+  document.getElementById('mycoach-edit-btn').disabled = empty;   // #87: выбирать не из кого
   flashCoachMsg(empty ? 'Тренеров пока нет — их назначает администратор.' : '', true, true);
   renderCoachPlanEdit();
+  renderCoachView();
+  // Открытый неизменённый блок сверяем уже с перечитанным выбором
+  if (profileEditKind() === 'coach') {
+    PROFILE_EDIT.snapshot = blockSnapshot('coach');
+    updateProfileBlockState();
+  }
+}
+
+// Сводка блока «Мой тренер» (#87); выбор — по «Изменить»
+function renderCoachView() {
+  document.getElementById('pf-coach-view').innerHTML = pfRow('Тренер', myCoach ? myCoach.name : 'без тренера');
 }
 
 // Переключатель «тренер может менять мои планы» (#60) — только при выбранном тренере.
@@ -4197,6 +4665,7 @@ async function onCoachChangedPlan() {
 }
 
 async function loadMyCoach() {
+  if (profileHeldOpen('coach')) return;   // #87: выбранного, но не сохранённого тренера не сбрасываем
   try {
     const [coachesRes, mineRes] = await Promise.all([
       fetch(API_URL + 'coaches', { headers: authHeaders() }),
@@ -4206,25 +4675,30 @@ async function loadMyCoach() {
     if (coachesRes.status === 401 || mineRes.status === 401) { handleAuthError(); return; }
     if (!coachesRes.ok || !mineRes.ok) throw new Error('HTTP ' + (coachesRes.ok ? mineRes.status : coachesRes.status));
     const mine = await mineRes.json();
+    const coaches = (await coachesRes.json()).coaches || [];
+    if (profileHeldOpen('coach')) return;   // пока шёл запрос, выбор успели изменить
     myCoach = mine.coach || null;
     myCoachPlanEdit = mine.can_edit_plans !== false;
-    renderMyCoach((await coachesRes.json()).coaches || []);
+    renderMyCoach(coaches);
   } catch (e) {
     flashCoachMsg('⚠ Не удалось загрузить список тренеров', false);
   }
 }
 
+// Сохраняет открытый блок «Мой тренер» (#87). Подтверждения смены и снятия —
+// прежние (#44); при отказе выбор остаётся в открытом блоке.
 async function saveMyCoach() {
   const select = document.getElementById('coach-select');
   const coachSub = select.value || null;
   const current = myCoach ? myCoach.sub : null;
-  if (coachSub === current) { flashCoachMsg('Без изменений', true); return; }
+  if (PROFILE_EDIT.saving) return;
+  if (coachSub === current) { closeProfileBlock(); return; }
   if (current && !confirm(coachSub
       ? 'Сменить тренера? Прежний потеряет доступ к вашим данным.'
       : 'Отказаться от тренера? Он потеряет доступ к вашим данным.')) {
-    select.value = current;
     return;
   }
+  setBlockSaving(true);
   try {
     const res = await fetch(API_URL + 'my/coach', {
       method: 'POST',
@@ -4236,18 +4710,23 @@ async function saveMyCoach() {
     if (!res.ok) {
       flashCoachMsg(data.error === 'not_a_coach'
         ? '⚠ Этот пользователь больше не тренер' : '⚠ Не удалось сохранить', false);
+      discardProfileBlock();     // список тренеров устарел — перечитываем его
       loadMyCoach();
       return;
     }
     myCoach = data.coach || null;
     myCoachPlanEdit = data.can_edit_plans !== false;   // у нового тренера — снова по умолчанию
+    closeProfileBlock();
     renderCoachPlanEdit();
+    renderCoachView();
     select.value = myCoach ? myCoach.sub : '';
     applyRole(currentRole);      // вкладка «Тренер» появляется и пропадает вместе с тренером
     refreshCoachBadge();
     flashCoachMsg(myCoach ? '✓ Тренер выбран' : '✓ Тренер снят', true);
   } catch (e) {
     flashCoachMsg('⚠ ' + e.message, false);
+  } finally {
+    if (profileEditKind() === 'coach') setBlockSaving(false);
   }
 }
 
