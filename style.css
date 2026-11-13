@@ -419,17 +419,88 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .badge-hm   { background: var(--c-warn-light);    color: var(--c-warn); }
 .badge-marathon { background: var(--c-danger-light); color: var(--c-danger); }
 
-/* ── Профиль спортсмена (#32) ── */
-.profile-section {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+/* ── Профиль спортсмена (#32): блоки в режиме просмотра, правка по одному (#87) ── */
+.pf-head-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.pf-head-who { min-width: 0; }
+.pf-head-name { font-size: 17px; font-weight: 500; overflow-wrap: anywhere; }
+.pf-head-meta { font-size: 12px; color: var(--text-muted); }
+.pf-head .hint { margin: 8px 0 0; }
+.pf-hints { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.pf-hints:empty { display: none; }
+.pf-hint {
+  display: flex; align-items: baseline; gap: 10px; width: 100%;
+  padding: 8px 10px; border: none; border-radius: 8px; cursor: pointer;
+  background: var(--c-warn-light); color: var(--c-warn);
+  font-family: inherit; font-size: 13px; text-align: left;
+}
+.pf-hint b { margin-left: auto; font-weight: 500; white-space: nowrap; text-decoration: underline; }
+
+/* Шапка липкая на телефоне — блок при открытии не должен уходить под неё */
+.pf-block { scroll-margin-top: 72px; }
+.pf-block.editing { box-shadow: 0 0 0 1px var(--c-accent); }
+.pf-block-head { display: flex; align-items: flex-start; gap: 10px; }
+.pf-block-head > div:first-child { flex: 1; min-width: 0; }
+.pf-block-title { font-size: 14px; font-weight: 500; }
+.pf-why { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
+.pf-block-head .pf-edit-btn { flex-shrink: 0; }
+.pf-view { margin-top: 8px; }
+.pf-view > div > .hint { margin: 0; }
+.pf-view-actions { margin-top: 10px; }
+.pf-edit { display: none; margin-top: 12px; }
+.pf-block.editing .pf-edit { display: block; }
+.pf-block.editing .pf-view,
+.pf-block.editing .pf-edit-btn { display: none; }
+
+/* Строка сводки: подпись — значение; по клику открывается блок на этом поле */
+.pf-row {
+  display: grid; grid-template-columns: minmax(110px, 34%) minmax(0, 1fr); gap: 12px;
+  padding: 7px 0; border-top: 0.5px solid var(--border); font-size: 13px;
+}
+.pf-row:first-child { border-top: none; }
+.pf-row[data-focus] { cursor: pointer; }
+.pf-label { color: var(--text-muted); }
+.pf-val { overflow-wrap: anywhere; white-space: pre-line; }
+.pf-missing, .pf-note { color: var(--text-muted); }
+.pf-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.pf-view .hr-zones { margin: 2px 0 4px; }
+
+.pf-subtitle {
+  font-size: 11px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .5px;
   color: var(--text-muted);
-  margin: 18px 0 8px;
-  padding-bottom: 6px;
+  margin: 16px 0 8px; padding-bottom: 6px;
   border-bottom: 0.5px solid var(--border);
 }
-.profile-section:first-of-type { margin-top: 8px; }
+.pf-calc { margin-top: 10px; font-size: 13px; }
+.pf-calc:empty { display: none; }
+.pf-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+.pf-dirty-note { display: none; font-size: 12px; color: var(--text-muted); }
+.pf-block.dirty .pf-dirty-note { display: inline; }
+.pf-group-title {
+  font-size: 11px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .5px;
+  color: var(--text-muted);
+  margin: 20px 2px 8px;
+}
+.btn-primary:disabled { opacity: .45; cursor: default; }
+.btn-sm:disabled { opacity: .5; cursor: default; }
+
+/* Ошибка проверки — под своим полем, пока его не поправят */
+.field-error { margin: 4px 0 0; font-size: 12px; color: var(--c-danger); }
+.form-group input.invalid,
+.form-group select.invalid,
+.form-group textarea.invalid,
+.zone-editor.invalid .zone-from input,
+.day-picker.invalid label { border-color: var(--c-danger); }
+.location-line.invalid { color: var(--c-danger); }
+
+@media (max-width: 600px) {
+  /* Сводка заполненного профиля — не длиннее двух экранов */
+  .pf-block { scroll-margin-top: 64px; margin-bottom: 10px; }
+  .pf-row { grid-template-columns: minmax(92px, 32%) minmax(0, 1fr); gap: 10px; padding: 5px 0; }
+  .pf-hint { padding: 6px 10px; font-size: 12px; }
+  .pf-actions .btn-primary { flex: 1 1 auto; }
+}
 
 .day-picker { display: flex; gap: 6px; flex-wrap: wrap; }
 .day-picker label {
@@ -450,14 +521,6 @@ table.plan tr:hover td { background: var(--bg-metric); }
   color: var(--c-accent-dark);
 }
 
-.profile-derived:empty { display: none; }
-.profile-derived {
-  margin-top: 16px;
-  padding: 12px;
-  background: var(--bg-metric);
-  border-radius: 10px;
-}
-.derived-row { font-size: 14px; }
 .derived-sep { color: var(--text-muted); margin: 0 8px; }
 .hr-zones { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 .hr-zones:empty { display: none; }

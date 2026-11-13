@@ -1418,3 +1418,223 @@ def test_coach_gets_weather_for_the_athletes_plan():
     html = INDEX.read_text(encoding="utf-8")
     for el in ("coach-day-wx", "coach-day-note-row", "coach-day-hint", "coach-day-save"):
         assert f'id="{el}"' in html, el
+
+
+# ── Профиль по блокам (#87) ───────────────────────────────────────────────────
+
+def _profile_tab(html):
+    return html[html.index('<div id="tab-profile"'):html.index('<div id="tab-users"')]
+
+
+def _profile_blocks(js):
+    """PROFILE_BLOCKS из app.js: {блок: {kind, focus, fields}}."""
+    literal = re.search(r"const PROFILE_BLOCKS = \{(.*?)\n\};", js, re.S)
+    assert literal, "PROFILE_BLOCKS не найден"
+    found = re.findall(r"(\w+):\s*\{ title: '[^']*', kind: '(\w+)', focus: '([\w-]+)'"
+                       r"(?:,\s*fields: \[([^\]]*)\])? \}", literal.group(1))
+    assert len(found) == literal.group(1).count("title:"), "блок записан иначе — проверка устарела"
+    return {name: {"kind": kind, "focus": focus, "fields": re.findall(r"'(\w+)'", fields)}
+            for name, kind, focus, fields in found}
+
+
+def _block_sections(tab):
+    """Разметка каждого блока вкладки — от его data-block до следующего."""
+    starts = [(m.start(), m.group(1)) for m in re.finditer(r'data-block="(\w+)"', tab)]
+    ends = [start for start, _ in starts[1:]] + [len(tab)]
+    return {name: tab[start:end] for (start, name), end in zip(starts, ends)}
+
+
+def _profile_js(js):
+    return (_js_section(js, "// ── Профиль спортсмена (#32)", "/// ── ИИ-тренер (#46)")
+            + _js_section(js, "// ── Мой тренер (#44)", "// Сообщение тренера о правке плана"))
+
+
+def test_profile_blocks_are_marked_up():
+    """Блок из PROFILE_BLOCKS без разметки упал бы на blockEl(...).classList
+    только при клике. У каждого — сводка, поля, «Изменить», «Сохранить» своей
+    записи и «Отмена», порядок — как в списке."""
+    html = INDEX.read_text(encoding="utf-8")
+    blocks = _profile_blocks(APP_JS.read_text(encoding="utf-8"))
+    assert set(blocks) == {"personal", "hr", "pace", "training", "weather", "health", "coach", "llm"}
+    sections = _block_sections(_profile_tab(html))
+    assert list(sections) == list(blocks), "набор или порядок блоков в разметке другой"
+    save = {"profile": "saveProfile()", "coach": "saveMyCoach()", "llm": "saveLlmConfig()"}
+    for name, part in sections.items():
+        kind = blocks[name]["kind"]
+        for piece in (f'data-kind="{kind}"', 'class="pf-view"', 'class="pf-edit"',
+                      f"onclick=\"openProfileBlock('{name}')\"", f'onclick="{save[kind]}"',
+                      'onclick="cancelProfileBlock()"', 'class="pf-dirty-note"', "pf-msg"):
+            assert piece in part, (name, piece)
+        assert f'id="{blocks[name]["focus"]}"' in part, (name, "поле фокуса не в своём блоке")
+
+
+def test_every_profile_field_lives_in_exactly_one_block():
+    """Поле в чужом блоке ушло бы на сервер, но не открылось бы на правку, а его
+    ошибка не встала бы под поле. Каждый код поля — ровно в одном блоке, и
+    разметка с этим согласна."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    blocks = _profile_blocks(js)
+    sections = _block_sections(_profile_tab(html))
+    labels = dict(re.findall(r"(\w+): '([^']*)'", _js_section(js, "const PROFILE_FIELD_LABELS = {", "};")))
+    field_map = dict(re.findall(r"(\w+): '(pr-[\w-]+)'", _js_section(js, "const PROFILE_FIELD_MAP = {", "};")))
+    anchors = dict(re.findall(r"(\w+): '(pr-[\w-]+)'", _js_section(js, "const PROFILE_ERROR_ANCHORS = {", "};")))
+    owner = {}
+    for name, block in blocks.items():
+        for field in block["fields"]:
+            assert field not in owner, f"{field} в блоках {owner[field]} и {name}"
+            owner[field] = name
+    assert set(owner) == set(labels), sorted(set(owner) ^ set(labels))
+    for field, block in owner.items():
+        element = anchors.get(field) or field_map[field]
+        holders = [name for name, part in sections.items() if f'id="{element}"' in part]
+        assert holders == [block], f"{field} ({element}) размечено в {holders}, а по списку — в {block}"
+
+
+def test_profile_fields_kept_their_ids():
+    """Поля переехали в блоки без смены id: на них завязаны сбор и заполнение
+    формы и проверки выше. Старая форма убрана целиком."""
+    js = APP_JS.read_text(encoding="utf-8")
+    tab = _profile_tab(INDEX.read_text(encoding="utf-8"))
+    for element in re.findall(r"'(pr-[\w-]+)'", _js_section(js, "const PROFILE_FIELD_MAP = {", "};")):
+        assert tab.count(f'id="{element}"') == 1, element
+    assert 'id="profile-derived"' not in tab and "profile-section" not in tab
+    assert "profile-derived" not in js and "getElementById('profile-save-btn')" not in js
+
+
+def test_profile_generated_handlers_exist():
+    """Подсказки и место прогноза рисует app.js — проверка inline-обработчиков
+    из index.html их не видит."""
+    js = APP_JS.read_text(encoding="utf-8")
+    defined = set(re.findall(r"^(?:async\s+)?function\s+(\w+)\s*\(", js, re.M))
+    called = set()
+    for handler in re.findall(r'onclick="([^"]*)"', _profile_js(js)):
+        handler = re.sub(r"\$\{[^}]*\}", "", handler)
+        called.update(re.findall(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", handler))
+    assert {"openProfileHint", "clearLocation", "pickCity"} <= called
+    assert not (called - defined), sorted(called - defined)
+    # строки сводки открывают блок одним обработчиком на вкладку, а не onclick
+    assert "addEventListener('click', onProfileTabClick)" in js
+    assert "row.dataset.focus" in _fn(js, "onProfileTabClick")
+    for kind in ("input", "change"):
+        assert f"addEventListener('{kind}', onProfileTabInput)" in js, kind
+
+
+def test_profile_summary_escapes_what_the_athlete_typed():
+    """Сводку собирает pfRow и сама экранирует подпись, текст и пояснение. ФИО,
+    травмы, заметки, город, имя тренера и маска ключа попадают в разметку
+    только через неё."""
+    js = APP_JS.read_text(encoding="utf-8")
+    row = _fn(js, "pfRow")
+    for piece in ("escapeHtml(text)", "escapeHtml(note)", "escapeHtml(label)", "escapeHtml(missing)"):
+        assert piece in row, piece
+    views = _fn(js, "renderProfileView") + _fn(js, "renderLlmView") + _fn(js, "renderCoachView")
+    for value in ("p.full_name", "p.injuries", "p.notes", "loc.name", "myCoach.name", "cfg.api_key_masked"):
+        lines = [line for line in views.splitlines() if value in line]
+        assert lines, value
+        assert all("pfRow(" in line for line in lines), (value, lines)
+    assert "textContent = (p && p.full_name)" in _fn(js, "renderProfileHead")
+
+
+def test_profile_block_save_writes_the_whole_profile_with_a_reason():
+    """POST /profile заменяет профиль целиком — уходит весь профиль, а в
+    истории версий видно, какой блок меняли. Без изменений блок не пишется."""
+    js = APP_JS.read_text(encoding="utf-8")
+    save = _js_section(js, "async function saveProfile() {", "\n}\n")
+    assert "profile: collectProfileForm(), change_reason: profileChangeReason(block)" in save
+    assert "!profileBlockDirty()" in save
+    assert save.index("showProfileErrors(data.fields") < save.index("closeProfileBlock()")
+    assert "'Профиль: '" in _fn(js, "profileChangeReason")
+
+
+def test_returning_to_the_profile_keeps_an_unsaved_block():
+    """Вкладка перечитывает профиль, тренера и конфиг модели при каждом
+    открытии. Открытый изменённый блок они не перезаполняют."""
+    js = APP_JS.read_text(encoding="utf-8")
+    load = _js_section(js, "async function loadProfile() {", "\n}\n")
+    assert load.index("profileHeldOpen('profile')") < load.index("applyProfileResponse(")
+    coach = _js_section(js, "async function loadMyCoach() {", "\n}\n")
+    assert coach.index("profileHeldOpen('coach')") < coach.index("renderMyCoach(")
+    llm = _js_section(js, "async function loadLlmSettings() {", "\n}\n")
+    assert llm.index("profileHeldOpen('llm')") < llm.index("fillLlmForm()")
+    assert "blockSnapshot(PROFILE_EDIT.block) !== PROFILE_EDIT.snapshot" in _fn(js, "profileBlockDirty")
+
+
+def test_changed_block_is_not_dropped_silently():
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("openProfileBlock", "cancelProfileBlock"):
+        assert "confirmDiscardProfileBlock()" in _fn(js, name), name
+    ask = _fn(js, "confirmDiscardProfileBlock")
+    assert ask.index("!profileBlockDirty()") < ask.index("confirm(")
+    # открыт не больше одного блока: прежний закрывается до открытия нового
+    opener = _fn(js, "openProfileBlock")
+    assert opener.index("discardProfileBlock()") < opener.index("classList.add('editing')")
+    assert "!PROFILE_LOADED" in opener, "без загруженного профиля блок профиля не открывается"
+
+
+def test_profile_edit_does_not_outlive_the_session():
+    """Введённое в открытый блок, в том числе ключ модели, следующему
+    пользователю не достаётся."""
+    js = APP_JS.read_text(encoding="utf-8")
+    for name in ("signOut", "handleAuthError"):
+        assert "profileReset();" in _fn(js, name), name
+    reset = _fn(js, "profileReset")
+    assert "closeProfileBlock()" in reset and "getElementById('s-api-key').value = ''" in reset
+
+
+def test_profile_hints_and_rows_lead_to_fields_of_their_block():
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    blocks = _profile_blocks(js)
+    sections = _block_sections(_profile_tab(html))
+    hints = _fn(js, "profileHints")
+    found = re.findall(r"block: '(\w+)', focus: '([\w-]+)'", hints)
+    assert len(found) == 6, "подсказки записаны иначе — проверка устарела"
+    for block, focus in found:
+        assert block in blocks and f'id="{focus}"' in sections[block], (block, focus)
+    assert "hints.slice(0, 2)" in hints
+    # строка сводки открывает свой блок на поле, которое в этом блоке и лежит
+    chunks = re.split(r"getElementById\('pf-(\w+)-view'\)\.innerHTML =", _fn(js, "renderProfileView"))
+    assert len(chunks) == 13, "сводки блоков записаны иначе — проверка устарела"
+    for block, chunk in zip(chunks[1::2], chunks[2::2]):
+        for expr in re.findall(r"focus: ([^,}]*)", chunk):
+            for focus in re.findall(r"'(pr-[\w-]+)'", expr):
+                assert f'id="{focus}"' in sections[block], (block, focus)
+
+
+def test_weather_note_opens_the_weather_block():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "showProfileBlock(\\'weather\\', \\'pr-city\\')" in _fn(js, "renderWeatherNote")
+    assert "openPendingProfileBlock();" in _js_section(js, "async function loadProfile() {", "\n}\n")
+
+
+def test_profile_placeholders_do_not_look_like_values():
+    """Серое «178» в пустом поле читалось как сохранённый пульс."""
+    tab = _profile_tab(INDEX.read_text(encoding="utf-8"))
+    assert not re.search(r'placeholder="\d', tab)
+    assert "оценка ~" in _fn(APP_JS.read_text(encoding="utf-8"), "renderProfileView")
+
+
+def test_coach_and_llm_blocks_keep_their_controls_where_they_belong():
+    """Переключатель права на правку и «Проверить ключ» — в просмотре: первый
+    сохраняется сразу, вторая проверяет сохранённый конфиг. Выбор тренера и
+    поле ключа — в правке."""
+    sections = _block_sections(_profile_tab(INDEX.read_text(encoding="utf-8")))
+
+    def halves(part):
+        return (part[part.index('class="pf-view"'):part.index('class="pf-edit"')],
+                part[part.index('class="pf-edit"'):])
+
+    view, edit = halves(sections["coach"])
+    assert 'id="coach-plan-edit"' in view and 'id="coach-select"' in edit
+    view, edit = halves(sections["llm"])
+    assert 'onclick="testLlmKey()"' in view and "testLlmKey" not in edit
+    for el in ("s-provider", "s-model", "s-effort", "s-api-key"):
+        assert f'id="{el}"' in edit, el
+    js = APP_JS.read_text(encoding="utf-8")
+    save = _js_section(js, "async function saveLlmConfig() {", "\n}\n")
+    assert "showFieldError(keyInput, 'Введите API-ключ')" in save
+    assert save.index("closeProfileBlock()") < save.index("await loadLlmSettings()")
+    assert "getElementById('llm-test-btn').disabled = !(cfg && cfg.configured)" in _fn(js, "renderLlmView")
+    coach = _js_section(js, "async function saveMyCoach() {", "\n}\n")
+    assert coach.index("confirm(") < coach.index("fetch(")

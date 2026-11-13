@@ -13,7 +13,7 @@
 <meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
 <meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=35">
+<link rel="stylesheet" href="style.css?v=36">
 <link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -587,204 +587,308 @@
     </div>
   </div>
 
-  <!-- НАСТРОЙКИ -->
+  <!-- ПРОФИЛЬ (#87): блоки в режиме просмотра, правка и сохранение одного блока.
+       Поля и их id — прежние (#32); сводку блоков рисует app.js. -->
   <div id="tab-profile" class="tab">
-    <div class="card" style="margin-bottom:12px">
-      <div class="week-header">
-        <div class="card-title" style="margin:0">Профиль спортсмена</div>
-        <span class="hint" id="profile-version" style="margin:0"></span>
-      </div>
-      <p class="hint">Эти данные уходят в контекст ИИ вместе с планом и тренировками — чем полнее профиль, тем точнее рекомендации. Незаполненные поля просто пропускаются.</p>
-
-      <div class="profile-section">Личное</div>
-      <div class="form-grid">
-        <div class="form-group full">
-          <label>ФИО</label>
-          <input type="text" id="pr-full-name" placeholder="Иванов Иван">
+    <div class="card pf-head">
+      <div class="pf-head-row">
+        <div class="pf-head-who">
+          <div class="pf-head-name" id="pf-head-name">Профиль спортсмена</div>
+          <div class="pf-head-meta" id="profile-version"></div>
         </div>
-        <div class="form-group">
-          <label>Дата рождения</label>
-          <input type="date" id="pr-birth-date" oninput="updateProfileHints()">
-        </div>
-        <div class="form-group">
-          <label>Пол</label>
-          <select id="pr-sex">
-            <option value="">—</option>
-            <option value="m">Мужской</option>
-            <option value="f">Женский</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Рост (см)</label>
-          <input type="number" id="pr-height-cm" min="100" max="250" placeholder="182" oninput="updateProfileHints()">
-        </div>
-        <div class="form-group">
-          <label>Вес (кг)</label>
-          <input type="number" id="pr-weight-kg" step="0.1" min="30" max="200" placeholder="74" oninput="updateProfileHints()">
-        </div>
-      </div>
-
-      <div class="profile-section">Физиология</div>
-      <div class="form-grid">
-        <div class="form-group">
-          <label>Пульс максимальный</label>
-          <input type="number" id="pr-hr-max" min="100" max="230" placeholder="178">
-        </div>
-        <div class="form-group">
-          <label>Пульс ПАНО</label>
-          <input type="number" id="pr-hr-threshold" min="80" max="220" placeholder="162">
-        </div>
-        <div class="form-group">
-          <label>Пульс покоя</label>
-          <input type="number" id="pr-hr-rest" min="30" max="120" placeholder="48">
-        </div>
-        <div class="form-group">
-          <label>МПК (VO₂max)</label>
-          <input type="number" id="pr-vo2max" step="0.1" min="20" max="90" placeholder="52">
-        </div>
-        <!-- #66: темп, который держится около часа; без него — оценка по «Стартам» -->
-        <div class="form-group">
-          <label>Пороговый темп, мин/км</label>
-          <input type="text" id="pr-threshold-pace" maxlength="5" placeholder="4:35">
-          <p class="hint field-hint" id="pr-threshold-hint"></p>
-        </div>
-      </div>
-
-      <div class="profile-section">Пульсовые зоны</div>
-      <div id="pr-zones-auto">
-        <div class="hr-zones" id="pr-zones-chips"></div>
-        <p class="hint zone-hint" id="pr-zones-auto-hint"></p>
-        <button class="btn-sm" onclick="setZonesManual(true)">✎ Настроить вручную</button>
-      </div>
-      <!-- Подписи и число строк — как в domain.HR_ZONE_BOUNDS -->
-      <div id="pr-zones-manual" style="display:none">
-        <div class="zone-editor">
-          <div class="zone-row">
-            <label for="pr-zone-1">Z1 восстановление</label>
-            <span class="zone-from">от <input type="number" id="pr-zone-1" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
-            <span class="zone-to" id="pr-zone-1-to"></span>
-          </div>
-          <div class="zone-row">
-            <label for="pr-zone-2">Z2 аэробная</label>
-            <span class="zone-from">от <input type="number" id="pr-zone-2" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
-            <span class="zone-to" id="pr-zone-2-to"></span>
-          </div>
-          <div class="zone-row">
-            <label for="pr-zone-3">Z3 темповая</label>
-            <span class="zone-from">от <input type="number" id="pr-zone-3" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
-            <span class="zone-to" id="pr-zone-3-to"></span>
-          </div>
-          <div class="zone-row">
-            <label for="pr-zone-4">Z4 ПАНО</label>
-            <span class="zone-from">от <input type="number" id="pr-zone-4" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
-            <span class="zone-to" id="pr-zone-4-to"></span>
-          </div>
-          <div class="zone-row">
-            <label for="pr-zone-5">Z5 максимальная</label>
-            <span class="zone-from">от <input type="number" id="pr-zone-5" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
-            <span class="zone-to" id="pr-zone-5-to"></span>
-          </div>
-        </div>
-        <p class="hint zone-hint">Начало каждой зоны, уд/мин; верх зоны — начало следующей. Заданные вручную зоны не пересчитываются, когда меняется максимальный пульс.</p>
-        <button class="btn-sm" onclick="setZonesManual(false)">↺ Вернуть авторасчёт</button>
-      </div>
-
-      <div class="profile-section">Тренировки</div>
-      <div class="form-grid">
-        <div class="form-group">
-          <label>Стаж бега (лет)</label>
-          <input type="number" id="pr-years-running" step="0.5" min="0" max="70" placeholder="6">
-        </div>
-        <div class="form-group">
-          <label>Обычный объём (км/нед)</label>
-          <input type="number" id="pr-weekly-km" step="1" min="0" max="300" placeholder="45">
-        </div>
-        <div class="form-group">
-          <label>Тренировок в неделю</label>
-          <input type="number" id="pr-sessions" min="0" max="14" placeholder="4">
-        </div>
-        <div class="form-group">
-          <label>День длительной</label>
-          <select id="pr-long-run-day">
-            <option value="">—</option>
-            <option value="mon">Понедельник</option>
-            <option value="tue">Вторник</option>
-            <option value="wed">Среда</option>
-            <option value="thu">Четверг</option>
-            <option value="fri">Пятница</option>
-            <option value="sat">Суббота</option>
-            <option value="sun">Воскресенье</option>
-          </select>
-        </div>
-        <div class="form-group full">
-          <label>Дни, доступные для тренировок</label>
-          <div class="day-picker" id="pr-available-days">
-            <label><input type="checkbox" value="mon"><span>Пн</span></label>
-            <label><input type="checkbox" value="tue"><span>Вт</span></label>
-            <label><input type="checkbox" value="wed"><span>Ср</span></label>
-            <label><input type="checkbox" value="thu"><span>Чт</span></label>
-            <label><input type="checkbox" value="fri"><span>Пт</span></label>
-            <label><input type="checkbox" value="sat"><span>Сб</span></label>
-            <label><input type="checkbox" value="sun"><span>Вс</span></label>
-          </div>
-        </div>
-      </div>
-
-      <!-- Погода (#72): по этим полям в плане появляются прогноз и советы -->
-      <div class="profile-section">Погода и место тренировок</div>
-      <p class="hint">По этим данным в плане появляются прогноз на неделю и советы: что надеть и где бежать.</p>
-      <div class="form-grid">
-        <div class="form-group full">
-          <label for="pr-city">Город для прогноза</label>
-          <div class="city-row">
-            <input type="text" id="pr-city" placeholder="Найти город, например: Казань"
-                   onkeydown="cityKeydown(event)">
-            <button class="btn-sm" onclick="searchCity()">Найти</button>
-            <button class="btn-sm" onclick="useMyLocation()">📍 Моё местоположение</button>
-          </div>
-          <div id="pr-city-results" class="city-results"></div>
-          <div id="pr-location" class="location-line"></div>
-          <div id="pr-location-note" class="hint" style="margin:4px 0 0"></div>
-        </div>
-        <div class="form-group">
-          <label for="pr-run-time">Обычно бегаю в</label>
-          <input type="time" id="pr-run-time">
-        </div>
-        <div class="form-group">
-          <label for="pr-cold">Как переношу холод</label>
-          <select id="pr-cold">
-            <option value="">Обычно</option>
-            <option value="cold">Мёрзну быстрее других</option>
-            <option value="warm">Мне быстро жарко</option>
-          </select>
-        </div>
-        <div class="form-group full">
-          <label>Где ещё можно тренироваться, кроме улицы</label>
-          <div class="day-picker" id="pr-venues">
-            <label><input type="checkbox" value="treadmill"><span>Дорожка в зале</span></label>
-            <label><input type="checkbox" value="manege"><span>Манеж</span></label>
-          </div>
-        </div>
-      </div>
-
-      <div class="profile-section">Здоровье и пожелания</div>
-      <div class="form-grid">
-        <div class="form-group full">
-          <label>Травмы и ограничения</label>
-          <textarea id="pr-injuries" rows="2" placeholder="Например: правое ахилловое, беспокоит после интервалов"></textarea>
-        </div>
-        <div class="form-group full">
-          <label>От спортсмена — что важно знать тренеру</label>
-          <textarea id="pr-notes" rows="3" placeholder="Цели, режим дня, командировки, предпочтения по тренировкам"></textarea>
-        </div>
-      </div>
-
-      <div class="profile-derived" id="profile-derived"></div>
-
-      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button class="btn-primary" id="profile-save-btn" onclick="saveProfile()" disabled>Сохранить</button>
         <button class="btn-sm" onclick="showLlmPreview()">👁 Показать контекст для ИИ</button>
-        <span id="profile-msg" class="save-msg"></span>
+      </div>
+      <p class="hint">Профиль читает ИИ-тренер: чем он полнее, тем точнее советы. Незаполненное пропускается.</p>
+      <div class="pf-hints" id="pf-hints"></div>
+      <span id="profile-msg" class="save-msg pf-msg"></span>
+    </div>
+
+    <div class="card pf-block" data-block="personal" data-kind="profile">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Личное</div>
+          <div class="pf-why">Возраст — для оценки пульса, рост и вес — для советов ИИ-тренера</div>
+        </div>
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('personal')" disabled>✎ Изменить</button>
+      </div>
+      <span class="save-msg pf-msg"></span>
+      <div class="pf-view"><div id="pf-personal-view"><div class="hint">Загрузка…</div></div></div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group full">
+            <label for="pr-full-name">ФИО</label>
+            <input type="text" id="pr-full-name" placeholder="например, Иванов Иван">
+          </div>
+          <div class="form-group">
+            <label for="pr-birth-date">Дата рождения</label>
+            <input type="date" id="pr-birth-date" oninput="updateProfileHints()">
+          </div>
+          <div class="form-group">
+            <label for="pr-sex">Пол</label>
+            <select id="pr-sex">
+              <option value="">—</option>
+              <option value="m">Мужской</option>
+              <option value="f">Женский</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="pr-height-cm">Рост (см)</label>
+            <input type="number" id="pr-height-cm" min="100" max="250" placeholder="например, 182" oninput="updateProfileHints()">
+          </div>
+          <div class="form-group">
+            <label for="pr-weight-kg">Вес (кг)</label>
+            <input type="number" id="pr-weight-kg" step="0.1" min="30" max="200" placeholder="например, 74" oninput="updateProfileHints()">
+          </div>
+        </div>
+        <div class="pf-calc" id="pf-personal-calc"></div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveProfile()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card pf-block" data-block="hr" data-kind="profile">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Пульс и зоны</div>
+          <div class="pf-why">От них считаются пульсовые зоны, время в зонах и нагрузка по пульсу</div>
+        </div>
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('hr')" disabled>✎ Изменить</button>
+      </div>
+      <span class="save-msg pf-msg"></span>
+      <div class="pf-view"><div id="pf-hr-view"><div class="hint">Загрузка…</div></div></div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="pr-hr-max">Пульс максимальный</label>
+            <input type="number" id="pr-hr-max" min="100" max="230" placeholder="например, 185">
+          </div>
+          <div class="form-group">
+            <label for="pr-hr-threshold">Пульс ПАНО</label>
+            <input type="number" id="pr-hr-threshold" min="80" max="220" placeholder="например, 162">
+          </div>
+          <div class="form-group">
+            <label for="pr-hr-rest">Пульс покоя</label>
+            <input type="number" id="pr-hr-rest" min="30" max="120" placeholder="например, 48">
+          </div>
+        </div>
+        <div class="pf-subtitle">Пульсовые зоны</div>
+        <div id="pr-zones-auto">
+          <div class="hr-zones" id="pr-zones-chips"></div>
+          <p class="hint zone-hint" id="pr-zones-auto-hint"></p>
+          <button class="btn-sm" onclick="setZonesManual(true)">✎ Настроить вручную</button>
+        </div>
+        <!-- Подписи и число строк — как в domain.HR_ZONE_BOUNDS -->
+        <div id="pr-zones-manual" style="display:none">
+          <div class="zone-editor" id="pr-zone-editor">
+            <div class="zone-row">
+              <label for="pr-zone-1">Z1 восстановление</label>
+              <span class="zone-from">от <input type="number" id="pr-zone-1" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+              <span class="zone-to" id="pr-zone-1-to"></span>
+            </div>
+            <div class="zone-row">
+              <label for="pr-zone-2">Z2 аэробная</label>
+              <span class="zone-from">от <input type="number" id="pr-zone-2" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+              <span class="zone-to" id="pr-zone-2-to"></span>
+            </div>
+            <div class="zone-row">
+              <label for="pr-zone-3">Z3 темповая</label>
+              <span class="zone-from">от <input type="number" id="pr-zone-3" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+              <span class="zone-to" id="pr-zone-3-to"></span>
+            </div>
+            <div class="zone-row">
+              <label for="pr-zone-4">Z4 ПАНО</label>
+              <span class="zone-from">от <input type="number" id="pr-zone-4" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+              <span class="zone-to" id="pr-zone-4-to"></span>
+            </div>
+            <div class="zone-row">
+              <label for="pr-zone-5">Z5 максимальная</label>
+              <span class="zone-from">от <input type="number" id="pr-zone-5" min="30" max="230" inputmode="numeric" oninput="updateZoneEditor()"></span>
+              <span class="zone-to" id="pr-zone-5-to"></span>
+            </div>
+          </div>
+          <p class="hint zone-hint">Начало каждой зоны, уд/мин; верх зоны — начало следующей. Заданные вручную зоны не пересчитываются, когда меняется максимальный пульс.</p>
+          <button class="btn-sm" onclick="setZonesManual(false)">↺ Вернуть авторасчёт</button>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveProfile()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card pf-block" data-block="pace" data-kind="profile">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Порог и МПК</div>
+          <div class="pf-why">По пороговому темпу считается нагрузка по темпу</div>
+        </div>
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('pace')" disabled>✎ Изменить</button>
+      </div>
+      <span class="save-msg pf-msg"></span>
+      <div class="pf-view"><div id="pf-pace-view"><div class="hint">Загрузка…</div></div></div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <!-- #66: темп, который держится около часа; без него — оценка по «Стартам» -->
+          <div class="form-group">
+            <label for="pr-threshold-pace">Пороговый темп, мин/км</label>
+            <input type="text" id="pr-threshold-pace" maxlength="5" placeholder="например, 4:35">
+            <p class="hint field-hint" id="pr-threshold-hint"></p>
+          </div>
+          <div class="form-group">
+            <label for="pr-vo2max">МПК (VO₂max)</label>
+            <input type="number" id="pr-vo2max" step="0.1" min="20" max="90" placeholder="например, 52">
+          </div>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveProfile()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card pf-block" data-block="training" data-kind="profile">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Режим тренировок</div>
+          <div class="pf-why">ИИ-тренер учитывает режим, когда предлагает правки плана</div>
+        </div>
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('training')" disabled>✎ Изменить</button>
+      </div>
+      <span class="save-msg pf-msg"></span>
+      <div class="pf-view"><div id="pf-training-view"><div class="hint">Загрузка…</div></div></div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="pr-sessions">Тренировок в неделю</label>
+            <input type="number" id="pr-sessions" min="0" max="14" placeholder="например, 4">
+          </div>
+          <div class="form-group">
+            <label for="pr-weekly-km">Обычный объём (км/нед)</label>
+            <input type="number" id="pr-weekly-km" step="1" min="0" max="300" placeholder="например, 45">
+          </div>
+          <div class="form-group">
+            <label for="pr-years-running">Стаж бега (лет)</label>
+            <input type="number" id="pr-years-running" step="0.5" min="0" max="70" placeholder="например, 6">
+          </div>
+          <div class="form-group">
+            <label for="pr-long-run-day">День длительной</label>
+            <select id="pr-long-run-day">
+              <option value="">—</option>
+              <option value="mon">Понедельник</option>
+              <option value="tue">Вторник</option>
+              <option value="wed">Среда</option>
+              <option value="thu">Четверг</option>
+              <option value="fri">Пятница</option>
+              <option value="sat">Суббота</option>
+              <option value="sun">Воскресенье</option>
+            </select>
+          </div>
+          <div class="form-group full">
+            <label>Дни, доступные для тренировок</label>
+            <div class="day-picker" id="pr-available-days">
+              <label><input type="checkbox" value="mon" id="pr-day-mon"><span>Пн</span></label>
+              <label><input type="checkbox" value="tue"><span>Вт</span></label>
+              <label><input type="checkbox" value="wed"><span>Ср</span></label>
+              <label><input type="checkbox" value="thu"><span>Чт</span></label>
+              <label><input type="checkbox" value="fri"><span>Пт</span></label>
+              <label><input type="checkbox" value="sat"><span>Сб</span></label>
+              <label><input type="checkbox" value="sun"><span>Вс</span></label>
+            </div>
+          </div>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveProfile()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Погода (#72): по этим полям в плане появляются прогноз и советы -->
+    <div class="card pf-block" data-block="weather" data-kind="profile">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Погода и место</div>
+          <div class="pf-why">Прогноз в плане и советы: что надеть и где бежать</div>
+        </div>
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('weather')" disabled>✎ Изменить</button>
+      </div>
+      <span class="save-msg pf-msg"></span>
+      <div class="pf-view"><div id="pf-weather-view"><div class="hint">Загрузка…</div></div></div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group full">
+            <label for="pr-city">Город для прогноза</label>
+            <div class="city-row">
+              <!-- data-pf-skip: строка поиска — не значение профиля, её набор не правка блока -->
+              <input type="text" id="pr-city" placeholder="Найти город, например: Казань"
+                     onkeydown="cityKeydown(event)" data-pf-skip>
+              <button class="btn-sm" onclick="searchCity()">Найти</button>
+              <button class="btn-sm" onclick="useMyLocation()">📍 Моё местоположение</button>
+            </div>
+            <div id="pr-city-results" class="city-results"></div>
+            <div id="pr-location" class="location-line"></div>
+            <div id="pr-location-note" class="hint" style="margin:4px 0 0"></div>
+          </div>
+          <div class="form-group">
+            <label for="pr-run-time">Обычно бегаю в</label>
+            <input type="time" id="pr-run-time">
+          </div>
+          <div class="form-group">
+            <label for="pr-cold">Как переношу холод</label>
+            <select id="pr-cold">
+              <option value="">Обычно</option>
+              <option value="cold">Мёрзну быстрее других</option>
+              <option value="warm">Мне быстро жарко</option>
+            </select>
+          </div>
+          <div class="form-group full">
+            <label>Где ещё можно тренироваться, кроме улицы</label>
+            <div class="day-picker" id="pr-venues">
+              <label><input type="checkbox" value="treadmill" id="pr-venue-treadmill"><span>Дорожка в зале</span></label>
+              <label><input type="checkbox" value="manege"><span>Манеж</span></label>
+            </div>
+          </div>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveProfile()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card pf-block" data-block="health" data-kind="profile">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Здоровье и пожелания</div>
+          <div class="pf-why">Это читает ИИ-тренер; тренеру-человеку профиль не показывается</div>
+        </div>
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('health')" disabled>✎ Изменить</button>
+      </div>
+      <span class="save-msg pf-msg"></span>
+      <div class="pf-view"><div id="pf-health-view"><div class="hint">Загрузка…</div></div></div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group full">
+            <label for="pr-injuries">Травмы и ограничения</label>
+            <textarea id="pr-injuries" rows="2" placeholder="Например: правое ахиллово, беспокоит после интервалов"></textarea>
+          </div>
+          <div class="form-group full">
+            <label for="pr-notes">От спортсмена — что важно знать тренеру</label>
+            <textarea id="pr-notes" rows="3" placeholder="Цели, режим дня, командировки, предпочтения по тренировкам"></textarea>
+          </div>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveProfile()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
       </div>
     </div>
 
@@ -794,28 +898,42 @@
       <div id="profile-pb"><div class="empty">Загрузка…</div></div>
     </div>
 
-    <!-- Мой тренер (#44) -->
-    <div class="card" style="margin-bottom:12px">
-      <div class="card-title">Мой тренер</div>
-      <p class="hint">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается. Менять тренер может только планы, и только пока вы это разрешаете.</p>
-      <div class="form-grid">
-        <div class="form-group full">
-          <label>Тренер</label>
-          <select id="coach-select" disabled>
-            <option value="">— без тренера —</option>
-          </select>
+    <div class="pf-group-title">Доступ и настройки</div>
+
+    <!-- Мой тренер (#44): выбор — блоком (#87), право на правку планов (#60) — сразу из просмотра -->
+    <div class="card pf-block" data-block="coach" data-kind="coach">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Мой тренер</div>
+          <div class="pf-why">Тренер видит ваши планы, выполнение по неделям и журнал пробежек с деталями. Профиль — вес, пульс, травмы — ему не показывается.</div>
         </div>
+        <button class="btn-sm pf-edit-btn" id="mycoach-edit-btn" onclick="openProfileBlock('coach')">✎ Изменить</button>
       </div>
-      <!-- #60: разрешение тренеру править планы, по умолчанию включено -->
-      <label class="check-row" id="coach-plan-edit-row" style="display:none">
-        <input type="checkbox" id="coach-plan-edit" checked onchange="saveCoachPlanEdit(this.checked)">
-        <span>Тренер может создавать и менять мои планы
-          <small>О каждой правке тренер сообщает в диалоге, прежние версии плана остаются в истории. Активный план и архив всегда выбираете вы.</small>
-        </span>
-      </label>
-      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button class="btn-primary" id="coach-save-btn" onclick="saveMyCoach()" disabled>Сохранить</button>
-        <span id="coach-msg" class="save-msg"></span>
+      <span id="coach-msg" class="save-msg pf-msg"></span>
+      <div class="pf-view">
+        <div id="pf-coach-view"><div class="hint">Загрузка…</div></div>
+        <!-- #60: разрешение тренеру править планы, по умолчанию включено -->
+        <label class="check-row" id="coach-plan-edit-row" style="display:none">
+          <input type="checkbox" id="coach-plan-edit" checked onchange="saveCoachPlanEdit(this.checked)">
+          <span>Тренер может создавать и менять мои планы
+            <small>О каждой правке тренер сообщает в диалоге, прежние версии плана остаются в истории. Активный план и архив всегда выбираете вы.</small>
+          </span>
+        </label>
+      </div>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group full">
+            <label for="coach-select">Тренер</label>
+            <select id="coach-select" disabled>
+              <option value="">— без тренера —</option>
+            </select>
+          </div>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" id="coach-save-btn" onclick="saveMyCoach()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
       </div>
     </div>
 
@@ -823,38 +941,55 @@
       <div class="card-title">Настройки ИИ</div>
       <p class="hint">ИИ-тренер настроен администратором приложения и доступен всем пользователям во вкладке «ИИ-тренер».</p>
     </div>
-    <div class="card" id="llm-settings-card">
-      <div class="card-title">Настройки LLM</div>
-      <p class="hint">Подключите внешнюю LLM (Anthropic / OpenAI / Deepseek) для ИИ-тренера. Ключ хранится в приватном GCS-объекте и не передаётся обратно фронту.</p>
-      <div class="form-grid">
-        <div class="form-group">
-          <label>Провайдер</label>
-          <select id="s-provider" onchange="updateModelOptions()">
-            <option value="openai">OpenAI (GPT)</option>
-            <option value="deepseek">Deepseek</option>
-          </select>
+    <!-- Настройки модели — только администратору; блоком (#87) -->
+    <div class="card pf-block" data-block="llm" data-kind="llm" id="llm-settings-card">
+      <div class="pf-block-head">
+        <div>
+          <div class="pf-block-title">Настройки LLM</div>
+          <div class="pf-why">Модель ИИ-тренера, общая для всех пользователей. Ключ хранится на сервере и обратно не показывается.</div>
         </div>
-        <div class="form-group">
-          <label>Модель</label>
-          <select id="s-model"></select>
-        </div>
-        <div class="form-group">
-          <label>Глубина рассуждения</label>
-          <select id="s-effort">
-            <option value="low">Низкая — быстро и дёшево</option>
-            <option value="medium" selected>Средняя</option>
-            <option value="high">Высокая — для сложных корректировок</option>
-          </select>
-        </div>
-        <div class="form-group full">
-          <label>API ключ <span id="s-key-current" style="color:var(--text-muted);font-weight:400;font-size:11px"></span></label>
-          <input type="password" id="s-api-key" placeholder="введите новый ключ или оставьте пустым" autocomplete="new-password">
+        <button class="btn-sm pf-edit-btn" onclick="openProfileBlock('llm')">✎ Изменить</button>
+      </div>
+      <span id="settings-msg" class="save-msg pf-msg"></span>
+      <div class="pf-view">
+        <div id="pf-llm-view"><div class="hint">Загрузка…</div></div>
+        <!-- Проверяет сохранённый конфиг, поэтому живёт в просмотре, а не рядом с полем ключа -->
+        <div class="pf-view-actions">
+          <button class="btn-sm" id="llm-test-btn" onclick="testLlmKey()" disabled>Проверить ключ</button>
         </div>
       </div>
-      <div style="margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button class="btn-primary" onclick="saveLlmConfig()">Сохранить</button>
-        <button class="btn-sm" onclick="testLlmKey()">Проверить ключ</button>
-        <span id="settings-msg" class="save-msg"></span>
+      <div class="pf-edit">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="s-provider">Провайдер</label>
+            <select id="s-provider" onchange="updateModelOptions()">
+              <option value="openai">OpenAI (GPT)</option>
+              <option value="deepseek">Deepseek</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="s-model">Модель</label>
+            <select id="s-model"></select>
+          </div>
+          <div class="form-group">
+            <label for="s-effort">Глубина рассуждения</label>
+            <select id="s-effort">
+              <option value="low">Низкая — быстро и дёшево</option>
+              <option value="medium" selected>Средняя</option>
+              <option value="high">Высокая — для сложных корректировок</option>
+            </select>
+          </div>
+          <div class="form-group full">
+            <label for="s-api-key">API ключ <span id="s-key-current" style="color:var(--text-muted);font-weight:400;font-size:11px"></span></label>
+            <input type="password" id="s-api-key" placeholder="вставьте ключ" autocomplete="new-password">
+            <p class="hint field-hint">Ключ нужен при каждом сохранении: сервер хранит его и обратно не показывает.</p>
+          </div>
+        </div>
+        <div class="pf-actions">
+          <button class="btn-primary pf-save" onclick="saveLlmConfig()" disabled>Сохранить</button>
+          <button class="btn-sm" onclick="cancelProfileBlock()">Отмена</button>
+          <span class="pf-dirty-note">Есть несохранённые изменения</span>
+        </div>
       </div>
     </div>
   </div>
@@ -1210,6 +1345,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=56"></script>
+<script src="app.js?v=57"></script>
 </body>
 </html>
