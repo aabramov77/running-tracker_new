@@ -3,14 +3,16 @@
 - Issue: https://github.com/aabramov77/running-tracker_new/issues/71
 - Ветка: `Dev`
 - Коммиты: `feat: #71 …`
-- PR: `Dev → main`, `Closes #71` (ссылка появится после открытия)
-- OpenSpec: change `runs-outside-plan` —
-  `openspec/changes/runs-outside-plan/` (proposal, design, дельты `run-log`
-  и `training-load`, tasks). Требования и решения — там; этот файл —
-  контекст, история решений и верификация.
+- PR: [#91](https://github.com/aabramov77/running-tracker_new/pull/91)
+  `Dev → main`, `Closes #71`
+- OpenSpec: change `runs-outside-plan` в архиве —
+  `openspec/changes/archive/2026-11-14-runs-outside-plan/` (proposal,
+  design, дельты, tasks). Требования — в основных спеках `run-log`,
+  `training-load`, `ai-coach-dialog`; этот файл — контекст, история решений
+  и верификация.
 - Статус: предложение 2026-11-13; доработано 2026-11-14 после сверки с
-  кодом (решения ниже); реализовано 2026-11-14 (см. «Реализация» в конце
-  файла).
+  кодом (решения ниже); реализовано и смержено 2026-11-14 (PR #91, см.
+  «Реализация» в конце файла), change заархивирован.
 
 ## Контекст
 
