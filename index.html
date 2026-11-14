@@ -13,7 +13,7 @@
 <meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
 <meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=36">
+<link rel="stylesheet" href="style.css?v=37">
 <link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -435,7 +435,7 @@
       </div>
       <p class="hint" style="margin-bottom:14px">FIT-загрузка заполняет форму распарсенными значениями (включая лапы и пульс по времени). Запись создаётся при нажатии «Сохранить пробежку».</p>
       <div class="form-grid">
-        <div class="form-group full" id="f-plan-group" style="display:none">
+        <div class="form-group full" id="f-plan-group">
           <label>План</label>
           <select id="f-plan"></select>
         </div>
@@ -499,10 +499,11 @@
   <!-- ЖУРНАЛ -->
   <div id="tab-log" class="tab">
     <div class="card">
-      <div class="week-header">
+      <div class="week-header" style="flex-wrap:wrap;gap:8px">
         <div class="card-title" style="margin:0">Журнал пробежек</div>
         <div style="display:flex;gap:6px;align-items:center">
           <button class="btn-sm scope-btn active" data-scope="plan" onclick="setRunScope('plan',this)">Текущий план</button>
+          <button class="btn-sm scope-btn" data-scope="none" onclick="setRunScope('none',this)">Без плана</button>
           <button class="btn-sm scope-btn" data-scope="all" onclick="setRunScope('all',this)">Все</button>
         </div>
       </div>
@@ -518,15 +519,16 @@
   <!-- АНАЛИТИКА -->
   <div id="tab-stats" class="tab">
     <div class="card" style="margin-bottom:12px">
-      <div class="week-header" style="margin:0">
+      <div class="week-header" style="margin:0;flex-wrap:wrap;gap:8px">
         <div class="card-title" style="margin:0">Область данных</div>
         <div style="display:flex;gap:6px;align-items:center">
           <button class="btn-sm scope-btn active" data-scope="plan" onclick="setRunScope('plan',this)">Текущий план</button>
+          <button class="btn-sm scope-btn" data-scope="none" onclick="setRunScope('none',this)">Без плана</button>
           <button class="btn-sm scope-btn" data-scope="all" onclick="setRunScope('all',this)">Все</button>
         </div>
       </div>
     </div>
-    <div class="card"><div class="card-title">Недельный объём: план и факт (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
+    <div class="card" id="week-chart-card"><div class="card-title">Недельный объём: план и факт (км)</div><div class="chart-wrap"><canvas id="weekChart"></canvas></div></div>
     <!-- Нагрузка по темпу и пульсу (#66): содержимое рисует renderLoadCard -->
     <div class="card" style="margin-top:12px"><div class="card-title">Недельная нагрузка</div><div id="load-body"></div></div>
     <div class="card" style="margin-top:12px"><div class="card-title">Динамика темпа (мин/км)</div><div class="chart-wrap"><canvas id="paceChart"></canvas></div></div>
@@ -1345,6 +1347,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=57"></script>
+<script src="app.js?v=58"></script>
 </body>
 </html>

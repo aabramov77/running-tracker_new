@@ -25,7 +25,8 @@ from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
 from compliance import (DEFAULT as UNDATED, anchor_source,
                         current_week_idx, plan_compliance,
-                        planned_for_date, to_date, week_days, week_window)
+                        planned_for_date, to_date, week_days, week_window,
+                        week_windows)
 from domain import (DIST_LABEL_KM, FEEL_LABELS, HR_ZONE_BOUNDS, MEMORY_FACTS_MAX,
                     MEMORY_KIND_LABELS, MEMORY_OPS_MAX, MEMORY_TEXT_MAX, PLAN_DAYS,
                     TYPE_LABELS, parse_time_to_sec, personal_bests)
@@ -364,9 +365,12 @@ def _clean_text_fields(raw, entity, errors, limits, prefix=""):
 def clean_run(raw, plans_index):
     """Пробежка из тела запроса → (пробежка, ошибки).
 
-    id, plan_id и fit_token в результате могут быть None: id тогда выдаёт
-    сервер, пробежка уходит в активный план, FIT к ней не приложен. plan_id
-    принимается только из своего реестра планов (plans_index).
+    id и fit_token в результате могут быть None: id тогда выдаёт сервер, FIT
+    к пробежке не приложен. plan_id в результате есть, только если ключ был
+    в теле (#71): None (из null или "") значит «без плана», а отсутствие
+    ключа — «по умолчанию» (при правке прежний план, у новой пробежки — по
+    дате, см. save_run). plan_id принимается только из своего реестра планов
+    (plans_index), архивные тоже.
     """
     run, errors = {}, {}
     _clean_entity_head(raw, run, errors)
@@ -392,13 +396,14 @@ def clean_run(raw, plans_index):
     _clean_text_fields(raw, run, errors, {"time": SHORT_TEXT_MAX, "pace": SHORT_TEXT_MAX,
                                           "notes": RUN_NOTES_MAX})
 
-    plan_id = raw.get("plan_id")
-    run["plan_id"] = None
-    if plan_id not in (None, ""):
-        if isinstance(plan_id, str) and find_plan(plans_index, plan_id):
-            run["plan_id"] = plan_id
-        else:
-            errors["plan_id"] = "нет такого плана"
+    if "plan_id" in raw:
+        plan_id = raw["plan_id"]
+        run["plan_id"] = None
+        if plan_id not in (None, ""):
+            if isinstance(plan_id, str) and find_plan(plans_index, plan_id):
+                run["plan_id"] = plan_id
+            else:
+                errors["plan_id"] = "нет такого плана"
 
     token = raw.get("fit_token")
     run["fit_token"] = None
@@ -1355,15 +1360,18 @@ def _drop_tmp_fit(staged):
 
 
 def save_run(bucket, sub, run, fit_token=None, base_version=None, change_reason="",
-             created_by="api", author="athlete", default_plan_id=None):
+             created_by="api", author="athlete", default_plan=None):
     """Создание или правка пробежки → запись индекса.
 
     run — id и поля пользователя (RUN_FIELDS). Поля из FIT и детали
     переходят из текущей версии; с fit_token в новую версию ложатся свои
     details.json и activity.fit из tmp/ — FIT к той же пробежке ещё раз
-    тоже новая версия. plan_id не пришёл: при правке остаётся прежний, у
-    новой пробежки — default_plan_id (активный план). base_version не
-    совпал с текущей → RunStale, скрытая пробежка → EntityDeleted.
+    тоже новая версия. Ключ plan_id есть — пишется как есть, None значит
+    «без плана» (#71). Ключа нет: при правке остаётся прежний план, у новой
+    пробежки — default_plan(дата) (привязка по дате, plan_for_date) или None.
+    default_plan вызывается только для новой пробежки, правка недели планов
+    не читает. base_version не совпал с текущей → RunStale, скрытая
+    пробежка → EntityDeleted.
     """
     run_id = run["id"]
     staged = _staged_fit(bucket, sub, fit_token) if fit_token else None
@@ -1379,8 +1387,11 @@ def save_run(bucket, sub, run, fit_token=None, base_version=None, change_reason=
         _editable(prev)
         old = (prev or {}).get("run") or {}
         snapshot = _snapshot(RUNS, run, old)
-        if snapshot.get("plan_id") is None:
-            snapshot["plan_id"] = old.get("plan_id") if prev else default_plan_id
+        if "plan_id" not in run:
+            if prev:
+                snapshot["plan_id"] = old.get("plan_id")
+            else:
+                snapshot["plan_id"] = default_plan(run.get("date")) if default_plan else None
         links = _links(RUNS, prev) if prev else {**_links(RUNS, None), **inherited}
         if staged:
             links = _place_fit(bucket, sub, run_id, version, current, staged)
@@ -1822,6 +1833,42 @@ def find_plan(index, plan_id):
 def get_active_plan(bucket, sub):
     index = read_plans_index(bucket, sub)
     return find_plan(index, index.get("active_plan_id"))
+
+
+def plan_for_date(bucket, sub, index, day):
+    """План новой пробежки по её дате (#71); None — пробежка без плана.
+
+    Смотрим все планы реестра, включая архивные: без плана остаётся только
+    пробежка, в дату которой нет никакого плана. Диапазон плана — от начала
+    первого до конца последнего окна недель, те же окна, что у план/факта и
+    «Нед N». Пустые и недатированные планы по дате не выбираются. Подошло
+    несколько — активный, иначе начавшийся позже.
+
+    Не подошёл ни один, а у активного плана диапазон неизвестен (недель нет
+    или они ничем не датированы) — активный план: где он кончается,
+    неизвестно, и прежнее поведение безопаснее, чем пробежка без плана.
+    """
+    day = to_date(day)
+    active_id = index.get("active_plan_id")
+    active_dated = False
+    matches = []
+    for plan in index.get("plans", []):
+        plan_id = plan.get("id")
+        weeks = read_plan_weeks(bucket, sub, plan_id) if plan_id else []
+        plan_start = plan.get("plan_start")
+        if not weeks or anchor_source(plan_start, weeks) == UNDATED:
+            continue
+        active_dated = active_dated or plan_id == active_id
+        windows = week_windows(weeks, plan_start)
+        first = min(start for start, _ in windows)
+        last = max(end for _, end in windows)
+        if day and first <= day <= last:
+            matches.append((plan_id == active_id, first, plan_id))
+    if matches:
+        return max(matches)[2]
+    if find_plan(index, active_id) and not active_dated:
+        return active_id
+    return None
 
 
 # Реестр планов с #60 пишут двое — спортсмен и его тренер, и «прочитал,

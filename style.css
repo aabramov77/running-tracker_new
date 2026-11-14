@@ -239,7 +239,10 @@ table.plan tr:hover td { background: var(--bg-metric); }
 .hidden-block { margin-top: 12px; }
 .hidden-block > .btn-sm { color: var(--text-muted); }
 
-/* Переключатель области данных: текущий план / все (#25) */
+/* Переключатель области данных: текущий план / без плана / все (#25, #71).
+   На телефоне три кнопки не помещаются в строку с заголовком: шапка
+   переносит переключатель целиком, а не ломает подписи кнопок. */
+.scope-btn { white-space: nowrap; }
 .scope-btn.active {
   background: var(--c-accent);
   color: white;

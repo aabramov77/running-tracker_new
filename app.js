@@ -27,7 +27,7 @@ let myCoach = null;         // #44: выбранный тренер {sub, name} 
 let myCoachPlanEdit = true; // #60: разрешено ли тренеру править планы
 let PLANS = [];             // все планы пользователя (#25)
 let ACTIVE_PLAN = null;     // активный план — от него зависят заголовок, метрики, LLM
-let runScope = 'plan';      // 'plan' — пробежки активного плана, 'all' — все
+let runScope = 'plan';      // 'plan' — пробежки активного плана, 'none' — без плана (#71), 'all' — все
 let LOAD = null;            // #66: нагрузка по темпу и пульсу — ответ GET /load
 
 // Payload JWT — только для namespace кэша и выбора стартового экрана (не для
@@ -333,16 +333,31 @@ function renderPlanSelectors() {
   }
   const historyBtn = document.getElementById('plan-history-btn');
   if (historyBtn) historyBtn.style.display = activePlanId() ? '' : 'none';
-  const runSel = document.getElementById('f-plan');
-  if (runSel) {
-    const prev = runSel.value;
-    runSel.innerHTML = list.map(p =>
-      `<option value="${escapeHtml(p.id)}">${escapeHtml(planLabel(p))}</option>`).join('');
-    runSel.value = (prev && list.some(p => p.id === prev)) ? prev : (activePlanId() || '');
-    const wrap = document.getElementById('f-plan-group');
-    if (wrap) wrap.style.display = list.length ? '' : 'none';
-  }
+  renderRunPlanSelect();
   fillRaceForm();
+}
+
+// Список «План» в форме пробежки (#71). auto и none — значения только формы:
+// auto — запрос без ключа plan_id (новую пробежку сервер привяжет по дате),
+// none — plan_id: null. При правке «Авто» нет: выбран план пробежки, а её
+// архивный (или ещё не загруженный) план добавлен в список — иначе правка
+// заметки отвязала бы пробежку. selected — что выбрать; без него остаётся
+// прежний выбор, если такой пункт ещё есть.
+function renderRunPlanSelect(selected) {
+  const sel = document.getElementById('f-plan');
+  if (!sel) return;
+  const want = selected !== undefined ? selected : sel.value;
+  const opts = runEdit ? [] : [['auto', 'Авто (по дате)']];
+  opts.push(['none', 'Без плана']);
+  livePlans().forEach(p => opts.push([p.id, planLabel(p)]));
+  const own = runEdit && runEdit.plan_id;
+  if (own && !opts.some(([v]) => v === own)) {
+    const plan = PLANS.find(p => p.id === own);
+    opts.push([own, plan ? `${planLabel(plan)}${plan.archived ? ' (архив)' : ''}` : 'План пробежки']);
+  }
+  sel.innerHTML = opts.map(([v, label]) =>
+    `<option value="${escapeHtml(v)}">${escapeHtml(label)}</option>`).join('');
+  sel.value = opts.some(([v]) => v === want) ? want : (runEdit ? (own || 'none') : 'auto');
 }
 
 // Поля карточки гонки. Форм две — своя (p-*) и у тренера (cp-*, #60), — поля
@@ -483,9 +498,10 @@ function setRunScope(scope, btn) {
   if (document.getElementById('tab-stats').classList.contains('active')) renderCharts();
 }
 
-/** Активные пробежки с учётом выбранной области (план / все). */
+/** Активные пробежки с учётом выбранной области (план / без плана / все). */
 function scopedRuns() {
   const active = runs.filter(r => !r.deleted);
+  if (runScope === 'none') return active.filter(r => r.plan_id == null);   // #71
   const pid = activePlanId();
   if (runScope === 'all' || !pid) return active;
   return active.filter(r => r.plan_id === pid);
@@ -807,8 +823,11 @@ function formatPace(v) {
 }
 // Неделя плана, в чьё окно попадает дата, — по тем же окнам, что и таблица:
 // отсчёт семидневок от plan_start расходился с подписями строк.
-function getWeekLabel(dateStr) {
-  const d = localDate(dateStr);
+// «Нед N» — номер недели активного плана, поэтому только у его пробежек (#71):
+// пробежке без плана или из другого плана чужой номер ни о чём не говорит.
+function getWeekLabel(run) {
+  if (!run || (run.plan_id || null) !== activePlanId()) return '';
+  const d = localDate(run.date);
   if (!d || !PLAN || !PLAN.length || !planIsDated()) return '';
   const i = weekWindows().findIndex(([s, e]) => d >= s && d <= e);
   return i >= 0 ? `Нед ${i + 1}` : '';
@@ -836,8 +855,10 @@ async function saveRun() {
     if (reason) run.change_reason = reason;
   }
   if (_pendingFitToken) run.fit_token = _pendingFitToken;
-  const planSel = document.getElementById('f-plan');
-  if (planSel && planSel.value) run.plan_id = planSel.value;   // #25
+  // План (#25, #71): «Авто» — без ключа, сервер привяжет по дате; «Без плана» — null
+  const planChoice = document.getElementById('f-plan')?.value || 'auto';
+  if (planChoice === 'none') run.plan_id = null;
+  else if (planChoice !== 'auto') run.plan_id = planChoice;
 
   const btn = document.getElementById('run-save-btn');
   btn.disabled = true; btn.textContent = 'Сохраняем…';
@@ -875,6 +896,7 @@ async function saveRun() {
 
 function clearRunForm() {
   ['f-dist','f-time','f-pace','f-hr','f-notes','f-reason'].forEach(id => document.getElementById(id).value = '');
+  renderRunPlanSelect('auto');   // следующая пробежка — снова по дате (#71)
 }
 
 // ── Правка пробежки (#76) ──
@@ -898,12 +920,11 @@ function fillRunForm(run) {
   set('f-date', run.date); set('f-type', run.type || 'easy'); set('f-dist', run.dist);
   set('f-time', run.time); set('f-pace', run.pace); set('f-hr', run.hr);
   set('f-feel', run.feel || 'good'); set('f-notes', run.notes); set('f-reason', '');
-  const planSel = document.getElementById('f-plan');
-  if (planSel && [...planSel.options].some(o => o.value === run.plan_id)) planSel.value = run.plan_id;
   // FIT, разобранный до правки, к этой пробежке не относится
   _pendingFitToken = null;
   document.getElementById('garmin-msg').style.display = 'none';
-  runEdit = { id: run.id, version: run.version ?? null, date: run.date };
+  runEdit = { id: run.id, version: run.version ?? null, date: run.date, plan_id: run.plan_id || null };
+  renderRunPlanSelect(run.plan_id || 'none');
   renderRunEditMode();
 }
 
@@ -1459,7 +1480,7 @@ function renderToday() {
         <button class="btn-sm" onclick="showTab('log')">Весь журнал</button>
       </div>
       ${recent.length
-        ? recent.map(r => runItemHtml(r, { onclick: `showRunDetail(${Number(r.id)})`, weekLabel: getWeekLabel(r.date) })).join('')
+        ? recent.map(r => runItemHtml(r, { onclick: `showRunDetail(${Number(r.id)})`, weekLabel: getWeekLabel(r) })).join('')
         : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>'}
     </div>`;
 
@@ -2029,14 +2050,16 @@ function renderLog() {
   if (!activeRuns.length) {
     el.innerHTML = runScope === 'plan' && activePlanId()
       ? '<div class="empty">В этом плане пробежек пока нет. Переключитесь на «Все» или добавьте первую!</div>'
-      : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>';
+      : runScope === 'none'
+        ? '<div class="empty">Пробежек вне планов нет.</div>'
+        : '<div class="empty">Пробежек пока нет. Добавьте первую!</div>';
     return;
   }
   const planName = {};
   PLANS.forEach(p => { planName[p.id] = planLabel(p); });
   el.innerHTML = activeRuns.map(r => runItemHtml(r, {
     onclick: `showRunDetail(${Number(r.id)})`,
-    weekLabel: getWeekLabel(r.date),
+    weekLabel: getWeekLabel(r),
     planName: runScope === 'all' ? planName[r.plan_id] : '',
     deletable: true,
     reviewable: true,
@@ -2653,9 +2676,15 @@ function renderCharts() {
   const exact = weeks ? weeks.map(w => w.complete) : null;
   const sortedRuns = [...activeRuns].sort((a,b) => String(a.date).localeCompare(String(b.date)));
 
-  if(wChart)wChart.destroy();
-  wChart=new Chart(document.getElementById('weekChart').getContext('2d'),
-                   weekChartConfig(n, planned, exact, actual));
+  // В области «без плана» недельного графика нет (#71): недели — это окна
+  // активного плана, а пробежки этой области почти все вне них. Карточку
+  // показываем до создания графика: в скрытой Chart.js получит нулевой размер.
+  const showWeeks = runScope !== 'none';
+  document.getElementById('week-chart-card').style.display = showWeeks ? '' : 'none';
+  if(wChart){wChart.destroy();wChart=null;}
+  if (showWeeks)
+    wChart=new Chart(document.getElementById('weekChart').getContext('2d'),
+                     weekChartConfig(n, planned, exact, actual));
   if(pChart)pChart.destroy();
   pChart=new Chart(document.getElementById('paceChart').getContext('2d'),{type:'line',data:{labels:sortedRuns.map(r=>String(r.date).slice(5)),datasets:[{label:'темп',data:sortedRuns.map(r=>{const p=parsePace(r.pace);return p?+p.toFixed(2):null;}),borderColor:'#185FA5',backgroundColor:'rgba(24,95,165,0.08)',pointRadius:4,tension:.3,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{reverse:true,ticks:{callback:v=>v?formatPace(v):''},beginAtZero:false},x:{ticks:{font:{size:10}}}}}});
   renderLoadCard('athlete');

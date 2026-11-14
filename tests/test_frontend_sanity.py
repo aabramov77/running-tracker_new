@@ -1638,3 +1638,68 @@ def test_coach_and_llm_blocks_keep_their_controls_where_they_belong():
     assert "getElementById('llm-test-btn').disabled = !(cfg && cfg.configured)" in _fn(js, "renderLlmView")
     coach = _js_section(js, "async function saveMyCoach() {", "\n}\n")
     assert coach.index("confirm(") < coach.index("fetch(")
+
+
+# ── Пробежки вне планов (#71) ─────────────────────────────────────────────────
+
+def test_scope_buttons_offer_runs_without_a_plan():
+    """Область «Без плана» есть и в журнале, и в аналитике: setRunScope
+    подсвечивает кнопки по data-scope, и набор в двух местах должен совпадать."""
+    html = INDEX.read_text(encoding="utf-8")
+    for scope, label in (("plan", "Текущий план"), ("none", "Без плана"), ("all", "Все")):
+        button = f'data-scope="{scope}" onclick="setRunScope(\'{scope}\',this)">{label}<'
+        assert html.count(button) == 2, scope
+    # На телефоне три кнопки не помещаются в строку с заголовком: шапка
+    # переносит переключатель, а подписи кнопок не ломаются на две строки.
+    assert html.count('style="flex-wrap:wrap;gap:8px">\n        <div class="card-title" style="margin:0">Журнал') == 1
+    assert 'style="margin:0;flex-wrap:wrap;gap:8px">\n        <div class="card-title" style="margin:0">Область' in html
+    assert ".scope-btn { white-space: nowrap; }" in STYLE.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "runScope === 'none'" in _fn(js, "scopedRuns")
+    assert "r.plan_id == null" in _fn(js, "scopedRuns")
+
+
+def test_run_form_always_shows_the_plan_choice():
+    html = INDEX.read_text(encoding="utf-8")
+    assert '<div class="form-group full" id="f-plan-group">' in html
+    js = APP_JS.read_text(encoding="utf-8")
+    select = _fn(js, "renderRunPlanSelect")
+    assert "['auto', 'Авто (по дате)']" in select and "['none', 'Без плана']" in select
+    assert "runEdit ? [] :" in select                 # при правке «Авто» нет
+    assert "' (архив)'" in select                     # архивный план пробежки в списке
+    assert "renderRunPlanSelect()" in _fn(js, "renderPlanSelectors")
+
+
+def test_run_plan_choice_maps_to_the_api_contract():
+    """«Авто» — без ключа plan_id, «Без плана» — null; служебные значения
+    формы на сервер не уходят."""
+    js = APP_JS.read_text(encoding="utf-8")
+    save = _js_section(js, "async function saveRun() {", "\n}\n")
+    assert "if (planChoice === 'none') run.plan_id = null;" in save
+    assert "else if (planChoice !== 'auto') run.plan_id = planChoice;" in save
+    assert "run.plan_id = planSel.value" not in save
+
+
+def test_run_plan_choice_returns_to_auto_and_edit_keeps_the_plan():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "renderRunPlanSelect('auto')" in _fn(js, "clearRunForm")
+    assert "clearRunForm()" in _fn(js, "endRunEdit")
+    fill = _fn(js, "fillRunForm")
+    assert "plan_id: run.plan_id || null" in fill
+    assert fill.index("runEdit = {") < fill.index("renderRunPlanSelect(run.plan_id || 'none')")
+
+
+def test_week_label_only_for_runs_of_the_active_plan():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "!== activePlanId()) return ''" in _fn(js, "getWeekLabel")
+    assert "getWeekLabel(r.date)" not in js           # и журнал, и «Сегодня» передают пробежку
+    assert js.count("weekLabel: getWeekLabel(r)") == 2
+
+
+def test_week_chart_is_hidden_for_runs_without_a_plan():
+    html = INDEX.read_text(encoding="utf-8")
+    assert '<div class="card" id="week-chart-card">' in html
+    charts = _fn(APP_JS.read_text(encoding="utf-8"), "renderCharts")
+    assert "const showWeeks = runScope !== 'none';" in charts
+    # карточку показываем до new Chart: в скрытой у графика нулевой размер
+    assert charts.index("week-chart-card") < charts.index("new Chart(document.getElementById('weekChart')")

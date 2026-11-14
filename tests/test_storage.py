@@ -659,6 +659,111 @@ def test_archive_plan_switches_active(storage_module, fake_bucket):
     assert storage_module.set_active_plan(fake_bucket, SUB, b["id"]) is None
 
 
+# ── Пробежка и план (#71): явное «без плана», привязка по дате ────────────────
+
+RUN_BODY = {"date": "2026-08-16", "dist": 10}
+RUN_PLANS = {"active_plan_id": "now", "plans": [{"id": "now"}, {"id": "old", "archived": True}]}
+
+
+def test_clean_run_without_plan_key_leaves_the_plan_to_the_server(storage_module):
+    run, errors = storage_module.clean_run(RUN_BODY, RUN_PLANS)
+    assert not errors and "plan_id" not in run
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), ("", None), ("now", "now"),
+                                            ("old", "old")])
+def test_clean_run_keeps_an_explicit_plan_or_no_plan(storage_module, value, expected):
+    run, errors = storage_module.clean_run({**RUN_BODY, "plan_id": value}, RUN_PLANS)
+    assert not errors and run["plan_id"] == expected
+
+
+def test_clean_run_rejects_an_unknown_plan(storage_module):
+    _, errors = storage_module.clean_run({**RUN_BODY, "plan_id": "ghost"}, RUN_PLANS)
+    assert list(errors) == ["plan_id"]
+
+
+def _plan(storage_module, bucket, name, plan_start="", weeks=4, archived=False):
+    """План на weeks недель от plan_start (окна по 7 дней); без plan_start —
+    недатированный. Созданный план становится активным, как у спортсмена."""
+    plan = storage_module.create_plan(bucket, SUB, {"race_name": name, "plan_start": plan_start})
+    if weeks:
+        storage_module.save_plan_weeks(bucket, SUB, plan["id"],
+                                       [{"w": i + 1, "mon": "5 км"} for i in range(weeks)], "seed")
+    if archived:
+        storage_module.archive_plan(bucket, SUB, plan["id"])
+    return plan["id"]
+
+
+def _for_date(storage_module, bucket, day):
+    index = storage_module.read_plans_index(bucket, SUB)
+    return storage_module.plan_for_date(bucket, SUB, index, day)
+
+
+def test_plan_for_date_without_plans(storage_module, fake_bucket):
+    assert _for_date(storage_module, fake_bucket, "2026-08-10") is None
+
+
+def test_plan_for_date_inside_and_after_the_active_plan(storage_module, fake_bucket):
+    plan = _plan(storage_module, fake_bucket, "A", "2026-08-03")       # 03.08–30.08
+    assert _for_date(storage_module, fake_bucket, "2026-08-03") == plan
+    assert _for_date(storage_module, fake_bucket, "2026-08-30") == plan
+    assert _for_date(storage_module, fake_bucket, "2026-08-31") is None   # план закончился
+    assert _for_date(storage_module, fake_bucket, "2026-08-02") is None   # ещё не начался
+
+
+def test_plan_for_date_between_plans(storage_module, fake_bucket):
+    _plan(storage_module, fake_bucket, "A", "2026-08-03")              # 03.08–30.08
+    _plan(storage_module, fake_bucket, "B", "2026-10-05")              # активный
+    assert _for_date(storage_module, fake_bucket, "2026-09-15") is None
+
+
+def test_plan_for_date_finds_an_inactive_plan(storage_module, fake_bucket):
+    old = _plan(storage_module, fake_bucket, "A", "2026-08-03")
+    _plan(storage_module, fake_bucket, "B", "2026-10-05")              # активный
+    assert _for_date(storage_module, fake_bucket, "2026-08-10") == old
+
+
+def test_plan_for_date_finds_an_archived_plan(storage_module, fake_bucket):
+    old = _plan(storage_module, fake_bucket, "A", "2026-08-03")
+    _plan(storage_module, fake_bucket, "B", "2026-10-05")              # активный
+    storage_module.archive_plan(fake_bucket, SUB, old)
+    assert _for_date(storage_module, fake_bucket, "2026-08-10") == old
+
+
+def test_plan_for_date_prefers_the_active_plan_then_the_latest_start(storage_module,
+                                                                     fake_bucket):
+    a = _plan(storage_module, fake_bucket, "A", "2026-08-03", weeks=6)   # 03.08–13.09
+    b = _plan(storage_module, fake_bucket, "B", "2026-09-07")            # 07.09–04.10
+    c = _plan(storage_module, fake_bucket, "C", "2026-12-07")
+    storage_module.set_active_plan(fake_bucket, SUB, a)
+    assert _for_date(storage_module, fake_bucket, "2026-09-10") == a    # активный, хоть и раньше
+    storage_module.set_active_plan(fake_bucket, SUB, c)
+    assert _for_date(storage_module, fake_bucket, "2026-09-10") == b    # начался позже
+
+
+def test_plan_for_date_falls_back_to_an_undated_active_plan(storage_module, fake_bucket):
+    plan = _plan(storage_module, fake_bucket, "Без дат")               # ни подписей, ни старта
+    assert _for_date(storage_module, fake_bucket, "2026-08-10") == plan
+
+
+def test_plan_for_date_falls_back_to_an_active_plan_without_weeks(storage_module, fake_bucket):
+    plan = _plan(storage_module, fake_bucket, "Пустой", "2026-08-03", weeks=0)
+    assert _for_date(storage_module, fake_bucket, "2027-01-10") == plan
+
+
+def test_plan_for_date_prefers_a_dated_plan_to_an_undated_active(storage_module, fake_bucket):
+    old = _plan(storage_module, fake_bucket, "A", "2026-08-03", archived=True)
+    undated = _plan(storage_module, fake_bucket, "Без дат")            # активный
+    assert _for_date(storage_module, fake_bucket, "2026-08-10") == old
+    assert _for_date(storage_module, fake_bucket, "2026-09-30") == undated
+
+
+def test_plan_for_date_skips_an_undated_inactive_plan(storage_module, fake_bucket):
+    _plan(storage_module, fake_bucket, "Без дат")
+    _plan(storage_module, fake_bucket, "B", "2026-10-05")              # активный, датирован
+    assert _for_date(storage_module, fake_bucket, "2026-08-10") is None
+
+
 # ── LLM config versioning (GLOBAL — shared key, admin-managed) ────────────────
 
 def test_llm_config_versioning(storage_module, fake_bucket):
