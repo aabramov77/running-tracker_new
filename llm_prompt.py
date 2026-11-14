@@ -434,11 +434,13 @@ def format_context_for_llm(ctx):
         lines.extend(format_history_block(ctx["history"]))
 
     lines.append("")
-    lines.append("Последние 14 тренировок (сначала свежие):")
+    lines.append("Последние 14 тренировок по всем планам и вне плана (сначала свежие, "
+                 "в скобках — к какому плану относится):")
     for r in ctx["last_runs"]:
         t = TYPE_LABELS.get(r.get("type"), r.get("type", ""))
         feel = FEEL_LABELS.get(r.get("feel"), "")
         parts = [r.get("date", "?"), t, f"{r.get('dist', '?')}км"]
+        if r.get("_plan"): parts.append(f"[{r['_plan']}]")
         if r.get("time"): parts.append(r["time"])
         if r.get("pace"): parts.append(f"темп {r['pace']}/км")
         if r.get("hr"): parts.append(f"пульс ср.{r['hr']}")
@@ -635,7 +637,10 @@ def format_run_focus(focus):
         lines.append(f"Заметки спортсмена: {run['notes']}")
 
     planned = focus.get("planned")
-    if planned:
+    if focus.get("unplanned"):
+        lines.append("Пробежка вне плана: спортсмен не привязал её ни к одному плану, "
+                     "сравнивать с планом не нужно")
+    elif planned:
         phase = PLAN_PHASE_LABELS.get(planned.get("phase"), planned.get("phase") or "")
         where = f"неделя {planned['week']}" + (f", {phase}" if phase else "")
         lines.append(f"По плану в этот день ({where}): «{planned['text']}»" if planned["text"]

@@ -2533,19 +2533,23 @@ LLM_RACES_MAX = 10
 
 
 def build_llm_context(bucket, sub):
-    """Собирает компактный богатый контекст для LLM: активный план и его пробежки."""
+    """Собирает компактный богатый контекст для LLM: активный план, последние
+    пробежки, нагрузку, историю."""
     today = datetime.utcnow().date()
     plans_index = read_plans_index(bucket, sub)
     active_plan = find_plan(plans_index, plans_index.get("active_plan_id"))
     plan_id = active_plan["id"] if active_plan else None
 
-    # Runs активного плана (#25)
+    # Последние пробежки — все, а не только активного плана (#71): после его
+    # окончания и между планами пробежки сохраняются без плана, и без них
+    # модель решила бы, что спортсмен не бегал. К какому плану относится
+    # пробежка, говорит пометка _plan.
     all_runs = read_runs(bucket, sub)
     active_runs = [r for r in all_runs if not r.get("deleted", False)]
-    if plan_id:
-        active_runs = [r for r in active_runs if r.get("plan_id") == plan_id]
     active_runs.sort(key=lambda r: r.get("date", ""), reverse=True)
     last_runs = active_runs[:14]
+    for r in last_runs:
+        r["_plan"] = run_plan_mark(plans_index, r.get("plan_id"), plan_id)
 
     # Для пробежек с FIT-данными подгружаем детали (лапы + HR-drift)
     for r in last_runs:
@@ -3190,6 +3194,17 @@ def plan_label(plan):
             or (f"Забег {plan['race_date']}" if plan.get("race_date") else "Без названия"))
 
 
+def run_plan_mark(plans_index, run_plan_id, active_plan_id):
+    """Пометка плана у пробежки в контексте ИИ (#71): «текущий план»,
+    «без плана» или «план «название»»."""
+    if not run_plan_id:
+        return "без плана"
+    if run_plan_id == active_plan_id:
+        return "текущий план"
+    plan = find_plan(plans_index, run_plan_id)
+    return f"план «{plan_label(plan)}»" if plan else "другой план"
+
+
 def notify_plan_change(bucket, athlete, coach, change, plan, version=None, comment=""):
     """Сообщение в чат пары о том, что тренер поменял план спортсмена.
 
@@ -3575,9 +3590,12 @@ def build_run_focus(bucket, sub, run, ctx):
         focus["hr_max"] = derived.get("hr_max_effective")
         focus["hr_max_estimated"] = bool(derived.get("hr_max_estimated"))
 
-    # Что стояло в плане на этот день. У пробежки без привязки (до #25)
-    # смотрим активный план: дата всё равно должна попасть в его недели.
-    plan_id = run.get("plan_id") or ctx.get("plan_id")
+    # Что стояло в плане на этот день — только по плану самой пробежки.
+    # Пробежка без плана (#71) с активным планом не сравнивается: спортсмен
+    # сам отметил, что она вне плана, хотя дата могла попасть в его недели.
+    # Пробежки до #25 план получили при переносе (migrate_single_plan).
+    plan_id = run.get("plan_id")
+    focus["unplanned"] = not plan_id
     if plan_id and plan_id == ctx.get("plan_id"):
         weeks, plan_start = ctx.get("plan_weeks") or [], ctx.get("plan_start")
     elif plan_id:

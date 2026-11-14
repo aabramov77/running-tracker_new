@@ -781,8 +781,10 @@ def test_llm_config_versioning(storage_module, fake_bucket):
     assert storage_module.read_llm_config_full(fake_bucket)["version"] == 2
 
 
-def test_llm_context_uses_only_active_plan(storage_module, fake_bucket):
-    """#25: контекст для LLM берёт недели активного плана и только его пробежки."""
+def test_llm_context_takes_weeks_of_the_active_plan_and_all_recent_runs(storage_module,
+                                                                         fake_bucket):
+    """#25: недели и гонка — активного плана. #71: последние пробежки — все,
+    с пометкой, к какому плану относится каждая."""
     a = storage_module.create_plan(fake_bucket, SUB, {"race_name": "A", "plan_start": "2026-05-10"})
     b = storage_module.create_plan(fake_bucket, SUB, {"race_name": "B", "plan_start": "2026-06-01"})
     storage_module.save_plan_weeks(fake_bucket, SUB, a["id"], [{"w": 1, "mon": "A-неделя"}])
@@ -795,14 +797,16 @@ def test_llm_context_uses_only_active_plan(storage_module, fake_bucket):
     # активен B (создан последним)
     ctx = storage_module.build_llm_context(fake_bucket, SUB)
     assert ctx["plan_id"] == b["id"]
-    assert [r["id"] for r in ctx["last_runs"]] == [2]
+    assert [(r["id"], r["_plan"]) for r in ctx["last_runs"]] == \
+        [(2, "текущий план"), (1, "план «A»")]
     assert ctx["race"]["race_name"] == "B"
     assert ctx["weeks_total"] == 1
 
-    # переключаемся на A → другой набор пробежек и недель
+    # переключаемся на A → другие недели и пометки, пробежки те же
     storage_module.set_active_plan(fake_bucket, SUB, a["id"])
     ctx_a = storage_module.build_llm_context(fake_bucket, SUB)
-    assert [r["id"] for r in ctx_a["last_runs"]] == [1]
+    assert [(r["id"], r["_plan"]) for r in ctx_a["last_runs"]] == \
+        [(2, "план «B»"), (1, "текущий план")]
     assert ctx_a["race"]["race_name"] == "A"
     text = storage_module.format_context_for_llm(ctx_a)
     assert "A" in text and "A-неделя" in text
