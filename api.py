@@ -44,7 +44,8 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      mark_proposal_states, mask_key, memory_facts, memory_view,
                      migrate_all_entity_history, migrate_legacy_to_user,
                      my_coach, notify_plan_change,
-                     parse_coach_reply, parse_fit_file, plan_author, plan_meta_unchanged,
+                     parse_coach_reply, parse_fit_file, plan_author, plan_for_date,
+                     plan_meta_unchanged,
                      read_advice_usage, read_ai_memory, read_ai_memory_history,
                      read_ai_messages, read_ai_thread, read_athlete_history,
                      read_athlete_profile,
@@ -1157,15 +1158,16 @@ def h_runs_post(c):
     base_version, bad = _base_version(body)
     if bad:
         return bad
-    # Привязка к плану: явный plan_id, при правке — прежний, у новой
-    # пробежки — активный план (#25)
-    active = find_plan(index, index.get("active_plan_id"))
-    run = {"id": clean["id"] or _new_id(), **{f: clean[f] for f in RUN_FIELDS}}
+    # Привязка к плану (#25, #71): ключ plan_id пришёл — пишется он (null —
+    # без плана); ключа нет — при правке прежний план, у новой пробежки — план
+    # по её дате. Поэтому в run переносятся только пришедшие поля.
+    run = {"id": clean["id"] or _new_id(), **{f: clean[f] for f in RUN_FIELDS if f in clean}}
     try:
         entry = save_run(c.bucket, c.sub, run, fit_token=clean["fit_token"],
                          base_version=base_version,
                          change_reason=clean_change_reason(body.get("change_reason")),
-                         created_by=c.email, default_plan_id=active["id"] if active else None)
+                         created_by=c.email,
+                         default_plan=lambda day: plan_for_date(c.bucket, c.sub, index, day))
     except FitTokenInvalid:
         # Токена нет или он просрочен. Прочие сбои — не ошибка запроса:
         # они уходят в лог и отдаются как internal_error.

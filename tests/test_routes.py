@@ -407,6 +407,60 @@ def test_llm_config_without_effort_gets_default(api):
     assert cfg["effort"] == cfg["default_effort"] == "medium"
 
 
+# ── Привязка пробежки к плану (#71) ───────────────────────────────────────────
+
+def _dated_plan(patched_api, fake_bucket):
+    """Активный план на две недели: 17.08–30.08.2026."""
+    plan = patched_api.create_plan(fake_bucket, "u1",
+                                   {"race_name": "HM", "plan_start": "2026-08-17"})
+    patched_api.save_plan_weeks(fake_bucket, "u1", plan["id"],
+                                [{"w": 1, "mon": "10 км"}, {"w": 2, "mon": "12 км"}], "seed")
+    return plan["id"]
+
+
+def _save_run(api, **fields):
+    body, code, _ = api(FakeRequest("POST", "/", json_body={"date": "2026-08-17", "dist": 10.0,
+                                                            **fields}))
+    assert code == 201, body
+    return json.loads(body)
+
+
+def test_new_run_without_plan_is_bound_by_its_date(api, patched_api, fake_bucket):
+    plan_id = _dated_plan(patched_api, fake_bucket)
+    assert _save_run(api, id=1, date="2026-08-20")["plan_id"] == plan_id
+    assert _save_run(api, id=2, date="2026-09-10")["plan_id"] is None   # план закончился
+
+
+def test_explicit_null_saves_a_run_without_a_plan(api, patched_api, fake_bucket):
+    _dated_plan(patched_api, fake_bucket)
+    assert _save_run(api, id=1, plan_id=None)["plan_id"] is None
+
+
+def test_edit_unbinds_a_run_and_history_keeps_the_plan(api, patched_api, fake_bucket):
+    plan_id = _dated_plan(patched_api, fake_bucket)
+    _save_run(api, id=1)
+    assert _save_run(api, id=1, plan_id=None, base_version=1)["plan_id"] is None
+
+    history = json.loads(api(FakeRequest("GET", "/runs/1/history"))[0])
+    assert [(v["version"], v["run"]["plan_id"]) for v in history["versions"]] == \
+        [(2, None), (1, plan_id)]
+
+
+def test_edit_without_plan_keeps_the_plan_and_reads_no_weeks(api, patched_api, fake_bucket,
+                                                            storage_module, monkeypatch):
+    """Правка с новой датой вне плана привязку не меняет и недели планов не
+    читает: привязка по дате — только у новой пробежки."""
+    plan_id = _dated_plan(patched_api, fake_bucket)
+    _save_run(api, id=1)
+
+    def no_weeks(*args):
+        raise AssertionError("правка не должна читать недели планов")
+    monkeypatch.setattr(storage_module, "read_plan_weeks", no_weeks)
+
+    edited = _save_run(api, id=1, date="2026-09-10", dist=12.0, base_version=1)
+    assert (edited["version"], edited["plan_id"]) == (2, plan_id)
+
+
 # ── План против факта (#41) ───────────────────────────────────────────────────
 
 def _seed_plan_with_runs(api, patched_api, fake_bucket, sub="u1"):

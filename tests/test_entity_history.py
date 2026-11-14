@@ -97,12 +97,22 @@ def test_edit_without_changes_writes_nothing(storage_module, fake_bucket, kind):
     assert fake_bucket._store == before
 
 
+def _no_default_plan(day):
+    raise AssertionError(f"привязка по дате при правке не нужна ({day})")
+
+
+def _without_plan(run):
+    """Тело без ключа plan_id — «план по умолчанию» (#71)."""
+    return {k: v for k, v in run.items() if k != "plan_id"}
+
+
 def test_edit_keeps_the_fit_and_the_plan(storage_module, fake_bucket):
-    """Правка без FIT: поля из FIT, детали и план остаются прежними."""
+    """Правка без FIT и без ключа plan_id: поля из FIT, детали и план остаются
+    прежними, а привязку по дате правка не запрашивает."""
     storage_module.save_run(fake_bucket, SUB, {**RUN, "plan_id": "plan-1"},
                             fit_token=_fit_token(storage_module, fake_bucket))
-    entry = storage_module.save_run(fake_bucket, SUB, {**RUN, "dist": 10.5},
-                                    default_plan_id="plan-2")
+    entry = storage_module.save_run(fake_bucket, SUB, _without_plan({**RUN, "dist": 10.5}),
+                                    default_plan=_no_default_plan)
 
     assert (entry["version"], entry["dist"], entry["plan_id"]) == (2, 10.5, "plan-1")
     assert (entry["details_available"], entry["max_hr"], entry["calories"]) == (True, 171, 600)
@@ -115,8 +125,35 @@ def test_edit_keeps_the_fit_and_the_plan(storage_module, fake_bucket):
 
 
 def test_new_run_goes_into_the_default_plan(storage_module, fake_bucket):
-    entry = storage_module.save_run(fake_bucket, SUB, RUN, default_plan_id="active")
-    assert entry["plan_id"] == "active"
+    asked = []
+    entry = storage_module.save_run(fake_bucket, SUB, _without_plan(RUN),
+                                    default_plan=lambda day: asked.append(day) or "by-date")
+    assert entry["plan_id"] == "by-date"
+    assert asked == [RUN["date"]]
+
+
+def test_new_run_without_a_default_has_no_plan(storage_module, fake_bucket):
+    assert storage_module.save_run(fake_bucket, SUB, _without_plan(RUN))["plan_id"] is None
+
+
+def test_explicit_no_plan_skips_the_default(storage_module, fake_bucket):
+    """plan_id: None — явное «без плана» (#71): умолчание не применяется."""
+    entry = storage_module.save_run(fake_bucket, SUB, {**RUN, "plan_id": None},
+                                    default_plan=_no_default_plan)
+    assert entry["plan_id"] is None
+
+
+def test_edit_unbinds_the_run_and_keeps_the_old_plan_in_history(storage_module, fake_bucket):
+    """Отвязка правкой (#71) — новая версия без плана, прежняя с планом в истории."""
+    storage_module.save_run(fake_bucket, SUB, {**RUN, "plan_id": "plan-1"})
+    entry = storage_module.save_run(fake_bucket, SUB, {**RUN, "plan_id": None},
+                                    default_plan=_no_default_plan)
+
+    assert (entry["version"], entry["plan_id"]) == (2, None)
+    assert storage_module.read_runs(fake_bucket, SUB)[0]["plan_id"] is None
+    assert [(v["version"], v["run"]["plan_id"]) for v in
+            _history(storage_module, fake_bucket, "run")["versions"]] == \
+        [(2, None), (1, "plan-1")]
 
 
 def test_run_with_fit_is_one_version(storage_module, fake_bucket):

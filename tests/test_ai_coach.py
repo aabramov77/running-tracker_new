@@ -737,6 +737,60 @@ def test_planned_day_comes_from_the_runs_own_plan(api, llm, patched_api, fake_bu
     assert "«16 км легко»" in llm["calls"][0]["system"]
 
 
+# ── Пробежки вне плана (#71) ──────────────────────────────────────────────────
+
+def test_run_without_plan_is_not_compared_with_the_active_plan(api, llm, patched_api, fake_bucket):
+    """Спортсмен явно сохранил пробежку «Без плана», хотя её дата в неделях
+    активного плана: задачи дня из него в разборе нет, есть пометка «вне плана»."""
+    _seed_reviewable_run(api, patched_api, fake_bucket)          # активный план 17.08–30.08
+    api(FakeRequest("POST", "/", json_body={"id": 502, "date": "2026-08-23", "dist": 6.0,
+                                            "plan_id": None}))
+    thread = _run_thread(api, 502)
+    _say(api, thread["id"])
+    system = llm["calls"][0]["system"]
+    assert "Пробежка вне плана: спортсмен не привязал её ни к одному плану" in system
+    assert "«16 км легко»" not in system and "По плану в этот день" not in system
+
+
+def test_run_block_marks_a_run_outside_any_plan(storage_module):
+    text = _block(storage_module, planned=None, unplanned=True)
+    assert "Пробежка вне плана" in text and "неизвестно" not in text
+    # у пробежки с планом, но вне его дат, — по-прежнему «неизвестно»
+    assert "неизвестно" in _block(storage_module, planned=None, unplanned=False)
+
+
+def test_recent_runs_cover_all_plans_with_a_plan_mark(api, patched_api, fake_bucket):
+    """После окончания активного плана пробежки сохраняются без плана — модель
+    видит их среди последних, как и пробежки других планов, с пометкой плана."""
+    spring = patched_api.create_plan(fake_bucket, SUB, {"race_name": "Весенний 10К",
+                                                        "plan_start": "2026-04-06"})
+    patched_api.save_plan_weeks(fake_bucket, SUB, spring["id"], [{"w": 1, "mon": "8 км"}], "seed")
+    autumn = patched_api.create_plan(fake_bucket, SUB, {"race_name": "HM",
+                                                        "plan_start": "2026-08-17"})
+    patched_api.save_plan_weeks(fake_bucket, SUB, autumn["id"],
+                                [{"w": 1, "mon": "10 км"}, {"w": 2, "mon": "12 км"}], "seed")
+    for run_id, day in ((1, "2026-04-07"), (2, "2026-08-18"), (3, "2026-09-10")):
+        assert api(FakeRequest("POST", "/", json_body={"id": run_id, "date": day,
+                                                       "dist": 10.0}))[1] == 201
+
+    prompt = _json(api(FakeRequest("GET", "/advise/preview")))["prompt"]
+    recent = prompt[prompt.index("Последние 14 тренировок"):]
+    assert "2026-09-10 лёгкий 10.0км [без плана]" in recent        # план закончился
+    assert "2026-08-18 лёгкий 10.0км [текущий план]" in recent
+    assert "2026-04-07 лёгкий 10.0км [план «Весенний 10К»]" in recent
+    assert recent.index("2026-09-10") < recent.index("2026-08-18") < recent.index("2026-04-07")
+
+
+def test_run_plan_mark(storage_module):
+    index = {"active_plan_id": "now", "plans": [{"id": "now", "race_name": "HM"},
+                                                {"id": "old", "race_date": "2026-05-10"}]}
+    mark = storage_module.run_plan_mark
+    assert mark(index, None, "now") == "без плана"
+    assert mark(index, "now", "now") == "текущий план"
+    assert mark(index, "old", "now") == "план «Забег 2026-05-10»"
+    assert mark(index, "ghost", "now") == "другой план"
+
+
 # ══ Фаза 3: правки плана кнопкой ═════════════════════════════════════════════
 
 import datetime as dt
