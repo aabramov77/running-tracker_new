@@ -7,9 +7,9 @@
 """
 from datetime import timedelta
 
-from compliance import DAY_FIELDS, to_date
+from compliance import DAY_FIELDS, KM, REST, parse_planned_day, to_date
 from config import AI_PLAN_GENERAL_WEEKS_MAX, AI_PLAN_WEEKS_MAX
-from domain import DIST_LABEL_KM, PLAN_PHASE_LABELS, parse_time_to_sec
+from domain import DIST_LABEL_KM, PLAN_DAYS, PLAN_PHASE_LABELS, parse_time_to_sec
 from load import (RACE_PACE_MAX, RACE_PACE_MIN, RIEGEL_EXP, estimate_threshold,
                   format_duration)
 
@@ -323,3 +323,128 @@ def outline_warnings(outline, usual_km=None, assessment=None):
         warnings.append(f"До старта {assessment['weeks']} нед. — для {assessment['distance_km']:g} км "
                         f"разумно не меньше {assessment['min_weeks']}")
     return warnings
+
+
+# ── Генерация недель по каркасу ──────────────────────────────────────────────
+
+CELL_TEXT_MAX = 200
+DRAFT_VOLUME_LIMIT = 1.15   # нижняя граница объёма по ячейкам к цели каркаса
+
+
+def chunks(calendar, size):
+    """Номера недель календаря кусками по size: [[1..4], [5..8], …]."""
+    numbers = [week["w"] for week in calendar]
+    return [numbers[i:i + size] for i in range(0, len(numbers), size)]
+
+
+def _day_statuses(brief, week, race):
+    """Дни строки календаря пн→вс с датой и статусом для модели."""
+    monday = to_date(week["end_date"]) - timedelta(days=6)
+    first = to_date(week["start_date"])
+    days = []
+    for offset, field in enumerate(DAY_FIELDS):
+        day = monday + timedelta(days=offset)
+        if day < first:
+            status = "outside"
+        elif race and race == (week["w"], field):
+            status = "race"
+        elif brief["days"] and field not in brief["days"]:
+            status = "unavailable"
+        elif field == brief.get("long_run_day"):
+            status = "long"
+        else:
+            status = ""
+        days.append({"field": field, "date": day.isoformat(), "status": status})
+    return days
+
+
+def chunk_rows(brief, calendar, outline, numbers):
+    """Недели куска для таблицы «Расписать недели»: календарь + каркас + дни."""
+    by_w = {week["w"]: week for week in calendar}
+    plan = {week["week"]: week for week in outline["weeks"]}
+    race = race_day(brief)
+    return [{"week": n, "start_date": by_w[n]["start_date"], "end_date": by_w[n]["end_date"],
+             "type": plan[n]["type"], "accent": plan[n]["accent"], "km": plan[n]["km"],
+             "key": plan[n]["key"], "days": _day_statuses(brief, by_w[n], race)}
+            for n in numbers]
+
+
+def clean_chunk(raw, numbers):
+    """Ответ модели на кусок → ({неделя: {день: текст}}, недостающие номера).
+
+    Неделя не из куска или повтор недели не принимаются. День, которого нет
+    в ответе, — отдых: пустая ячейка валидна.
+    """
+    cells = {}
+    items = raw.get("weeks") if isinstance(raw, dict) else None
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        number = _int(item.get("week"))
+        if number not in numbers or number in cells:
+            continue
+        cells[number] = {field: _one_line(item.get(field), CELL_TEXT_MAX)
+                         if isinstance(item.get(field), str) else ""
+                         for field in DAY_FIELDS}
+    return cells, [n for n in numbers if n not in cells]
+
+
+def assemble_weeks(brief, calendar, outline, cells):
+    """Недели плана из календаря, каркаса и ячеек модели.
+
+    Номер, подписи дат, тип и акцент — из календаря и каркаса; дни вне окна
+    первой недели пустые; ячейку дня старта ставит сервер.
+    """
+    plan = {week["week"]: week for week in outline["weeks"]}
+    race = race_day(brief)
+    weeks = []
+    for week in calendar:
+        row = {"w": week["w"], "start": week["start"], "end": week["end"],
+               "type": plan[week["w"]]["type"], "accent": plan[week["w"]]["accent"]}
+        for day in _day_statuses(brief, week, race):
+            if day["status"] == "outside":
+                row[day["field"]] = ""
+            elif day["status"] == "race":
+                row[day["field"]] = race_cell(brief)
+            else:
+                row[day["field"]] = cells[week["w"]][day["field"]]
+        weeks.append(row)
+    return weeks
+
+
+def draft_warnings(brief, calendar, outline, weeks):
+    """Предупреждения черновика: созданию плана не мешают."""
+    day_ru = dict(PLAN_DAYS)
+    target = {week["week"]: week["km"] for week in outline["weeks"]}
+    race = race_day(brief)
+    warnings = []
+    for cal, row in zip(calendar, weeks):
+        n = row["w"]
+        busy = [f for f in DAY_FIELDS
+                if parse_planned_day(row.get(f))["kind"] != REST]
+        off = [f for f in busy if brief["days"] and f not in brief["days"]
+               and (n, f) != race]
+        if off:
+            warnings.append(f"Неделя {n}: тренировка в {', '.join(day_ru[f] for f in off)} — "
+                            "не из доступных дней")
+        if len(busy) > brief["sessions_per_week"]:
+            warnings.append(f"Неделя {n}: тренировок {len(busy)} — больше, чем в брифе "
+                            f"({brief['sessions_per_week']})")
+        low = sum(parsed["km"] for parsed in (parse_planned_day(row.get(f)) for f in DAY_FIELDS)
+                  if parsed["kind"] == KM)
+        if target[n] and low > DRAFT_VOLUME_LIMIT * target[n]:
+            warnings.append(f"Неделя {n}: по ячейкам не меньше {low:g} км при цели каркаса "
+                            f"{target[n]:g} км")
+    return warnings
+
+
+def draft_summary(brief, weeks, outline, warnings):
+    """Текст ответа с черновиком — его составляет сервер, а не модель."""
+    kms = [week["km"] for week in outline["weeks"]]
+    first, last = weeks[0], weeks[-1]
+    text = (f"План расписан по неделям: {len(weeks)} нед., {first['start']}–{last['end']}, "
+            f"объём {min(kms):g}–{max(kms):g} км в неделю.")
+    if warnings:
+        text += f" Предупреждений: {len(warnings)} — они в карточке черновика."
+    return text + (" Проверьте черновик: план создаётся только по вашей команде — "
+                   "«Создать план…» или правка в конструкторе.")

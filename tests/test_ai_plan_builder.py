@@ -505,3 +505,413 @@ def test_plan_thread_shows_up_in_past_threads_and_preview_works(api, llm):
     assert "Сейчас ты составляешь" not in system                  # обычный разбор
     body, code, _ = api(FakeRequest("GET", "/advise/preview"))
     assert code == 200 and "«🤖 Составить с ИИ»" in json.loads(body)["system_prompt"]
+
+
+# ── генерация недель ──────────────────────────────────────────────────────────
+
+import re  # noqa: E402
+import threading  # noqa: E402
+
+
+def _week_cells(n):
+    return {"week": n, "mon": "", "tue": f"8 км легко н{n}", "wed": "", "thu": "10 км: 3×2 км",
+            "fri": "", "sat": "6 км восстановительный", "sun": "16 км длительный"}
+
+
+class FakeWeeksModel:
+    """Отвечает на запрос куска по номерам недель из вопроса. skip — недели,
+    которые модель «забывает» (в первый раз или всегда)."""
+
+    def __init__(self, skip_once=(), skip_always=(), cells=_week_cells):
+        self.skip_once, self.skip_always, self.cells = set(skip_once), set(skip_always), cells
+        self.asked, self.lock = [], threading.Lock()
+
+    def numbers(self, user):
+        found = [int(x) for x in re.findall(r"\d+", user)]
+        return list(range(found[0], found[-1] + 1))
+
+    def __call__(self, system, user):
+        numbers = self.numbers(user)
+        with self.lock:
+            self.asked.append((numbers, system))
+            skipped = {n for n in numbers if n in self.skip_always or n in self.skip_once}
+            self.skip_once -= skipped
+        weeks = [self.cells(n) for n in numbers if n not in skipped]
+        return {"text": json.dumps({"weeks": weeks}, ensure_ascii=False),
+                "input_tokens": 1000, "output_tokens": 300}
+
+
+def _use_model(patched_api, monkeypatch, model):
+    monkeypatch.setattr(patched_api, "call_llm",
+                        lambda provider, mdl, key, system, user, effort=None, history=None:
+                        model(system, user))
+
+
+def _draft_inputs(**over):
+    brief = _clean(_race_brief(**over))
+    kms = [24 + i for i in range(brief["weeks"])]
+    types = ["dev"] * (brief["weeks"] - 1) + ["race"]
+    outline, _ = pb.clean_outline(_outline(kms, types), pb.brief_calendar(brief))
+    return brief, outline
+
+
+def test_chunk_table_marks_the_days():
+    brief, outline = _draft_inputs(start_date="2026-11-19")      # с четверга
+    calendar = pb.brief_calendar(brief)
+    rows = pb.chunk_rows(brief, calendar, outline, [1, 17])
+    text = llm_prompt.format_chunk_days(rows)
+    assert "Неделя 1, 19.11–22.11, Развитие: 24 км" in text
+    assert "  mon (пн 16.11): вне плана — оставь пустым" in text
+    assert "  thu (чт 19.11)\n" in text
+    assert "  wed (ср 25.11)" not in text                          # недели 2 в куске нет
+    assert "  mon (пн 08.03): недоступный день — отдых" in text
+    assert "  sun (вс 14.03): день старта — оставь пустым" in text
+    assert "  sat (сб 13.03)\n" in text
+
+
+def test_sixteen_weeks_in_four_parallel_calls(storage_module):
+    brief, outline = _draft_inputs()
+    model = FakeWeeksModel()
+    draft = storage_module.generate_plan_draft(brief, outline, model, ["Возраст: 40 лет"])
+    assert draft["calls"] == 4
+    assert sorted(n for ns, _ in model.asked for n in ns) == list(range(1, 17))
+    assert draft["input_tokens"] == 4000 and draft["output_tokens"] == 1200
+    weeks = draft["weeks"]
+    assert len(weeks) == 16 and weeks[0]["start"] == "23.11" and weeks[-1]["end"] == "14.03"
+    assert weeks[0]["type"] == "dev" and weeks[0]["accent"] == "акцент 1"
+    assert weeks[4]["tue"] == "8 км легко н5"
+    assert weeks[-1]["sun"] == "СТАРТ 21.1 км, цель 1:45"           # не «16 км длительный»
+    system = model.asked[0][1]
+    assert "=== Спортсмен ===\nВозраст: 40 лет" in system and "=== Каркас плана ===" in system
+    assert "=== Расписать недели ===" in system
+
+
+def test_days_before_the_start_stay_empty(storage_module):
+    brief, outline = _draft_inputs(start_date="2026-11-19")
+    draft = storage_module.generate_plan_draft(brief, outline, FakeWeeksModel())
+    first = draft["weeks"][0]
+    assert first["tue"] == "" and first["thu"] == "10 км: 3×2 км"
+
+
+def test_missing_week_is_asked_again_alone(storage_module):
+    brief, outline = _draft_inputs()
+    model = FakeWeeksModel(skip_once={7})
+    draft = storage_module.generate_plan_draft(brief, outline, model)
+    assert draft["calls"] == 5 and [7] in [ns for ns, _ in model.asked]
+    assert draft["weeks"][6]["tue"] == "8 км легко н7"
+
+
+def test_week_missing_twice_fails_the_draft(storage_module):
+    brief, outline = _draft_inputs()
+    with pytest.raises(storage_module.PlanDraftIncomplete):
+        storage_module.generate_plan_draft(brief, outline, FakeWeeksModel(skip_always={7}))
+
+
+def test_garbage_reply_counts_as_missing_weeks(storage_module):
+    brief, outline = _draft_inputs()
+    calls = []
+
+    def model(system, user):
+        calls.append(user)
+        return {"text": "не JSON", "input_tokens": 1, "output_tokens": 1}
+
+    with pytest.raises(storage_module.PlanDraftIncomplete):
+        storage_module.generate_plan_draft(brief, outline, model)
+    # первый провалившийся кусок отменяет ещё не начатые: лишних вызовов нет
+    assert 2 <= len(calls) <= 8
+
+
+def test_draft_warnings():
+    brief, outline = _draft_inputs()
+    calendar = pb.brief_calendar(brief)
+    cells = {n: {**{f: "" for f in pb.DAY_FIELDS}, "tue": "5 км", "thu": "5 км",
+                 "sat": "6 км", "sun": "8 км"} for n in range(1, 17)}
+    cells[2].update(mon="5 км легко")                                # пн — не из доступных
+    cells[4].update(sun="40 км")                                     # объём сильно выше каркаса
+    weeks = pb.assemble_weeks(brief, calendar, outline, cells)
+    warnings = pb.draft_warnings(brief, calendar, outline, weeks)
+    assert "Неделя 2: тренировка в пн — не из доступных дней" in warnings
+    assert "Неделя 2: тренировок 5 — больше, чем в брифе (4)" in warnings
+    assert any(w.startswith("Неделя 4: по ячейкам не меньше 56 км") for w in warnings)
+    assert not any(w.startswith("Неделя 3") for w in warnings)
+
+
+def test_race_on_an_unavailable_day_is_not_warned():
+    brief, outline = _draft_inputs(race_date="2027-03-13")          # суббота
+    calendar = pb.brief_calendar(brief)
+    cells = {n: {f: "" for f in pb.DAY_FIELDS} for n in range(1, 17)}
+    brief = {**brief, "days": ["tue", "thu", "sun"]}
+    weeks = pb.assemble_weeks(brief, calendar, outline, cells)
+    assert weeks[-1]["sat"].startswith("СТАРТ")
+    assert pb.draft_warnings(brief, calendar, outline, weeks) == []
+
+
+# ── генерация через HTTP ──────────────────────────────────────────────────────
+
+def _outline_message(api, llm, weeks=8):
+    thread = _plan_thread(api)
+    llm["replies"].append(_reply("Бриф.", brief=_live_brief(weeks=weeks)))
+    _ask(api, thread["id"])
+    llm["replies"].append(_reply("Каркас.", outline=_live_outline(weeks=weeks)))
+    return thread, _ask(api, thread["id"], "Всё верно")
+
+
+def _generate(api, thread_id, message_id):
+    return api(FakeRequest("POST", f"/ai-coach/threads/{thread_id}/messages/{message_id}/weeks"))
+
+
+def _usage(api):
+    body, _, _ = api(FakeRequest("GET", "/ai-coach/threads"))
+    return json.loads(body)["usage"]["count"]
+
+
+def _messages(api, thread_id):
+    body, _, _ = api(FakeRequest("GET", f"/ai-coach/threads/{thread_id}"))
+    return json.loads(body)["messages"]
+
+
+def test_weeks_route_writes_a_draft_for_one_attempt(api, llm, patched_api, monkeypatch):
+    thread, outline_msg = _outline_message(api, llm)
+    _use_model(patched_api, monkeypatch, FakeWeeksModel())
+    before = _usage(api)
+    body, code, _ = _generate(api, thread["id"], outline_msg["id"])
+    assert code == 201, body
+    data = json.loads(body)
+    question, answer = data["messages"]
+    assert question["role"] == "athlete" and question["text"] == "Расписать план по неделям"
+    draft = answer["plan_draft"]
+    assert len(draft["weeks"]) == 8 and draft["outline_message_id"] == outline_msg["id"]
+    assert draft["brief"]["weeks"] == 8 and answer["llm_calls"] == 2
+    assert answer["plan_draft_state"] == "open"
+    assert answer["text"].startswith("План расписан по неделям: 8 нед.")
+    assert _usage(api) == before + 1 == data["usage"]["count"]
+    assert _messages(api, thread["id"])[-1]["plan_draft"] == draft
+
+
+def test_bad_draft_writes_nothing_and_returns_the_attempt(api, llm, patched_api, monkeypatch):
+    thread, outline_msg = _outline_message(api, llm)
+    _use_model(patched_api, monkeypatch, FakeWeeksModel(skip_always={3}))
+    before, count = _usage(api), len(_messages(api, thread["id"]))
+    body, code, _ = _generate(api, thread["id"], outline_msg["id"])
+    assert code == 502 and json.loads(body)["error"] == "llm_bad_draft"
+    assert _usage(api) == before and len(_messages(api, thread["id"])) == count
+
+
+def test_provider_failure_on_a_chunk_writes_nothing(api, llm, patched_api, monkeypatch):
+    import httpx
+    thread, outline_msg = _outline_message(api, llm)
+
+    def broken(provider, mdl, key, system, user, effort=None, history=None):
+        request = httpx.Request("POST", "https://api.example/chat")
+        raise httpx.HTTPStatusError("boom", request=request,
+                                    response=httpx.Response(429, request=request, text="rate"))
+
+    monkeypatch.setattr(patched_api, "call_llm", broken)
+    before, count = _usage(api), len(_messages(api, thread["id"]))
+    body, code, _ = _generate(api, thread["id"], outline_msg["id"])
+    assert code == 502 and json.loads(body)["error"] == "llm_provider_error"
+    assert _usage(api) == before and len(_messages(api, thread["id"])) == count
+
+
+def test_second_generation_adds_a_second_draft(api, llm, patched_api, monkeypatch):
+    thread, outline_msg = _outline_message(api, llm)
+    _use_model(patched_api, monkeypatch, FakeWeeksModel())
+    first = json.loads(_generate(api, thread["id"], outline_msg["id"])[0])["messages"][1]
+    second = json.loads(_generate(api, thread["id"], outline_msg["id"])[0])["messages"][1]
+    drafts = [m for m in _messages(api, thread["id"]) if m.get("plan_draft")]
+    assert [m["id"] for m in drafts] == [first["id"], second["id"]]
+    assert drafts[0]["plan_draft"] == first["plan_draft"]
+
+
+def test_weeks_route_errors(api, llm):
+    thread, outline_msg = _outline_message(api, llm)
+    brief_msg = _messages(api, thread["id"])[1]
+    body, code, _ = _generate(api, thread["id"], brief_msg["id"])
+    assert code == 400 and json.loads(body)["error"] == "no_outline"
+    body, code, _ = _generate(api, "20260101T000000000000-deadbeef", outline_msg["id"])
+    assert code == 404 and json.loads(body)["error"] == "thread not found"
+    body, code, _ = _generate(api, thread["id"], "20260101T000000000000-ai-deadbeef")
+    assert code == 404 and json.loads(body)["error"] == "message not found"
+
+
+# ── создание плана из черновика ───────────────────────────────────────────────
+
+def _draft_message(api, llm, patched_api, monkeypatch, weeks=8):
+    thread, outline_msg = _outline_message(api, llm, weeks=weeks)
+    _use_model(patched_api, monkeypatch, FakeWeeksModel())
+    body, code, _ = _generate(api, thread["id"], outline_msg["id"])
+    assert code == 201, body
+    return thread, json.loads(body)["messages"][1]
+
+
+def _create(api, thread_id, message_id, **body):
+    return api(FakeRequest("POST",
+                           f"/ai-coach/threads/{thread_id}/messages/{message_id}/create-plan",
+                           body))
+
+
+def _plans(api):
+    body, _, _ = api(FakeRequest("GET", "/plans"))
+    return json.loads(body)
+
+
+def _history(api, plan_id):
+    body, _, _ = api(FakeRequest("GET", f"/plans/{plan_id}/history"))
+    return json.loads(body)["versions"]
+
+
+def test_plan_from_a_draft_without_edits(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=True)
+    assert code == 201, body
+    created = json.loads(body)
+    plan = created["plan"]
+    brief = answer["plan_draft"]["brief"]
+    assert created["version"] == 1 and created["active_plan_id"] == plan["id"]
+    assert plan["race_name"] == "Весенний полумарафон" and plan["race_date"] == brief["race_date"]
+    assert plan["target_time"] == "1:45" and plan["plan_start"] == brief["start_date"]
+    listed = next(p for p in _plans(api)["plans"] if p["id"] == plan["id"])
+    assert listed["created_by_role"] == "ai"
+    assert listed["ai_source"] == {"thread_id": thread["id"], "message_id": answer["id"]}
+    body, _, _ = api(FakeRequest("GET", f"/plans/{plan['id']}/weeks"))
+    assert json.loads(body) == answer["plan_draft"]["weeks"]
+    history = _history(api, plan["id"])
+    assert [(v["version"], v["author_role"], v["change_reason"]) for v in history] == \
+           [(1, "ai", "ИИ-тренер: новый план")]
+
+
+def test_plan_from_an_edited_draft_has_two_versions(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    weeks = json.loads(json.dumps(answer["plan_draft"]["weeks"]))
+    weeks[1]["tue"] = "10 км легко"
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=True, weeks=weeks)
+    created = json.loads(body)
+    assert code == 201 and created["version"] == 2
+    history = _history(api, created["plan"]["id"])
+    assert [(v["version"], v["author_role"], v["change_reason"]) for v in history] == \
+           [(2, "athlete", "Правка черновика ИИ-тренера"), (1, "ai", "ИИ-тренер: новый план")]
+    body, _, _ = api(FakeRequest("GET", f"/plans/{created['plan']['id']}/weeks"))
+    assert json.loads(body)[1]["tue"] == "10 км легко"
+
+
+def test_unchanged_weeks_give_one_version(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=True,
+                            weeks=answer["plan_draft"]["weeks"])
+    assert code == 201 and json.loads(body)["version"] == 1
+
+
+def test_activate_later_keeps_the_active_plan(api, llm, patched_api, fake_bucket, monkeypatch):
+    autumn = patched_api.create_plan(fake_bucket, SUB, {"race_name": "Осенний марафон"})
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=False)
+    created = json.loads(body)
+    assert code == 201 and created["active_plan_id"] == autumn["id"]
+    plans = _plans(api)
+    assert plans["active_plan_id"] == autumn["id"]
+    assert created["plan"]["id"] in [p["id"] for p in plans["plans"]]
+
+
+def test_without_an_active_plan_the_new_one_becomes_active(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=False)
+    assert code == 201 and _plans(api)["active_plan_id"] == json.loads(body)["plan"]["id"]
+
+
+def test_second_create_is_already_created(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    first = json.loads(_create(api, thread["id"], answer["id"], make_active=True)[0])
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=True)
+    assert code == 409
+    assert json.loads(body) == {"error": "already_created", "plan_id": first["plan"]["id"]}
+    assert len(_plans(api)["plans"]) == 1
+
+
+def test_bad_weeks_create_nothing(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    weeks = json.loads(json.dumps(answer["plan_draft"]["weeks"]))
+    weeks[0]["mon"] = "x" * 501
+    body, code, _ = _create(api, thread["id"], answer["id"], make_active=True, weeks=weeks)
+    assert code == 400 and json.loads(body)["error"] == "validation_failed"
+    assert _plans(api)["plans"] == []
+
+
+def test_create_errors(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    outline_id = answer["plan_draft"]["outline_message_id"]
+    body, code, _ = _create(api, thread["id"], outline_id, make_active=True)
+    assert code == 400 and json.loads(body)["error"] == "no_plan_draft"
+    body, code, _ = _create(api, thread["id"], "20260101T000000000000-ai-deadbeef")
+    assert code == 404 and json.loads(body)["error"] == "message not found"
+    body, code, _ = _create(api, "20260101T000000000000-deadbeef", answer["id"])
+    assert code == 404 and json.loads(body)["error"] == "thread not found"
+
+
+def _race_on_index_read(fake_bucket, monkeypatch, competitor):
+    """competitor() вклинивается после чтения реестра планов внутри условной
+    записи — данные у пишущего к записи уже устарели."""
+    real_get, state = fake_bucket.get_blob, {"reads": 0, "done": False}
+
+    def get_blob(name):
+        blob = real_get(name)
+        if name.endswith("plans/index.json") and not state["done"] and blob is not None:
+            state["reads"] += 1
+            if state["reads"] == 2:                     # первое — проверка наличия
+                state["done"] = True
+                read = blob.download_as_text
+
+                def download_as_text():
+                    text = read()
+                    competitor()
+                    return text
+
+                blob.download_as_text = download_as_text
+        return blob
+
+    monkeypatch.setattr(fake_bucket, "get_blob", get_blob)
+
+
+def test_two_concurrent_creates_make_one_plan(api, llm, patched_api, fake_bucket, monkeypatch,
+                                              storage_module):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    patched_api.create_plan(fake_bucket, SUB, {"race_name": "Текущий"})   # реестр уже есть
+    results = []
+
+    def competitor():
+        results.append(storage_module.create_plan_from_draft(
+            fake_bucket, SUB, thread["id"], answer["id"], make_active=True))
+
+    _race_on_index_read(fake_bucket, monkeypatch, competitor)
+    with pytest.raises(storage_module.PlanAlreadyCreated):
+        storage_module.create_plan_from_draft(fake_bucket, SUB, thread["id"], answer["id"],
+                                              make_active=True)
+    plans = storage_module.read_plans_index(fake_bucket, SUB)["plans"]
+    assert results and len([p for p in plans if p.get("ai_source")]) == 1
+
+
+def test_plan_without_weeks_is_finished_on_retry(api, llm, patched_api, fake_bucket, monkeypatch,
+                                                 storage_module):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    real_save = storage_module.save_plan_weeks
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("сбой между записями")
+
+    monkeypatch.setattr(storage_module, "save_plan_weeks", broken)
+    with pytest.raises(RuntimeError):
+        storage_module.create_plan_from_draft(fake_bucket, SUB, thread["id"], answer["id"], True)
+    monkeypatch.setattr(storage_module, "save_plan_weeks", real_save)
+    created = storage_module.create_plan_from_draft(fake_bucket, SUB, thread["id"], answer["id"],
+                                                    True)
+    assert created["version"] == 1
+    assert len(storage_module.read_plans_index(fake_bucket, SUB)["plans"]) == 1
+
+
+def test_draft_state_on_read(api, llm, patched_api, monkeypatch):
+    thread, answer = _draft_message(api, llm, patched_api, monkeypatch)
+    assert _messages(api, thread["id"])[-1]["plan_draft_state"] == "open"
+    created = json.loads(_create(api, thread["id"], answer["id"], make_active=True)[0])
+    last = _messages(api, thread["id"])[-1]
+    assert last["plan_draft_state"] == "created" and last["plan_id"] == created["plan"]["id"]
+    api(FakeRequest("POST", f"/plans/{created['plan']['id']}/archive"))
+    assert _messages(api, thread["id"])[-1]["plan_draft_state"] == "created"

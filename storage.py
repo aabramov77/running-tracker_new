@@ -20,7 +20,8 @@ from fitparse import FitFile
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage as gcs
 
-from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
+from config import (ADMIN_EMAILS, AI_PLAN_CHUNK_WEEKS, AI_PLAN_PARALLEL, BUCKET_NAME,
+                    LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
 from compliance import (DEFAULT as UNDATED, anchor_source,
@@ -39,10 +40,12 @@ from llm_prompt import (coach_chat_data, coach_chat_instructions,
                         format_brief_block, format_context_for_llm,
                         format_goal_assessment, format_memory_block,
                         format_outline_block, format_past_threads, format_plan_window,
-                        format_run_focus, format_thread_start, plan_builder_data,
-                        plan_builder_instructions)
-from plan_builder import (brief_calendar, clean_brief, clean_outline, goal_assessment,
-                          outline_warnings)
+                        format_chunk_days, format_run_focus, format_thread_start,
+                        plan_builder_data, plan_builder_instructions, plan_weeks_data,
+                        PLAN_WEEKS_PROMPT)
+from plan_builder import (assemble_weeks, brief_calendar, chunk_rows, chunks, clean_brief,
+                          clean_chunk, clean_outline, draft_warnings, goal_assessment,
+                          outline_warnings, target_label)
 from weather import (COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time,
                      weather_report)
 
@@ -1901,18 +1904,23 @@ def _update_plans_index(bucket, sub, change):
     return update_json(bucket, path, normalized, _empty_plans_index, busy=PlansIndexBusy)
 
 
+def _new_plan_card(meta, author=None):
+    plan = {
+        "id": _new_plan_id(),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "archived": False,
+        **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
+    }
+    if author:
+        plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
+    return plan
+
+
 def create_plan(bucket, sub, meta, make_active=True, author=None):
     """Новый план в реестре. make_active=False — активным он станет, только
     если активного плана нет (так создаёт план тренер, #60)."""
     def add(index):
-        plan = {
-            "id": _new_plan_id(),
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "archived": False,
-            **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
-        }
-        if author:
-            plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
+        plan = _new_plan_card(meta, author)
         index["plans"].append(plan)
         if make_active or not index.get("active_plan_id"):
             index["active_plan_id"] = plan["id"]
@@ -3738,6 +3746,186 @@ def clean_plan_reply(envelope, builder):
     if rejected:
         extra["draft_rejected"] = rejected
     return extra
+
+
+class PlanDraftIncomplete(Exception):
+    """Модель не дала всех недель куска и после повтора (llm_bad_draft)."""
+
+
+def plan_draft_brief(bucket, sub, thread_id, message):
+    """Бриф, к которому относится каркас реплики; None — его нет."""
+    if message.get("brief"):
+        return message["brief"]
+    ref = outline_brief_id(message)
+    source = read_ai_message(bucket, sub, thread_id, ref) if ref else None
+    return (source or {}).get("brief")
+
+
+def generate_plan_draft(brief, outline, ask, profile_lines=(),
+                        chunk_size=AI_PLAN_CHUNK_WEEKS, parallel=AI_PLAN_PARALLEL):
+    """Недели плана по каркасу: куски параллельными вызовами модели.
+
+    ask(system, user) → ответ модели {text, input_tokens, output_tokens}; сбой
+    модели ask поднимает сам — маршрут переводит его в свой код. Кусок, в
+    ответе на который нет каких-то недель, переспрашивается один раз только
+    о них; не дали и тогда — PlanDraftIncomplete. Ничего не пишет.
+    """
+    calendar = brief_calendar(brief)
+    brief_text = format_brief_block(brief, calendar)
+    outline_text = format_outline_block(outline, "Каркас плана")
+
+    def call(numbers):
+        system = PLAN_WEEKS_PROMPT + "\n\n" + plan_weeks_data(
+            profile_lines, brief_text, outline_text,
+            format_chunk_days(chunk_rows(brief, calendar, outline, numbers)))
+        res = ask(system, f"Распиши недели {numbers[0]}–{numbers[-1]} по каркасу."
+                  if len(numbers) > 1 else f"Распиши неделю {numbers[0]} по каркасу.")
+        try:
+            raw = parse_llm_json(res["text"])
+        except (ValueError, TypeError):
+            raw = None
+        return res, raw
+
+    def chunk(numbers):
+        cells, tokens = {}, [0, 0, 0]
+        wanted = numbers
+        for _ in range(2):
+            res, raw = call(wanted)
+            tokens = [tokens[0] + 1, tokens[1] + res.get("input_tokens", 0),
+                      tokens[2] + res.get("output_tokens", 0)]
+            got, wanted = clean_chunk(raw, wanted)
+            cells.update(got)
+            if not wanted:
+                return cells, tokens
+        raise PlanDraftIncomplete(f"недели {wanted} без ответа")
+
+    parts = chunks(calendar, chunk_size)
+    with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(parts)))) as pool:
+        results = list(pool.map(chunk, parts))
+    cells = {n: days for got, _ in results for n, days in got.items()}
+    weeks = assemble_weeks(brief, calendar, outline, cells)
+    warnings = draft_warnings(brief, calendar, outline, weeks)
+    return {"weeks": weeks, "warnings": warnings,
+            "calls": sum(t[0] for _, t in results),
+            "input_tokens": sum(t[1] for _, t in results),
+            "output_tokens": sum(t[2] for _, t in results)}
+
+
+# ── План из черновика (#69) ───────────────────────────────────────────────────
+# Черновик становится планом только по действию спортсмена. Один черновик —
+# не больше одного плана: признак — ai_source в карточке плана, а проверка и
+# добавление идут одной условной записью реестра.
+
+AI_PLAN_REASON = "ИИ-тренер: новый план"
+AI_PLAN_EDIT_REASON = "Правка черновика ИИ-тренера"
+
+
+class PlanAlreadyCreated(Exception):
+    """Из этого черновика план уже создан (already_created)."""
+
+    def __init__(self, plan_id):
+        super().__init__(plan_id)
+        self.plan_id = plan_id
+
+
+class PlanDraftInvalid(ValueError):
+    """Правленые недели черновика не прошли проверку (validation_failed)."""
+
+    def __init__(self, errors):
+        super().__init__("validation_failed")
+        self.errors = errors
+
+
+def plan_card_from_brief(brief):
+    """Карточка плана по брифу: у общего плана нет даты старта и цели."""
+    card = {"race_name": brief["title"], "race_date": "", "target_time": "",
+            "plan_start": brief["start_date"]}
+    if brief.get("type") == "race":
+        card.update(race_date=brief["race_date"],
+                    target_time=target_label(brief.get("target_time") or ""))
+    return card
+
+
+def _draft_plan(index, thread_id, msg_id):
+    return next((p for p in index.get("plans", [])
+                 if (p.get("ai_source") or {}).get("message_id") == msg_id
+                 and (p.get("ai_source") or {}).get("thread_id") == thread_id), None)
+
+
+def create_plan_from_draft(bucket, sub, thread_id, msg_id, make_active, weeks=None,
+                           created_by="api"):
+    """План из черновика реплики: версия 1 — черновик ИИ, версия 2 — правки
+    спортсмена, если он прислал недели, отличные от черновика.
+
+    None — реплики нет. AICoachError("no_plan_draft") — в реплике нет
+    черновика; PlanDraftInvalid — правленые недели не прошли проверку
+    (тогда ничего не создано); PlanAlreadyCreated — план из этого черновика
+    уже есть.
+
+    План мог появиться в реестре без недель (сбой между двумя записями):
+    тогда повтор не отвечает already_created, а дописывает недели.
+    """
+    message = read_ai_message(bucket, sub, thread_id, msg_id)
+    if not message:
+        return None
+    draft = message.get("plan_draft")
+    if not draft:
+        raise AICoachError("no_plan_draft")
+    draft_weeks, _ = clean_plan_weeks(draft["weeks"])
+    edited = None
+    if weeks is not None:
+        edited, errors = clean_plan_weeks(weeks)
+        if errors:
+            raise PlanDraftInvalid(errors)
+        if edited == draft_weeks:
+            edited = None
+
+    card = plan_card_from_brief(draft["brief"])
+    source = {"thread_id": thread_id, "message_id": msg_id}
+
+    def add(index):
+        existing = _draft_plan(index, thread_id, msg_id)
+        if existing:
+            raise PlanAlreadyCreated(existing["id"])
+        plan = {**_new_plan_card(card, plan_author("ai", sub)), "ai_source": source}
+        index["plans"].append(plan)
+        if make_active or not index.get("active_plan_id"):
+            index["active_plan_id"] = plan["id"]
+        return plan
+
+    try:
+        plan = _update_plans_index(bucket, sub, add)
+    except PlanAlreadyCreated as e:
+        if read_plan_manifest(bucket, sub, e.plan_id):
+            raise
+        plan = find_plan(read_plans_index(bucket, sub), e.plan_id)
+    try:
+        saved = save_plan_weeks(bucket, sub, plan["id"], draft_weeks, AI_PLAN_REASON,
+                                created_by, base_version=0, author=plan_author("ai", sub))
+        if edited:
+            saved = save_plan_weeks(bucket, sub, plan["id"], edited, AI_PLAN_EDIT_REASON,
+                                    created_by, base_version=saved["version"],
+                                    author=plan_author("athlete", sub))
+    except PlanStale:
+        # Недели успел дописать параллельный запрос того же черновика.
+        raise PlanAlreadyCreated(plan["id"])
+    return {"plan": plan, "version": saved["version"],
+            "active_plan_id": read_plans_index(bucket, sub).get("active_plan_id")}
+
+
+def mark_draft_states(bucket, sub, thread_id, messages):
+    """Проставляет репликам с черновиком plan_draft_state: created (с plan_id)
+    или open. Состояние — свойство реестра планов, в реплике не хранится."""
+    drafts = [m for m in messages if m.get("plan_draft")]
+    if not drafts:
+        return messages
+    index = read_plans_index(bucket, sub)
+    for message in drafts:
+        plan = _draft_plan(index, thread_id, message["id"])
+        message["plan_draft_state"] = "created" if plan else "open"
+        if plan:
+            message["plan_id"] = plan["id"]
+    return messages
 
 
 def build_ai_turn(bucket, sub, thread, messages, run=None):
