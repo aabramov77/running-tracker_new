@@ -210,8 +210,11 @@ function localIso(d) {
   const p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
+// В предпросмотре импорта и черновика ИИ (#69) недели — чужого плана: подписи
+// «ДД.ММ» читаются с годом от его начала, а не от начала активного.
 function planStartDate() {
-  return localDate(ACTIVE_PLAN?.plan_start) || localDate('2026-05-10');
+  return localDate((_importedRace && _importedRace.plan_start) || ACTIVE_PLAN?.plan_start)
+    || localDate('2026-05-10');
 }
 // Подпись недели «11.05» / «11.05.2026» / «2026-05-11» → Date. Год у первого
 // формата отсутствует — берём ближайший к plan_start, чтобы план через
@@ -325,9 +328,12 @@ function renderPlanSelectors() {
   const list = livePlans();
   const sel = document.getElementById('plan-select');
   if (sel) {
-    // План, который создал тренер (#60), подписан — спортсмен видит, откуда он.
+    // План, который создал тренер (#60) или ИИ-тренер (#69), подписан —
+    // спортсмен видит, откуда он.
+    const from = p => p.created_by_role === 'coach' ? ' · от тренера'
+                    : p.created_by_role === 'ai' ? ' · от ИИ' : '';
     sel.innerHTML = list.map(p =>
-      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}${p.created_by_role === 'coach' ? ' · от тренера' : ''}</option>`
+      `<option value="${escapeHtml(p.id)}"${p.id === activePlanId() ? ' selected' : ''}>${escapeHtml(planLabel(p))}${from(p)}</option>`
     ).join('');
     sel.style.display = list.length ? '' : 'none';
   }
@@ -1724,27 +1730,34 @@ function importPlanFile(file) {
 }
 
 /** Показывает загруженный план в конструкторе, ничего не сохраняя. */
-function applyImportedPlan(weeks, fileName, warnings, race) {
+// draft — черновик ИИ-тренера (#69): {threadId, messageId}. Предпросмотр тот
+// же, что у файла, но действия свои — план создаётся из черновика на сервере.
+let _draftPreview = null;
+
+function applyImportedPlan(weeks, fileName, warnings, race, draft = null) {
   _planBackup = Array.isArray(PLAN) ? JSON.parse(JSON.stringify(PLAN)) : [];
   _importedRace = race;
+  _draftPreview = draft;
   PLAN = weeks;
   planEditMode = true;
   document.getElementById('plan-edit-btn').textContent = '✕ Отмена';
   document.getElementById('plan-save-bar').style.display = 'none';  // свой бар
   renderPlan();
-  renderImportBar({ fileName, count: weeks.length,
+  renderImportBar({ fileName, count: weeks.length, draft: !!draft,
                     warnings: [...warnings, ...planDateWarnings()] });
 }
 
-function renderImportBar({ fileName, count, warnings, errors }) {
+function renderImportBar({ fileName, count, warnings, errors, draft = false }) {
   const bar = document.getElementById('plan-import-bar');
   const summary = document.getElementById('plan-import-summary');
   const warnEl = document.getElementById('plan-import-warnings');
   const actions = document.getElementById('plan-import-actions');
+  const draftActions = document.getElementById('plan-draft-actions');
   const closeBtn = document.getElementById('plan-import-close');
   if (!bar) return;
   bar.style.display = '';
   bar.classList.toggle('error', !!errors);
+  draftActions.style.display = 'none';
   if (errors) {
     summary.textContent = `⚠ Не удалось загрузить «${fileName}»`;
     warnEl.style.display = '';
@@ -1752,10 +1765,15 @@ function renderImportBar({ fileName, count, warnings, errors }) {
     actions.style.display = 'none';
     closeBtn.style.display = '';
   } else {
-    summary.textContent = `✓ Загружено недель: ${count} из «${fileName}». Проверьте и при необходимости поправьте, затем выберите действие.`;
+    summary.textContent = draft
+      ? `🤖 Черновик ИИ-тренера «${fileName}»: недель ${count}. Проверьте и при необходимости поправьте, затем создайте план — текущий план не изменится.`
+      : `✓ Загружено недель: ${count} из «${fileName}». Проверьте и при необходимости поправьте, затем выберите действие.`;
     warnEl.style.display = (warnings && warnings.length) ? '' : 'none';
     warnEl.innerHTML = (warnings || []).map(w => '⚠ ' + escapeHtml(w)).join('<br>');
-    actions.style.display = 'flex';
+    actions.style.display = draft ? 'none' : 'flex';
+    draftActions.style.display = draft ? 'flex' : 'none';
+    // «Активировать позже» имеет смысл, только если активный план есть
+    document.getElementById('plan-draft-later').style.display = activePlanId() ? '' : 'none';
     closeBtn.style.display = 'none';
   }
 }
@@ -1771,7 +1789,7 @@ function importFlash(text) {
 }
 
 function finishImport() {
-  _planBackup = null; _importedRace = null;
+  _planBackup = null; _importedRace = null; _draftPreview = null;
   planEditMode = false;
   document.getElementById('plan-edit-btn').textContent = '✏ Редактировать';
   document.getElementById('plan-save-bar').style.display = 'none';
@@ -1833,6 +1851,33 @@ async function saveImportedAsNewPlan() {
     await loadPlan();
     renderAll();
   } catch (e) { importFlash('⚠ Не удалось создать план: ' + e.message); }
+}
+
+// Черновик ИИ-тренера из предпросмотра (#69): план создаёт сервер из реплики
+// черновика, правки уходят полем weeks и ложатся второй версией.
+async function saveDraftAsPlan(makeActive) {
+  const draft = _draftPreview;
+  if (!draft) return;
+  collectPlanEdits();
+  PLAN.forEach((r, i) => { r.w = i + 1; });
+  const weeks = JSON.parse(JSON.stringify(PLAN));
+  try {
+    const created = await aiPostCreatePlan(draft.threadId, draft.messageId, makeActive, weeks);
+    aiMarkDraftCreated(draft.threadId, draft.messageId, created.plan.id);
+    PLAN = _planBackup || [];        // недели прежнего активного плана
+    finishImport();
+    await aiAfterPlanCreated();
+    aiRender(false);
+  } catch (e) {
+    if (e.code === 'already_created') {
+      aiMarkDraftCreated(draft.threadId, draft.messageId, e.data.plan_id);
+      cancelPlanImport();
+      await loadPlans();
+      alert('План из этого черновика уже создан.');
+      return;
+    }
+    if (!e.handled) importFlash('⚠ Не удалось создать план: ' + aiErrorText(e));
+  }
 }
 
 // ── Экспорт ──
@@ -3936,12 +3981,17 @@ const AI_STARTERS = [
     text: 'Что стоит поменять в плане на следующую неделю, исходя из последних тренировок?' },
   { label: '🎯 Иду ли я к цели', title: 'Движение к цели',
     text: 'Иду ли я по графику к целевому результату? Что сейчас сдерживает больше всего?' },
+  { label: '🗓 Составить новый план', plan: true, text: 'Хочу составить новый план.' },
 ];
+// Разбор «Новый план» (#69): подтверждение брифа — обычная реплика.
+const AI_BRIEF_OK_TEXT = 'Бриф верный — предложи каркас плана.';
 // session растёт при смене разбора: ответ, пришедший уже в другой разбор,
 // отбрасывается. pending — вопрос {text, runId}, на который модель ещё не
-// ответила.
+// ответила. generating — id реплики каркаса, недели по которому сейчас
+// расписываются; planAsk — id черновика, у которого открыт выбор активации.
 const AICOACH = { threads: [], thread: null, messages: [], usage: null,
-                  pending: null, loading: false, applying: false, session: 0 };
+                  pending: null, loading: false, applying: false, session: 0,
+                  generating: null, planAsk: null, creating: false };
 // Память тренера (#80): data — ответ GET /ai-coach/memory, по его version
 // идут правки; editing — id факта, который правится на месте.
 const AIMEM = { data: null, open: false, editing: null, showHidden: false, busy: false };
@@ -3950,7 +4000,8 @@ const AI_DAY_LABELS = Object.fromEntries(PLAN_DAYS);    // mon → «Пн»
 function aiReset() {
   AICOACH.session++;
   Object.assign(AICOACH, { threads: [], thread: null, messages: [], usage: null,
-                           pending: null, loading: false, applying: false });
+                           pending: null, loading: false, applying: false,
+                           generating: null, planAsk: null, creating: false });
   Object.assign(AIMEM, { data: null, open: false, editing: null, showHidden: false, busy: false });
 }
 
@@ -3963,7 +4014,8 @@ async function aiFetch(path, { method = 'GET', body = null } = {}) {
   if (res.status === 401) { handleAuthError(); throw Object.assign(new Error('Unauthorized'), { handled: true }); }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`),
-                                   { code: data.error, status: res.status, limit: data.limit });
+                                   { code: data.error, status: res.status, limit: data.limit,
+                                     data });
   return data;
 }
 
@@ -3983,6 +4035,14 @@ function aiErrorText(e) {
   if (e.code === 'llm_empty_reply') return 'Модель вернула пустой ответ — попробуйте ещё раз.';
   if (e.code === 'message_too_long') return 'Сообщение длиннее 2000 символов';
   if (e.code === 'proposal_stale') return 'План изменился после этого предложения — попросите тренера предложить правки заново';
+  // Новый план с ИИ (#69)
+  if (e.code === 'llm_bad_draft') return 'Модель расписала не все недели — попробуйте ещё раз. Попытка не потрачена.';
+  if (e.code === 'no_outline') return 'У этого ответа нет каркаса — попросите тренера предложить каркас';
+  if (e.code === 'no_plan_draft') return 'У этого ответа нет черновика плана';
+  if (e.code === 'already_created') return 'План из этого черновика уже создан';
+  if (e.code === 'validation_failed') return 'Проверьте недели черновика: ' +
+    Object.values((e.data && e.data.fields) || {}).join('; ');
+  if (e.code === 'plans_busy') return 'Список планов сейчас меняется — повторите чуть позже.';
   if (e.status === 404) return 'Разбор не найден — возможно, он скрыт в другой вкладке';
   return e.message || 'Не удалось получить ответ';
 }
@@ -4036,12 +4096,116 @@ function aiProposalHtml(m) {
     + `<table>${rows}</table>${footer}</div>`;
 }
 
+// ── Разбор «Новый план» (#69): карточки брифа, каркаса и черновика ──
+// Сервер проверил и сохранил их в реплике; карточки только показывают и
+// ведут к следующему шагу. План создаётся лишь по кнопке спортсмена.
+const AI_BRIEF_DAY = Object.fromEntries(PLAN_DAYS.map(([f, l]) => [f, l.toLowerCase()]));
+
+function aiDdmm(iso) {
+  const s = String(iso || '');
+  return s.length >= 10 ? `${s.slice(8, 10)}.${s.slice(5, 7)}` : s;
+}
+
+function aiWarningsHtml(warnings) {
+  return warnings && warnings.length
+    ? `<div class="ai-plan-warn">${warnings.map(w => '⚠ ' + escapeHtml(w)).join('<br>')}</div>` : '';
+}
+
+// Кнопка подтверждения — только у последнего брифа, пока к нему нет каркаса.
+function aiOpenBriefId() {
+  const ms = AICOACH.messages;
+  const idx = ms.map(m => !!m.brief).lastIndexOf(true);
+  if (idx < 0 || ms.slice(idx).some(m => m.outline)) return null;
+  return ms[idx].id;
+}
+
+function aiBriefHtml(m) {
+  const b = m.brief;
+  const rows = [['Тип', b.type === 'race' ? 'к старту' : 'общий, без старта'], ['Название', b.title]];
+  if (b.type === 'race') {
+    rows.push(['Старт', `${aiDdmm(b.race_date)}, ${Number(b.distance_km)} км`]);
+    rows.push(['Цель', b.target_time || 'финишировать']);
+  }
+  rows.push(['Начало', aiDdmm(b.start_date)], ['Недель', String(b.weeks)]);
+  rows.push(['Тренировок в неделю', String(b.sessions_per_week)]);
+  rows.push(['Дни', b.days && b.days.length ? b.days.map(d => AI_BRIEF_DAY[d]).join(', ') : 'без ограничений']);
+  if (b.long_run_day) rows.push(['Длительная', AI_BRIEF_DAY[b.long_run_day]]);
+  if (b.notes) rows.push(['Ограничения', b.notes]);
+  const button = m.id === aiOpenBriefId()
+    ? `<button class="btn-primary" ${AICOACH.pending || AICOACH.generating ? 'disabled' : ''} onclick="aiConfirmBrief()">Всё верно — предложить каркас</button>` : '';
+  return `<div class="ai-plan-card"><div class="ai-prop-title">Бриф плана</div>`
+    + `<table>${rows.map(([k, v]) => `<tr><td class="ai-prop-when">${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join('')}</table>`
+    + button + '</div>';
+}
+
+function aiOutlineHtml(m) {
+  const o = m.outline;
+  const max = Math.max(1, ...o.weeks.map(w => Number(w.km) || 0));
+  const bars = o.weeks.map(w =>
+    `<span class="ai-bar ${PLAN_BADGE[w.type] || ''}" style="height:${Math.max(4, Math.round((Number(w.km) || 0) / max * 100))}%"`
+    + ` title="Нед ${Number(w.week)}: ${escapeHtml(PLAN_TYPE_LABEL[w.type] || w.type)}, ${Number(w.km)} км"></span>`).join('');
+  const kms = o.weeks.map(w => Number(w.km) || 0);
+  const weeks = o.weeks.map(w =>
+    `<div class="ai-plan-week"><b>Нед ${Number(w.week)}</b> · <span class="badge ${PLAN_BADGE[w.type] || ''}">${escapeHtml(PLAN_TYPE_LABEL[w.type] || w.type)}</span> · ${Number(w.km)} км`
+    + (w.accent ? ` — ${escapeHtml(w.accent)}` : '')
+    + (w.key ? `<div class="ai-prop-why">${escapeHtml(w.key)}</div>` : '') + '</div>').join('');
+  const paceList = o.paces || [];
+  const paces = paceList.length
+    ? `<div class="ai-prop-why">Темпы: ${paceList.map(p => `${escapeHtml(p.name)} ${escapeHtml(p.value)}`).join('; ')}</div>` : '';
+  const busy = AICOACH.generating === m.id;
+  const button = `<button class="btn-primary" ${AICOACH.generating || AICOACH.pending ? 'disabled' : ''} onclick="aiGenerateWeeks('${escapeHtml(m.id)}')">${busy ? 'Тренер расписывает недели…' : 'Расписать по неделям'}</button>`;
+  return `<div class="ai-plan-card"><div class="ai-prop-title">Каркас плана: ${Number(o.weeks.length)} нед., ${Math.min(...kms)}–${Math.max(...kms)} км в неделю</div>`
+    + `<div class="ai-bars" aria-hidden="true">${bars}</div>`
+    + aiWarningsHtml(o.warnings) + paces
+    + `<details class="ai-plan-details"><summary>Недели каркаса</summary>${weeks}</details>`
+    + button + '</div>';
+}
+
+function aiDraftWeeksHtml(weeks) {
+  return weeks.map(w => {
+    const days = PLAN_DAYS.filter(([f]) => String(w[f] || '').trim())
+      .map(([f, l]) => `<div><span class="ai-prop-when">${l}</span> ${escapeHtml(w[f])}</div>`).join('');
+    return `<div class="ai-plan-week"><b>Нед ${Number(w.w)}</b> · ${escapeHtml(w.start)}–${escapeHtml(w.end)} · `
+      + `<span class="badge ${PLAN_BADGE[w.type] || ''}">${escapeHtml(PLAN_TYPE_LABEL[w.type] || w.type)}</span>`
+      + (w.accent ? ` — ${escapeHtml(w.accent)}` : '') + (days || '<div class="ai-prop-why">отдых</div>') + '</div>';
+  }).join('');
+}
+
+function aiDraftHtml(m) {
+  const d = m.plan_draft;
+  const first = d.weeks[0], last = d.weeks[d.weeks.length - 1];
+  const head = `<div class="ai-prop-title">Черновик плана «${escapeHtml(d.brief.title)}»: ${Number(d.weeks.length)} нед., ${escapeHtml(first.start)}–${escapeHtml(last.end)}</div>`;
+  let footer;
+  if (m.plan_draft_state === 'created') {
+    const plan = PLANS.find(p => p.id === m.plan_id);
+    const name = plan ? planLabel(plan) : d.brief.title;
+    footer = `<div class="ai-prop-state done">✓ План создан: «${escapeHtml(name)}»${plan && plan.archived ? ' (в архиве)' : ''}</div>`
+      + (plan && !plan.archived && plan.id !== activePlanId()
+        ? `<button class="btn-sm" onclick="aiActivatePlan('${escapeHtml(plan.id)}')">Сделать активным</button>` : '');
+  } else if (AICOACH.planAsk === m.id) {
+    footer = `<div class="ai-plan-ask">${escapeHtml(aiCreateQuestion(d))} Текущий план «${escapeHtml(planLabel(ACTIVE_PLAN))}» останется в списке.</div>`
+      + `<div class="ai-plan-actions"><button class="btn-primary" ${AICOACH.creating ? 'disabled' : ''} onclick="aiCreatePlan('${escapeHtml(m.id)}', true)">Сделать активным</button>`
+      + `<button class="btn-sm" ${AICOACH.creating ? 'disabled' : ''} onclick="aiCreatePlan('${escapeHtml(m.id)}', false)">Активировать позже</button>`
+      + `<button class="btn-sm" onclick="aiCreateCancel()">Отмена</button></div>`;
+  } else {
+    footer = `<div class="ai-plan-actions"><button class="btn-primary" ${AICOACH.creating ? 'disabled' : ''} onclick="aiCreatePlanAsk('${escapeHtml(m.id)}')">Создать план…</button>`
+      + `<button class="btn-sm desktop-only" onclick="aiDraftPreview('${escapeHtml(m.id)}')">Посмотреть и поправить в конструкторе</button></div>`;
+  }
+  return `<div class="ai-plan-card">${head}${aiWarningsHtml(d.warnings)}`
+    + `<details class="ai-plan-details"><summary>Показать недели</summary>${aiDraftWeeksHtml(d.weeks)}</details>`
+    + footer + '</div>';
+}
+
 function aiMessageHtml(m) {
   const mine = m.role === 'athlete';
   const chip = m.run_id ? aiRunChipHtml(m.run_id, m.run_title || 'тренировка') : '';
   const proposal = m.proposal ? aiProposalHtml(m) : '';
   const memory = m.memory_changes && m.memory_changes.length ? aiMemoryChangesHtml(m.memory_changes) : '';
-  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}${memory}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
+  const plan = (m.brief ? aiBriefHtml(m) : '') + (m.outline ? aiOutlineHtml(m) : '')
+    + (m.plan_draft ? aiDraftHtml(m) : '')
+    + (m.draft_rejected && m.draft_rejected.length
+      ? `<div class="ai-prop-state">Тренер ошибся в ${m.draft_rejected.includes('brief') ? 'брифе' : 'каркасе'} — попросите его повторить.</div>` : '');
+  return `<div class="chat-msg${mine ? ' mine' : ''}">${mine ? escapeHtml(m.text) : mdLite(m.text)}${chip}${proposal}${plan}${memory}<span class="chat-time">${chatTime(m.ts)}</span></div>`;
 }
 
 function aiRenderRunChoices() {
@@ -4065,7 +4229,7 @@ function aiRenderThreads() {
     `<div class="run-item ai-thread${t.id === current ? ' active' : ''}" onclick="aiOpenThread('${escapeHtml(t.id)}')">
       <div class="run-date">${chatTime(t.last_ts)}</div>
       <div class="run-info">
-        <div class="run-title">${escapeHtml(t.title)}</div>
+        <div class="run-title">${t.kind === 'plan' ? '🗓 ' : ''}${escapeHtml(t.title)}</div>
         <div class="run-meta">сообщений: ${Number(t.messages)}</div>
       </div>
       <button class="btn-sm" title="Скрыть разбор" onclick="event.stopPropagation();aiArchiveThread('${escapeHtml(t.id)}')" style="flex-shrink:0;color:var(--c-danger)">✕</button>
@@ -4090,6 +4254,8 @@ function aiRender(scrollToEnd = true) {
     html += `<div class="chat-msg mine">${escapeHtml(pending.text)}${run ? aiRunChipHtml(run.id, aiRunLabel(run)) : ''}</div>`
           + '<div class="chat-msg ai-thinking">Тренер думает…</div>';
   }
+  if (AICOACH.generating && !loading)
+    html += '<div class="chat-msg ai-thinking">Тренер расписывает недели по каркасу — это займёт до минуты…</div>';
   const log = document.getElementById('ai-log');
   log.innerHTML = html;
   log.style.display = html ? '' : 'none';
@@ -4100,7 +4266,7 @@ function aiRender(scrollToEnd = true) {
   document.getElementById('ai-starter-list').innerHTML = AI_STARTERS
     .map((s, i) => (s.latestRun && !hasRuns) ? '' :
       `<button class="btn-sm" onclick="aiStarter(${i})">${escapeHtml(s.label)}</button>`).join('');
-  document.getElementById('ai-send').disabled = !!pending || loading;
+  document.getElementById('ai-send').disabled = !!pending || loading || !!AICOACH.generating;
 }
 
 function openAiCoachTab() {
@@ -4168,7 +4334,7 @@ async function aiSend(preset = null) {
   const input = document.getElementById('ai-input');
   const select = document.getElementById('ai-run');
   const text = (preset ? preset.text : input.value).trim();
-  if (!text || AICOACH.pending || AICOACH.loading) return;
+  if (!text || AICOACH.pending || AICOACH.loading || AICOACH.generating) return;
   const runId = preset ? null : (Number(select.value) || null);
   const session = AICOACH.session;
   AICOACH.pending = { text, runId };
@@ -4179,7 +4345,9 @@ async function aiSend(preset = null) {
     if (!AICOACH.thread) {
       const head = preset && preset.threadRunId
         ? { run_id: preset.threadRunId }            // заголовок сервер возьмёт из пробежки
-        : { title: (preset && preset.title) || text };
+        : preset && preset.kind === 'plan'
+          ? { kind: 'plan' }                        // разбор нового плана (#69): «Новый план»
+          : { title: (preset && preset.title) || text };
       const created = await aiFetch('threads', { method: 'POST', body: head });
       if (AICOACH.session !== session) return;
       AICOACH.thread = created.thread;
@@ -4206,6 +4374,7 @@ async function aiSend(preset = null) {
 function aiStarter(index) {
   const starter = AI_STARTERS[index];
   if (!starter) return;
+  if (starter.plan) { aiSend({ text: starter.text, kind: 'plan' }); return; }
   if (!starter.latestRun) { aiSend({ text: starter.text, title: starter.title }); return; }
   const latest = aiOwnRuns()[0];
   if (latest) aiSend({ text: starter.text, threadRunId: latest.id });
@@ -4244,6 +4413,139 @@ async function aiApplyProposal(messageId) {
     AICOACH.applying = false;
     if (AICOACH.session === session) aiRender(false);
   }
+}
+
+// ── Новый план с ИИ (#69): действия карточек ──
+
+// Вход с вкладки «План»: новый разбор «Новый план», тренер начинает с вопросов.
+function aiPlanBuilder() {
+  showTab('aicoach');
+  aiNewThread();
+  aiSend({ text: AI_STARTERS.find(s => s.plan).text, kind: 'plan' });
+}
+
+function aiConfirmBrief() {
+  if (AICOACH.thread && !AICOACH.pending) aiSend({ text: AI_BRIEF_OK_TEXT });
+}
+
+// Недели по каркасу: одна попытка лимита, до минуты ожидания.
+async function aiGenerateWeeks(messageId) {
+  const thread = AICOACH.thread;
+  if (!thread || AICOACH.generating || AICOACH.pending) return;
+  if (!confirm('Расписать план по неделям? Это займёт до минуты и одну попытку из дневного лимита.')) return;
+  const session = AICOACH.session;
+  AICOACH.generating = messageId;
+  aiNote('');
+  aiRender();
+  try {
+    const data = await aiFetch(`threads/${encodeURIComponent(thread.id)}/messages/${encodeURIComponent(messageId)}/weeks`,
+                               { method: 'POST' });
+    if (AICOACH.session !== session) { aiLoadThreads(); return; }
+    AICOACH.messages = AICOACH.messages.concat(data.messages || []);
+    AICOACH.usage = data.usage || AICOACH.usage;
+    aiLoadThreads();
+  } catch (e) {
+    if (AICOACH.session === session && !e.handled) aiNote(aiErrorText(e));
+  } finally {
+    AICOACH.generating = null;
+    aiRender(AICOACH.session === session);
+  }
+}
+
+function aiCreateQuestion(draft) {
+  const n = draft.weeks.length;
+  return `Создать план «${draft.brief.title}» (${n} ${ruPlural(n, 'неделя', 'недели', 'недель')}, с ${aiDdmm(draft.brief.start_date)})?`;
+}
+
+// «Создать план…»: без активного плана — подтверждение, и новый план станет
+// активным; с активным — выбор на карточке: сделать активным или позже.
+function aiCreatePlanAsk(messageId) {
+  const message = AICOACH.messages.find(m => m.id === messageId);
+  if (!message || !message.plan_draft || AICOACH.creating) return;
+  if (!activePlanId()) {
+    if (confirm(aiCreateQuestion(message.plan_draft) + ' Он станет активным планом.'))
+      aiCreatePlan(messageId, true);
+    return;
+  }
+  AICOACH.planAsk = messageId;
+  aiRender(false);
+}
+
+function aiCreateCancel() {
+  AICOACH.planAsk = null;
+  aiRender(false);
+}
+
+function aiPostCreatePlan(threadId, messageId, makeActive, weeks = null) {
+  return aiFetch(`threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}/create-plan`,
+                 { method: 'POST', body: weeks ? { make_active: makeActive, weeks } : { make_active: makeActive } });
+}
+
+function aiMarkDraftCreated(threadId, messageId, planId) {
+  if (!AICOACH.thread || AICOACH.thread.id !== threadId) return;
+  const message = AICOACH.messages.find(m => m.id === messageId);
+  if (message) Object.assign(message, { plan_draft_state: 'created', plan_id: planId });
+  AICOACH.planAsk = null;
+}
+
+// Новый план в списке планов; стал активным — его недели, план/факт и
+// погода, как при переключении плана.
+async function aiAfterPlanCreated() {
+  const before = activePlanId();
+  await loadPlans();
+  if (activePlanId() !== before) {
+    COMPLIANCE = null;
+    WEATHER = null;
+    await loadPlan();
+  }
+  renderAll();
+}
+
+async function aiCreatePlan(messageId, makeActive) {
+  const thread = AICOACH.thread;
+  if (!thread || AICOACH.creating) return;
+  if (makeActive && planEditMode) {
+    // Иначе открытая правка осталась бы поверх недель другого плана.
+    aiNote('Сначала сохраните или отмените правку плана на вкладке «План»');
+    return;
+  }
+  AICOACH.creating = true;
+  aiNote('');
+  aiRender(false);
+  try {
+    const created = await aiPostCreatePlan(thread.id, messageId, makeActive);
+    aiMarkDraftCreated(thread.id, messageId, created.plan.id);
+    await aiAfterPlanCreated();
+  } catch (e) {
+    if (e.code === 'already_created') {
+      aiMarkDraftCreated(thread.id, messageId, e.data.plan_id);
+      await loadPlans();
+    } else if (!e.handled) aiNote(aiErrorText(e));
+  } finally {
+    AICOACH.creating = false;
+    aiRender(false);
+  }
+}
+
+async function aiActivatePlan(planId) {
+  await switchPlan(planId);
+  aiRender(false);
+}
+
+// «Посмотреть и поправить в конструкторе»: черновик открывается как
+// предпросмотр импорта, без записи на сервер. Даты считаются от начала
+// черновика — его карточка подставляется на время предпросмотра.
+function aiDraftPreview(messageId) {
+  const thread = AICOACH.thread;
+  const message = AICOACH.messages.find(m => m.id === messageId);
+  if (!thread || !message || !message.plan_draft) return;
+  if (planEditMode) { aiNote('Сначала сохраните или отмените правку плана на вкладке «План»'); return; }
+  const d = message.plan_draft;
+  const card = { race_name: d.brief.title, race_date: d.brief.race_date || '',
+                 target_time: d.brief.target_time || '', plan_start: d.brief.start_date };
+  showTab('plan');
+  applyImportedPlan(JSON.parse(JSON.stringify(d.weeks)), d.brief.title, d.warnings || [], card,
+                    { threadId: thread.id, messageId });
 }
 
 // Вход из журнала и карточки пробежки: новый разбор, посвящённый ей.

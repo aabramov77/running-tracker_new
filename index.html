@@ -13,7 +13,7 @@
 <meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
 <meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=37">
+<link rel="stylesheet" href="style.css?v=38">
 <link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -293,6 +293,7 @@
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <select id="plan-select" onchange="switchPlan(this.value)" style="max-width:220px"></select>
           <button class="btn-sm" onclick="createNewPlan()">+ Новый план</button>
+          <button class="btn-sm" onclick="aiPlanBuilder()" title="Составить новый план в диалоге с ИИ-тренером">🤖 Составить с ИИ</button>
           <button class="btn-sm" onclick="toggleRaceForm()">✏ Гонка</button>
           <button class="btn-sm" id="plan-history-btn" onclick="showOwnPlanHistory()" style="display:none">История</button>
         </div>
@@ -315,6 +316,12 @@
           <button class="btn-primary" onclick="saveImportedPlan()">Сохранить в текущий план</button>
           <button class="btn-sm" onclick="saveImportedAsNewPlan()">Создать новый план</button>
           <button class="btn-sm" onclick="cancelPlanImport()" style="color:var(--c-danger)">Отменить импорт</button>
+        </div>
+        <!-- Черновик ИИ-тренера в конструкторе (#69): план создаётся только отсюда -->
+        <div id="plan-draft-actions" style="display:none;gap:8px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn-primary" onclick="saveDraftAsPlan(true)">Создать и сделать активным</button>
+          <button class="btn-sm" id="plan-draft-later" onclick="saveDraftAsPlan(false)">Создать, активировать позже</button>
+          <button class="btn-sm" onclick="cancelPlanImport()" style="color:var(--c-danger)">Отмена</button>
         </div>
         <div style="margin-top:10px">
           <button class="btn-sm" id="plan-import-close" onclick="hideImportBar()" style="display:none">Закрыть</button>
@@ -1347,6 +1354,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=58"></script>
+<script src="app.js?v=59"></script>
 </body>
 </html>
