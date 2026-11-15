@@ -234,6 +234,38 @@ def test_empty_reply_is_an_error(storage_module, text):
         storage_module.parse_coach_reply(text)
 
 
+# ── вид разбора: новый план (#69) ─────────────────────────────────────────────
+
+def test_plan_thread_gets_its_kind_and_default_title(api, fake_bucket, storage_module):
+    body, code, _ = api(FakeRequest("POST", "/ai-coach/threads", {"kind": "plan"}))
+    thread = json.loads(body)["thread"]
+    assert code == 201
+    assert thread["kind"] == "plan" and thread["title"] == "Новый план"
+    assert thread["run_id"] is None
+    assert storage_module.read_ai_thread(fake_bucket, SUB, thread["id"]) == thread
+
+
+def test_plan_thread_keeps_its_own_title_and_ignores_the_run(api, fake_bucket):
+    """run_id при kind=plan не ищется: несуществующая пробежка не даёт 404."""
+    body, code, _ = api(FakeRequest("POST", "/ai-coach/threads",
+                                    {"kind": "plan", "title": "Марафон весной", "run_id": 999}))
+    thread = json.loads(body)["thread"]
+    assert code == 201
+    assert thread["title"] == "Марафон весной" and thread["run_id"] is None
+
+
+@pytest.mark.parametrize("kind", ["x", "general", "run", 1, ""])
+def test_unknown_thread_kind_is_rejected(api, fake_bucket, kind):
+    body, code, _ = api(FakeRequest("POST", "/ai-coach/threads", {"kind": kind}))
+    assert code == 400 and json.loads(body)["error"] == "invalid_kind"
+    assert not _ai_objects(fake_bucket)
+
+
+def test_thread_without_kind_is_as_before(api):
+    thread = _new_thread(api)
+    assert thread["kind"] == "general" and thread["title"] == "Итоги недели"
+
+
 # ── ход диалога через HTTP ────────────────────────────────────────────────────
 
 def test_turn_stores_question_and_answer(api, llm, fake_bucket, storage_module):

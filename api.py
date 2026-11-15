@@ -32,7 +32,8 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
                      clean_effort, clean_memory_edit, clean_memory_ops,
                      clean_plan_meta, clean_plan_weeks,
-                     clean_proposal, clean_race, clean_run, clean_thread_summary,
+                     clean_plan_reply, clean_proposal, clean_race, clean_run,
+                     clean_thread_summary,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
                      coach_weather_view,
@@ -703,8 +704,14 @@ def _attached_run(c):
 
 
 def h_ai_threads_post(c):
+    # kind (#69): нет — обычный разбор, "plan" — разбор нового плана. У него
+    # пробежки разбора нет, поэтому run_id даже не ищется.
+    kind = c.body().get("kind")
+    if kind is not None and kind != "plan":
+        return jresp({"error": "invalid_kind"}, 400)
     thread = create_ai_thread(c.bucket, c.sub, c.body().get("title"),
-                              run=_attached_run(c), created_by=c.email)
+                              run=None if kind == "plan" else _attached_run(c),
+                              created_by=c.email, kind=kind)
     return jresp({"thread": thread}, 201)
 
 
@@ -771,7 +778,11 @@ def h_ai_message_post(c):
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
     ctx = turn["ctx"]
-    proposal = clean_proposal(envelope.get("proposal"), turn["plan_window"])
+    # Разбор нового плана (#69): вместо правок текущего плана — бриф и
+    # каркас; proposal там не предлагается, и пришедший отбрасывается.
+    draft = clean_plan_reply(envelope, turn["plan_builder"]) if turn["plan_builder"] else {}
+    proposal = None if turn["plan_builder"] else \
+        clean_proposal(envelope.get("proposal"), turn["plan_window"])
     if proposal:
         # К какой версии плана относится «было» — по ней apply решает,
         # применимо ли ещё предложение.
@@ -795,6 +806,7 @@ def h_ai_message_post(c):
         "based_on_memory_version": turn["memory_version"],
         **({"thread_summary": summary} if summary else {}),
         **({"proposal": proposal} if proposal else {}),
+        **draft,
         **({"memory_changes": memory["changes"], "memory_version": memory["version"]}
            if memory else {}),
     })
