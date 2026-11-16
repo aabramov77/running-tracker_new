@@ -128,6 +128,8 @@ function applyRole(role) {
   gate('admin', isAdmin);
   // #44: вкладка «Тренер» нужна и тренеру, и спортсмену, у которого тренер есть
   gate('coach', currentIsCoach || myCoach);
+  // #64: подраздел справки «Для тренера» — только тому, кто сам тренер
+  gate('coach-self', currentIsCoach);
   document.getElementById('more-user').textContent = currentUser.name || currentUser.email || '';
   document.getElementById('llm-settings-card').style.display = isAdmin ? '' : 'none';
   document.getElementById('llm-settings-note').style.display = isAdmin ? 'none' : '';
@@ -1460,9 +1462,9 @@ async function saveDayEdit() {
       // План уже перечитан. Тот же план и неделя на месте — показываем, что
       // теперь стоит в этом дне; иначе править здесь больше нечего.
       const row = activePlanId() === planId ? PLAN[edit.idx] : null;
-      if (!row) { closeDaySheet(); alert(e.message); return; }
+      if (!row) { closeDaySheet(); alert(e.message + PLAN_STALE_HELP); return; }
       edit.was = row[edit.field] || '';
-      dayNote(`План изменился: сейчас здесь «${edit.was || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
+      dayNote(`План изменился: сейчас здесь «${edit.was || 'пусто'}». Сохраните ещё раз, чтобы заменить.` + PLAN_STALE_HELP, true);
       return;
     }
     dayNote('Не удалось сохранить: ' + e.message, true);
@@ -1817,7 +1819,7 @@ async function saveImportedPlan() {
       // вернула бы недели, которых на сервере больше нет.
       finishImport();
       renderPlan();
-      alert(e.message + ' Если план всё ещё нужно заменить, загрузите файл ещё раз.');
+      alert(e.message + ' Если план всё ещё нужно заменить, загрузите файл ещё раз.' + PLAN_STALE_HELP);
       return;
     }
     importFlash('⚠ Не удалось сохранить: ' + e.message);
@@ -1952,6 +1954,9 @@ function downloadPlanTemplate() {
 
 const PLAN_STALE_TEXT = 'План успели изменить — с другого устройства, тренером или правкой ИИ-тренера. ' +
   'Загружена его свежая версия, ваша правка не сохранена.';
+// #64: последняя фраза любого сообщения об отказе по plan_stale — где об этом
+// прочитать. В сам PLAN_STALE_TEXT не входит: он же уходит в Error.message.
+const PLAN_STALE_HELP = ' Подробнее — в «❓ Справке», раздел «Планы».';
 
 /** Пишет недели в активный план (бэкенд создаёт новую версию).
  *
@@ -1994,7 +1999,7 @@ async function savePlanEdits() {
     setTimeout(() => { msg.style.display = 'none'; cancelPlanEdit(); }, 1500);
   } catch(e) {
     // При plan_stale конструктор остаётся открытым уже со свежими неделями.
-    alert(e.code === 'plan_stale' ? e.message + ' Внесите её заново.'
+    alert(e.code === 'plan_stale' ? e.message + ' Внесите её заново.' + PLAN_STALE_HELP
                                   : 'Ошибка сохранения: ' + e.message);
   } finally {
     btn.disabled = false; btn.textContent = 'Сохранить изменения';
@@ -2747,7 +2752,17 @@ const LOAD_COST_LABELS = { usual: 'как обычно', higher: 'дороже �
 const LOAD_COST_HINTS = { usual: 'пульс как обычно при той же работе',
                           higher: 'пульс выше обычного при той же работе',
                           lower: 'пульс ниже обычного при той же работе' };
-const LOAD_AXES = { ext: { unit: 'rTSS', label: 'По темпу' }, int: { unit: 'TRIMP', label: 'По пульсу' } };
+const LOAD_AXES = {
+  ext: { unit: 'rTSS', label: 'По темпу', help: 'rtss', term: 'нагрузка по темпу, rTSS' },
+  int: { unit: 'TRIMP', label: 'По пульсу', help: 'trimp', term: 'нагрузка по пульсу, TRIMP' },
+};
+
+// Кнопка «ⓘ» (#64): открывает справку на объяснении термина. Якорь и термин —
+// константы из кода, не данные сервера.
+function infoLinkHtml(anchor, term) {
+  return `<button type="button" class="info-link" aria-label="Справка: ${term}" `
+    + `onclick="showHelp('${anchor}', event)">ⓘ</button>`;
+}
 const LOAD_VIEWS = {
   athlete: { body: 'load-body', canvas: 'loadChart', axis: null, chart: null },
   coach: { body: 'coach-load-body', canvas: 'coachLoadChart', axis: null, chart: null },
@@ -2816,7 +2831,7 @@ function loadTileHtml(period, key) {
   if (!axis) return '';
   const value = loadValueText(axis, LOAD_AXES[key].unit);
   return `<div class="load-tile">
-      <div class="load-tile-label">${LOAD_AXES[key].label}, последние 7 дней</div>
+      <div class="load-tile-label">${LOAD_AXES[key].label}, последние 7 дней${infoLinkHtml(LOAD_AXES[key].help, LOAD_AXES[key].term)}</div>
       <div class="load-tile-value">${value}</div>${loadVerdictHtml(axis)}
     </div>`;
 }
@@ -2824,14 +2839,15 @@ function loadTileHtml(period, key) {
 function loadCostTileHtml(load) {
   if (!loadAxesOf(load).includes('ext') || !loadAxesOf(load).includes('int')) return '';
   const cost = load.rolling && load.rolling.cost;
+  const label = `<div class="load-tile-label">Цена работы${infoLinkHtml('cost', 'цена работы')}</div>`;
   if (!cost || !LOAD_COST_LABELS[cost.band]) {
-    return `<div class="load-tile"><div class="load-tile-label">Цена работы</div>
+    return `<div class="load-tile">${label}
       <div class="load-tile-value">—</div>
       <div class="load-tile-note">Нужны хотя бы 2 лёгкие или длительные пробежки за неделю и 4 за месяц до неё — с пульсом и темпом.</div></div>`;
   }
   const band = cost.band;
   const pct = `${cost.dev_pct > 0 ? '+' : ''}${Number(cost.dev_pct)} %`;
-  return `<div class="load-tile"><div class="load-tile-label">Цена работы</div>
+  return `<div class="load-tile">${label}
       <div class="load-tile-value">${pct}</div>
       <span class="load-pill cost-${band}">${LOAD_COST_LABELS[band]}</span>
       <div class="load-tile-note">${LOAD_COST_HINTS[band]} — на лёгких и длительных</div></div>`;
@@ -3020,7 +3036,7 @@ function todayLoadHtml() {
   const costLine = costBand
     ? `<div class="load-cost-line ${costBand}">♥ ${LOAD_COST_HINTS[costBand]}: ${costPct}</div>` : '';
   return `<div class="card load-today" onclick="showTab('stats')" style="cursor:pointer">
-      <div class="card-title" style="margin:0 0 6px">Нагрузка за 7 дней</div>
+      <div class="card-title" style="margin:0 0 6px">Нагрузка за 7 дней${infoLinkHtml(LOAD_AXES[key].help, LOAD_AXES[key].term)}</div>
       <div class="load-verdict">${loadVerdictHtml(axis)}</div>
       <div class="hint" style="margin:4px 0 0">${of} ${value}${usual}</div>
       ${costLine}
@@ -4783,6 +4799,38 @@ function showTab(name){
   if(name==='users')loadUsers();
   // #44: открытого спортсмена перерисовываем (график в скрытой вкладке не имел размера)
   if(name==='coach')openCoachTab();
+  if(name==='help')setHelpReturn(null);   // #64: из меню «‹ Назад» не нужен; showHelp поставит свой
+}
+
+// ── Справка (#64) ──
+// Разделы и термины — id="help-<якорь>" в index.html. Справка — статика:
+// ни открытие, ни переходы внутри не обращаются к API.
+let helpReturnTab = null;            // вкладка, откуда пришли по «ⓘ»
+
+function setHelpReturn(tab) {
+  helpReturnTab = tab;
+  document.getElementById('help-back').style.display = tab ? '' : 'none';
+}
+
+// Кнопка «ⓘ» и оглавление. С другой вкладки — запоминаем её для «‹ Назад»;
+// внутри справки запомненное не трогаем. event — от «ⓘ», чтобы клик не
+// раскрыл блок профиля и не свернул карточку под кнопкой.
+function showHelp(anchor, event) {
+  if (event) event.stopPropagation();
+  const from = document.body.dataset.tab;
+  if (from !== 'help') {
+    showTab('help');
+    setHelpReturn(from || null);
+  }
+  const target = document.getElementById('help-' + anchor);
+  // Скрытое по роли или неизвестное — к началу справки
+  if (target && target.offsetParent !== null) target.scrollIntoView({ block: 'start' });
+  else window.scrollTo(0, 0);
+}
+
+function helpBack() {
+  const tab = helpReturnTab;
+  if (tab) showTab(tab);
 }
 
 // ── Мобильная раскладка (#48) ──
@@ -4792,6 +4840,7 @@ const TAB_GROUP = {
   today: 'today', plan: 'plan', add: 'add',
   log: 'progress', stats: 'progress',
   more: 'more', aicoach: 'more', races: 'more', profile: 'more', coach: 'more', users: 'more',
+  help: 'more',
 };
 const MOBILE_ONLY_TABS = ['today', 'more'];   // у десктопа в меню таких пунктов нет
 const MOBILE_MQ = window.matchMedia('(max-width: 600px)');
@@ -5312,7 +5361,7 @@ async function coachStale(athlete, planId) {
   if (COACH.athlete !== athlete || COACH.planId !== planId) return;
   if (!COACH.base) {
     // Свежий план не загрузился — о «загруженной свежей версии» не говорим.
-    alert(COACH_STALE_LOST_TEXT);
+    alert(COACH_STALE_LOST_TEXT + PLAN_STALE_HELP);
     return;
   }
   if (!importing) {
@@ -5320,7 +5369,7 @@ async function coachStale(athlete, planId) {
     document.getElementById('coach-change-note').value = note;
   }
   alert(COACH_STALE_TEXT + (importing
-    ? ' Если план всё ещё нужно заменить, загрузите файл ещё раз.' : ' Внесите её заново.'));
+    ? ' Если план всё ещё нужно заменить, загрузите файл ещё раз.' : ' Внесите её заново.') + PLAN_STALE_HELP);
 }
 
 // ── Неделя и правка дня на телефоне (#62): как у спортсмена (#48) ──
@@ -5445,9 +5494,9 @@ async function coachDayStale(edit) {
   if (COACH.dayEdit !== edit) return;      // лист закрыли, пока шёл запрос
   const row = COACH.athlete === edit.athlete && COACH.planId === edit.planId && COACH.base
     ? COACH.weeks[edit.idx] : null;
-  if (!row) { coachCloseDay(); alert(COACH.base ? COACH_STALE_TEXT : COACH_STALE_LOST_TEXT); return; }
+  if (!row) { coachCloseDay(); alert((COACH.base ? COACH_STALE_TEXT : COACH_STALE_LOST_TEXT) + PLAN_STALE_HELP); return; }
   edit.was = row[edit.field] || '';
-  coachDayMsg(`План изменился: сейчас здесь «${edit.was || 'пусто'}». Сохраните ещё раз, чтобы заменить.`, true);
+  coachDayMsg(`План изменился: сейчас здесь «${edit.was || 'пусто'}». Сохраните ещё раз, чтобы заменить.` + PLAN_STALE_HELP, true);
 }
 
 // ── Новый план и карточка гонки (#60) ──
