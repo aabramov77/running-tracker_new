@@ -18,9 +18,13 @@ from config import (ADMIN_DAILY_AI_COACH_LIMIT, BUCKET_NAME, CLIENT_ID,
                     DAILY_AI_COACH_LIMIT, LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS,
                     MAX_FIT_BODY_BYTES, MAX_JSON_BODY_BYTES)
 from domain import personal_bests
+from llm_prompt import format_profile_block
+from plan_builder import draft_summary
 from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      FitTokenInvalid, LLMRefused, LLMTruncated, MemoryStale,
-                     PlansIndexBusy, PlanStale, RaceStale, RegistrationClosed, RunStale,
+                     PlanAlreadyCreated, PlanDraftIncomplete, PlanDraftInvalid,
+                     PlansIndexBusy, PlanStale, RaceStale,
+                     RegistrationClosed, RunStale,
                      StorageBusy, UsageBusy, LATE_PROFILE_FIELDS, RACE_FIELDS, RUN_FIELDS,
                      _fmt_pace, format_duration,
                      active_coach_sub, append_ai_message, append_chat_message,
@@ -32,21 +36,24 @@ from storage import (AICoachError, ChatError, CoachLinkError, EntityDeleted,
                      clean_ai_text, clean_athlete_profile, clean_change_reason,
                      clean_effort, clean_memory_edit, clean_memory_ops,
                      clean_plan_meta, clean_plan_weeks,
-                     clean_proposal, clean_race, clean_run, clean_thread_summary,
+                     clean_plan_reply, clean_proposal, clean_race, clean_run,
+                     clean_thread_summary,
                      cleanup_old_tmp, coach_access, coach_plan_edit_allowed,
                      athlete_derived, build_training_load, coach_load_view,
                      coach_weather_view,
-                     create_ai_thread, create_plan,
+                     create_ai_thread, create_plan, create_plan_from_draft,
                      current_coach, delete_race, delete_run,
-                     find_own_run, find_plan, get_active_plan,
+                     find_own_run, find_plan, generate_plan_draft, get_active_plan,
                      get_storage_client,
                      list_ai_threads, list_athletes_of, list_coaches,
-                     mark_proposal_states, mask_key, memory_facts, memory_view,
+                     mark_draft_states, mark_proposal_states, mask_key, memory_facts,
+                     memory_view,
                      migrate_all_entity_history, migrate_legacy_to_user,
                      my_coach, notify_plan_change,
-                     parse_coach_reply, parse_fit_file, plan_author, plan_for_date,
+                     parse_coach_reply, parse_fit_file, plan_author, plan_draft_brief,
+                     plan_for_date,
                      plan_meta_unchanged,
-                     read_advice_usage, read_ai_memory, read_ai_memory_history,
+                     read_advice_usage, read_ai_memory, read_ai_memory_history, read_ai_message,
                      read_ai_messages, read_ai_thread, read_athlete_history,
                      read_athlete_profile,
                      read_llm_config_full, read_plan_history, read_plan_state,
@@ -703,8 +710,14 @@ def _attached_run(c):
 
 
 def h_ai_threads_post(c):
+    # kind (#69): нет — обычный разбор, "plan" — разбор нового плана. У него
+    # пробежки разбора нет, поэтому run_id даже не ищется.
+    kind = c.body().get("kind")
+    if kind is not None and kind != "plan":
+        return jresp({"error": "invalid_kind"}, 400)
     thread = create_ai_thread(c.bucket, c.sub, c.body().get("title"),
-                              run=_attached_run(c), created_by=c.email)
+                              run=None if kind == "plan" else _attached_run(c),
+                              created_by=c.email, kind=kind)
     return jresp({"thread": thread}, 201)
 
 
@@ -714,6 +727,7 @@ def h_ai_thread_get(c):
         return jresp({"error": "thread not found"}, 404)
     messages = mark_proposal_states(c.bucket, c.sub, thread["id"],
                                     read_ai_messages(c.bucket, c.sub, thread["id"]))
+    messages = mark_draft_states(c.bucket, c.sub, thread["id"], messages)
     return jresp({"thread": thread, "messages": messages, "usage": _ai_usage(c)}, 200)
 
 
@@ -771,7 +785,11 @@ def h_ai_message_post(c):
     # Вопрос пишется только вместе с ответом: сбой модели не оставляет в
     # разборе реплику, на которую никто не ответил.
     ctx = turn["ctx"]
-    proposal = clean_proposal(envelope.get("proposal"), turn["plan_window"])
+    # Разбор нового плана (#69): вместо правок текущего плана — бриф и
+    # каркас; proposal там не предлагается, и пришедший отбрасывается.
+    draft = clean_plan_reply(envelope, turn["plan_builder"]) if turn["plan_builder"] else {}
+    proposal = None if turn["plan_builder"] else \
+        clean_proposal(envelope.get("proposal"), turn["plan_window"])
     if proposal:
         # К какой версии плана относится «было» — по ней apply решает,
         # применимо ли ещё предложение.
@@ -795,6 +813,7 @@ def h_ai_message_post(c):
         "based_on_memory_version": turn["memory_version"],
         **({"thread_summary": summary} if summary else {}),
         **({"proposal": proposal} if proposal else {}),
+        **draft,
         **({"memory_changes": memory["changes"], "memory_version": memory["version"]}
            if memory else {}),
     })
@@ -834,6 +853,114 @@ def h_ai_proposal_apply(c):
     if not applied:
         return jresp({"error": "message not found"}, 404)
     return jresp({"applied": applied}, 201)
+
+
+# ── Новый план с ИИ: генерация недель (#69) ───────────────────────────────────
+
+PLAN_WEEKS_REQUEST_TEXT = "Расписать план по неделям"
+
+
+class _DraftAskFailed(Exception):
+    """Сбой модели на одном из кусков: несёт готовый ответ с кодом."""
+
+    def __init__(self, failure):
+        super().__init__("llm failure")
+        self.failure = failure
+
+
+def h_ai_plan_weeks(c):
+    """Недели плана по каркасу реплики: одна попытка лимита на всю генерацию.
+
+    Куски идут параллельными вызовами модели. Любой сбой — ни запроса, ни
+    ответа в разборе, попытка возвращается; иначе как у хода диалога.
+    """
+    thread = read_ai_thread(c.bucket, c.sub, c.args[0])
+    if not thread:
+        return jresp({"error": "thread not found"}, 404)
+    message = read_ai_message(c.bucket, c.sub, thread["id"], c.args[1])
+    if not message:
+        return jresp({"error": "message not found"}, 404)
+    brief = plan_draft_brief(c.bucket, c.sub, thread["id"], message) \
+        if message.get("outline") else None
+    if not brief:
+        return jresp({"error": "no_outline"}, 400)
+    cfg = read_llm_config_full(c.bucket)
+    if not cfg or not cfg.get("api_key"):
+        return jresp({"error": "LLM config not set. Обратитесь к администратору."}, 400)
+    limit = _ai_limit(c)
+    try:
+        reserved = reserve_advice_usage(c.bucket, c.sub, limit)
+    except UsageBusy:
+        return jresp({"error": "usage_busy"}, 429)
+    if reserved is None:
+        return jresp({"error": "daily_limit_reached", "limit": limit}, 429)
+    usage = {"count": reserved["count"], "limit": limit}
+
+    def ask(system, user):
+        res, failure = _ask_llm(cfg, system, user)
+        if failure:
+            raise _DraftAskFailed(failure)
+        return res
+
+    try:
+        profile, profile_version, _ = read_athlete_profile(c.bucket, c.sub)
+        races = [r for r in read_races(c.bucket, c.sub) if not r.get("deleted")]
+        profile_lines = format_profile_block(profile, athlete_derived(profile, races),
+                                             personal_bests(races))
+        draft = generate_plan_draft(brief, message["outline"], ask, profile_lines)
+    except _DraftAskFailed as e:
+        release_advice_usage(c.bucket, c.sub)
+        return e.failure
+    except PlanDraftIncomplete as e:
+        release_advice_usage(c.bucket, c.sub)
+        return _llm_failure("llm_bad_draft", 502, cfg, e)
+    except Exception:
+        release_advice_usage(c.bucket, c.sub)
+        raise
+
+    question = append_ai_message(c.bucket, c.sub, thread["id"], "athlete",
+                                 PLAN_WEEKS_REQUEST_TEXT,
+                                 {"created_by": c.email, "plan_weeks_for": message["id"]})
+    plan_draft = {"brief": brief, "outline": message["outline"], "weeks": draft["weeks"],
+                  "warnings": draft["warnings"], "outline_message_id": message["id"]}
+    answer = append_ai_message(c.bucket, c.sub, thread["id"], "ai",
+                               draft_summary(brief, draft["weeks"], message["outline"],
+                                             draft["warnings"]), {
+        "plan_draft": plan_draft,
+        "provider": cfg["provider"], "model": cfg["model"],
+        "llm_calls": draft["calls"],
+        "input_tokens": draft["input_tokens"], "output_tokens": draft["output_tokens"],
+        "based_on_llm_config_version": cfg["version"],
+        "based_on_profile_version": profile_version,
+    })
+    return jresp({"messages": [question, {**answer, "plan_draft_state": "open"}],
+                  "usage": usage}, 201)
+
+
+def h_ai_create_plan(c):
+    """План из черновика — только по действию спортсмена (#69).
+
+    make_active — сделать новый план активным; без активного плана он
+    становится активным и так. weeks — недели, поправленные в конструкторе:
+    ложатся второй версией поверх черновика.
+    """
+    thread = read_ai_thread(c.bucket, c.sub, c.args[0])
+    if not thread:
+        return jresp({"error": "thread not found"}, 404)
+    body = c.body()
+    try:
+        created = create_plan_from_draft(c.bucket, c.sub, thread["id"], c.args[1],
+                                         make_active=body.get("make_active") is True,
+                                         weeks=body.get("weeks"), created_by=c.email)
+    except AICoachError as e:
+        return jresp({"error": str(e)}, 400)
+    except PlanDraftInvalid as e:
+        return validation_failed(e.errors)
+    except PlanAlreadyCreated as e:
+        return jresp({"error": "already_created", "plan_id": e.plan_id}, 409)
+    if not created:
+        return jresp({"error": "message not found"}, 404)
+    return jresp(created, 201)
 
 
 # ── Память ИИ-тренера (#80) ───────────────────────────────────────────────────
@@ -1265,6 +1392,8 @@ ROUTES = [
     ("POST",   r"^/ai-coach/threads/([\w-]+)/archive$",    h_ai_thread_archive, False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages$",   h_ai_message_post,   False),
     ("POST",   r"^/ai-coach/threads/([\w-]+)/messages/([\w-]+)/apply$", h_ai_proposal_apply, False),
+    ("POST",   r"^/ai-coach/threads/([\w-]+)/messages/([\w-]+)/weeks$", h_ai_plan_weeks, False),
+    ("POST",   r"^/ai-coach/threads/([\w-]+)/messages/([\w-]+)/create-plan$", h_ai_create_plan, False),
     ("GET",    r"^/ai-coach/memory$",                      h_ai_memory_get,     False),
     ("POST",   r"^/ai-coach/memory$",                      h_ai_memory_post,    False),
     ("GET",    r"^/ai-coach/memory/history$",              h_ai_memory_history, False),

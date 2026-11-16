@@ -635,6 +635,33 @@ table.pb-table td:last-child { text-align: right; }
 .ai-prop-why { font-size: 12px; color: var(--text-muted); }
 .ai-prop-state { font-size: 12px; color: var(--text-muted); }
 .ai-prop-state.done { color: var(--c-accent); font-weight: 500; }
+/* Новый план с ИИ (#69): бриф, каркас и черновик под ответом тренера */
+.ai-plan-card {
+  white-space: normal; margin-top: 8px; padding: 8px 10px;
+  background: var(--bg-card); color: var(--text);
+  border: 0.5px solid var(--border); border-left: 3px solid var(--c-accent);
+  border-radius: 0 8px 8px 0;
+}
+.ai-plan-card table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+.ai-plan-card td { padding: 3px 0; border-top: 0.5px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+.ai-plan-card td.ai-prop-when, .ai-plan-week .ai-prop-when {
+  white-space: nowrap; padding-right: 12px;
+  font-family: 'DM Mono', monospace; font-size: 12px; color: var(--text-muted);
+}
+.ai-bars {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 56px; margin: 4px 0 8px;
+}
+.ai-bar { flex: 1 1 0; min-width: 0; border-radius: 2px 2px 0 0; padding: 0; }
+/* цвет типа недели — от цвета текста бейджа: светлый фон бейджа на столбике не виден */
+.ai-bars .ai-bar { background: currentColor; opacity: .55; }
+.ai-plan-warn { font-size: 12px; color: var(--c-warn); margin-bottom: 6px; }
+.ai-plan-details { margin: 6px 0 8px; font-size: 12px; }
+.ai-plan-details summary { cursor: pointer; width: fit-content; color: var(--text-muted); }
+.ai-plan-week { padding: 6px 0; border-top: 0.5px solid var(--border); overflow-wrap: anywhere; }
+.ai-plan-week .badge { font-size: 10px; }
+.ai-plan-ask { font-size: 13px; margin-bottom: 8px; }
+.ai-plan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 /* Что тренер помнит об открытом разборе (#82) */
 .ai-summary { margin: 0 0 8px; font-size: 12px; color: var(--text-muted); }
 .ai-summary summary { cursor: pointer; width: fit-content; }

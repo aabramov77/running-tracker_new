@@ -319,6 +319,24 @@ def test_plan_is_changed_only_by_the_apply_button():
     assert apply.index("/apply`") < apply.index("await loadPlan()")
 
 
+def test_plan_builder_entry_points_are_wired():
+    """Новый план с ИИ (#69): вход с вкладки «План» и подсказка заводят разбор
+    kind=plan; план создаётся только кнопками карточки и бара предпросмотра."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert 'onclick="aiPlanBuilder()"' in html
+    assert 'id="plan-draft-actions"' in html and 'id="plan-draft-later"' in html
+    assert html.count('onclick="saveDraftAsPlan(') == 2
+    assert "{ kind: 'plan' }" in js and "plan: true" in js
+    assert "/create-plan`" in js and "/weeks`" in js
+    preview = _js_section(js, "async function saveDraftAsPlan(", "\n}\n")
+    assert "collectPlanEdits()" in preview and "aiPostCreatePlan(" in preview
+    ask = _js_section(js, "function aiCreatePlanAsk(", "\n}\n")
+    assert "confirm(" in ask and "activePlanId()" in ask
+    generate = _js_section(js, "async function aiGenerateWeeks(", "\n}\n")
+    assert "confirm('Расписать план по неделям? Это займёт до минуты и одну попытку из дневного лимита.')" in generate
+
+
 def test_run_review_entry_points_are_wired():
     html = INDEX.read_text(encoding="utf-8")
     js = APP_JS.read_text(encoding="utf-8")
@@ -488,7 +506,8 @@ def js_templates(src):
 _SAFE_CALLS = ("escapeHtml", "Number", "km1", "chatTime", "mdLite", "ddmm", "secondsToTime",
                "plannedKmLabel", "dayFactHtml", "aiRunChipHtml", "aiProposalHtml",
                "runItemHtml", "kmCell", "dayCell", "inp", "typeSel", "hero",
-               "wxDeg", "wxVenueHtml", "wxCellHtml", "wxShortHtml", "wxDetailHtml")
+               "wxDeg", "wxVenueHtml", "wxCellHtml", "wxShortHtml", "wxDetailHtml",
+               "aiWarningsHtml", "aiDraftWeeksHtml")
 # Словари подписей в коде: значение берётся из них, а не из данных.
 _SAFE_MAPS = r"(?:[A-Z][A-Z_0-9]*|label|feelEmoji|typeLabels|statusLabel)"
 _MARKUP = re.compile(r"</?[a-zA-Z]")

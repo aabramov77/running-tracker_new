@@ -20,7 +20,8 @@ from fitparse import FitFile
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.cloud import storage as gcs
 
-from config import (ADMIN_EMAILS, BUCKET_NAME, LLM_CONFIG_MANIFEST,
+from config import (ADMIN_EMAILS, AI_PLAN_CHUNK_WEEKS, AI_PLAN_PARALLEL, BUCKET_NAME,
+                    LLM_CONFIG_MANIFEST,
                     LLM_DEFAULT_EFFORT, LLM_EFFORT_LEVELS, LLM_MAX_TOKENS,
                     MAX_PENDING, REGISTRY_TTL_SEC, USERS_REGISTRY)
 from compliance import (DEFAULT as UNDATED, anchor_source,
@@ -36,9 +37,15 @@ from load import (HIST_VERSION, THRESHOLD_PACE_MAX, THRESHOLD_PACE_MIN,
                   hr_histogram, run_hist_entry, threshold_for, weekly_load,
                   zone_seconds)
 from llm_prompt import (coach_chat_data, coach_chat_instructions,
-                        format_context_for_llm, format_memory_block,
-                        format_past_threads, format_plan_window, format_run_focus,
-                        format_thread_start)
+                        format_brief_block, format_context_for_llm,
+                        format_goal_assessment, format_memory_block,
+                        format_outline_block, format_past_threads, format_plan_window,
+                        format_chunk_days, format_run_focus, format_thread_start,
+                        plan_builder_data, plan_builder_instructions, plan_weeks_data,
+                        PLAN_WEEKS_PROMPT)
+from plan_builder import (assemble_weeks, brief_calendar, chunk_rows, chunks, clean_brief,
+                          clean_chunk, clean_outline, draft_warnings, goal_assessment,
+                          outline_warnings, target_label)
 from weather import (COLD_SENSITIVITY, LOCATION_NAME_MAX, VENUES, parse_run_time,
                      weather_report)
 
@@ -1897,18 +1904,23 @@ def _update_plans_index(bucket, sub, change):
     return update_json(bucket, path, normalized, _empty_plans_index, busy=PlansIndexBusy)
 
 
+def _new_plan_card(meta, author=None):
+    plan = {
+        "id": _new_plan_id(),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "archived": False,
+        **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
+    }
+    if author:
+        plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
+    return plan
+
+
 def create_plan(bucket, sub, meta, make_active=True, author=None):
     """Новый план в реестре. make_active=False — активным он станет, только
     если активного плана нет (так создаёт план тренер, #60)."""
     def add(index):
-        plan = {
-            "id": _new_plan_id(),
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "archived": False,
-            **{f: (meta.get(f) or "") for f in PLAN_META_FIELDS},
-        }
-        if author:
-            plan["created_by_role"], plan["created_by_sub"] = author["role"], author["sub"]
+        plan = _new_plan_card(meta, author)
         index["plans"].append(plan)
         if make_active or not index.get("active_plan_id"):
             index["active_plan_id"] = plan["id"]
@@ -3332,21 +3344,31 @@ def run_title(run):
     return " · ".join(part for part in (f"{label} {dist}".strip(), run.get("date")) if part)
 
 
-def create_ai_thread(bucket, sub, title, run=None, created_by="api"):
+AI_PLAN_THREAD_TITLE = "Новый план"
+
+
+def create_ai_thread(bucket, sub, title, run=None, created_by="api", kind=None):
     """Заводит разбор и возвращает его карточку. LLM здесь не вызывается.
 
     run — пробежка, которой разбор посвящён: она остаётся в фокусе на всём
     его протяжении и даёт заголовок, если своего не задали.
+
+    kind="plan" — разбор нового плана (#69): пробежки разбора у него нет,
+    run игнорируется. Другой kind здесь не принимается — его отсекает
+    маршрут кодом invalid_kind.
     """
     title = " ".join(str(title or "").split())[:AI_TITLE_MAX]
+    if kind == "plan":
+        run = None
 
     def make():
         now = datetime.utcnow()
         thread = {
             "id": f"{now.strftime(_AI_ID_TIME)}-{secrets_mod.token_hex(4)}",
-            "kind": "run" if run else "general",
+            "kind": "plan" if kind == "plan" else ("run" if run else "general"),
             "run_id": run["id"] if run else None,
-            "title": title or (run_title(run) if run else "Разбор"),
+            "title": title or (AI_PLAN_THREAD_TITLE if kind == "plan"
+                               else run_title(run) if run else "Разбор"),
             "status": "active",
             "created_at": now.isoformat() + "Z",
             "created_by": created_by,
@@ -3613,6 +3635,299 @@ def build_run_focus(bucket, sub, run, ctx):
     return focus
 
 
+# ── Разбор «Новый план» (#69) ─────────────────────────────────────────────────
+# Бриф и каркас модель возвращает в ответе хода; сервер их проверяет и хранит
+# в реплике, как предложение правок. Календарь — функция брифа, его не
+# хранят: он пересчитывается из брифа на лету.
+
+USUAL_KM_DAYS = 28
+USUAL_KM_MIN_RUNS = 4
+
+
+def usual_weekly_km(profile, runs, today):
+    """Обычный недельный объём: из профиля, иначе средний за 4 недели.
+
+    Пробежек меньше USUAL_KM_MIN_RUNS — сравнивать не с чем, None.
+    """
+    typical = (profile or {}).get("weekly_km_typical")
+    if isinstance(typical, (int, float)) and not isinstance(typical, bool) and typical > 0:
+        return float(typical)
+    since = today - timedelta(days=USUAL_KM_DAYS)
+    recent = []
+    for run in runs:
+        day = to_date(run.get("date"))
+        if day is None or not since < day <= today or run.get("deleted"):
+            continue
+        try:
+            recent.append(float(run.get("dist") or 0))
+        except (TypeError, ValueError):
+            continue
+    if len(recent) < USUAL_KM_MIN_RUNS:
+        return None
+    return round(sum(recent) / (USUAL_KM_DAYS / 7), 1)
+
+
+def plan_thread_state(messages):
+    """Последний принятый бриф и последний каркас разбора с id их реплик.
+
+    Каркас относится к брифу своей реплики, а без него — к реплике
+    outline.brief_message_id.
+    """
+    def last(field):
+        return next((m for m in reversed(messages)
+                     if m.get("role") == "ai" and m.get(field)), None)
+
+    brief_msg, outline_msg = last("brief"), last("outline")
+    return {"brief": brief_msg and brief_msg["brief"],
+            "brief_id": brief_msg and brief_msg["id"],
+            "outline": outline_msg and outline_msg["outline"],
+            "outline_id": outline_msg and outline_msg["id"]}
+
+
+def outline_brief_id(message):
+    """id реплики, к брифу которой относится каркас этой реплики."""
+    if message.get("brief"):
+        return message["id"]
+    return (message.get("outline") or {}).get("brief_message_id")
+
+
+def plan_builder_turn(ctx, messages, runs, races, today=None):
+    """Бриф, оценка цели и каркас для хода разбора «Новый план».
+
+    Каркас показывается, только если он построен под последний бриф: после
+    смены брифа прежний каркас уже о другом плане.
+    """
+    today = to_date(today) or datetime.utcnow().date()
+    state = plan_thread_state(messages)
+    brief = state["brief"]
+    usual = usual_weekly_km(ctx.get("profile"), runs, today)
+    texts = []
+    if brief:
+        texts.append(format_brief_block(brief, brief_calendar(brief)))
+        texts.append(format_goal_assessment(goal_assessment(brief, races, today)))
+        outline_msg = next((m for m in messages if m.get("id") == state["outline_id"]), None)
+        if outline_msg and outline_brief_id(outline_msg) == state["brief_id"]:
+            texts.append(format_outline_block(state["outline"]))
+    return {"state": state, "usual_km": usual, "races": races, "today": today,
+            "text": plan_builder_data(*texts)}
+
+
+def clean_plan_reply(envelope, builder):
+    """Бриф и каркас из ответа модели → поля ответа разбора «Новый план».
+
+    Принятое ложится полями brief / outline, отклонённое — пометкой
+    draft_rejected: ответ тренера сохраняется в любом случае. Каркас
+    проверяется по брифу этого же ответа, а без него — по последнему
+    принятому брифу разбора.
+    """
+    state, today = builder["state"], builder["today"]
+    extra, rejected = {}, []
+    base, base_id = state["brief"], state["brief_id"]
+    if envelope.get("brief"):
+        brief, reason = clean_brief(envelope["brief"], today)
+        if brief:
+            extra["brief"] = brief
+            base, base_id = brief, None         # бриф этой же реплики
+        else:
+            rejected.append("brief")
+            logging.info("plan builder: бриф отклонён (%s)", reason)
+    if envelope.get("outline"):
+        outline, reason = (clean_outline(envelope["outline"], brief_calendar(base))
+                           if base else (None, "no_brief"))
+        if outline:
+            outline["warnings"] = outline_warnings(
+                outline, builder["usual_km"], goal_assessment(base, builder["races"], today))
+            if base_id:
+                outline["brief_message_id"] = base_id
+            extra["outline"] = outline
+        else:
+            rejected.append("outline")
+            logging.info("plan builder: каркас отклонён (%s)", reason)
+    if rejected:
+        extra["draft_rejected"] = rejected
+    return extra
+
+
+class PlanDraftIncomplete(Exception):
+    """Модель не дала всех недель куска и после повтора (llm_bad_draft)."""
+
+
+def plan_draft_brief(bucket, sub, thread_id, message):
+    """Бриф, к которому относится каркас реплики; None — его нет."""
+    if message.get("brief"):
+        return message["brief"]
+    ref = outline_brief_id(message)
+    source = read_ai_message(bucket, sub, thread_id, ref) if ref else None
+    return (source or {}).get("brief")
+
+
+def generate_plan_draft(brief, outline, ask, profile_lines=(),
+                        chunk_size=AI_PLAN_CHUNK_WEEKS, parallel=AI_PLAN_PARALLEL):
+    """Недели плана по каркасу: куски параллельными вызовами модели.
+
+    ask(system, user) → ответ модели {text, input_tokens, output_tokens}; сбой
+    модели ask поднимает сам — маршрут переводит его в свой код. Кусок, в
+    ответе на который нет каких-то недель, переспрашивается один раз только
+    о них; не дали и тогда — PlanDraftIncomplete. Ничего не пишет.
+    """
+    calendar = brief_calendar(brief)
+    brief_text = format_brief_block(brief, calendar)
+    outline_text = format_outline_block(outline, "Каркас плана")
+
+    def call(numbers):
+        system = PLAN_WEEKS_PROMPT + "\n\n" + plan_weeks_data(
+            profile_lines, brief_text, outline_text,
+            format_chunk_days(chunk_rows(brief, calendar, outline, numbers)))
+        res = ask(system, f"Распиши недели {numbers[0]}–{numbers[-1]} по каркасу."
+                  if len(numbers) > 1 else f"Распиши неделю {numbers[0]} по каркасу.")
+        try:
+            raw = parse_llm_json(res["text"])
+        except (ValueError, TypeError):
+            raw = None
+        return res, raw
+
+    def chunk(numbers):
+        cells, tokens = {}, [0, 0, 0]
+        wanted = numbers
+        for _ in range(2):
+            res, raw = call(wanted)
+            tokens = [tokens[0] + 1, tokens[1] + res.get("input_tokens", 0),
+                      tokens[2] + res.get("output_tokens", 0)]
+            got, wanted = clean_chunk(raw, wanted)
+            cells.update(got)
+            if not wanted:
+                return cells, tokens
+        raise PlanDraftIncomplete(f"недели {wanted} без ответа")
+
+    parts = chunks(calendar, chunk_size)
+    with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(parts)))) as pool:
+        results = list(pool.map(chunk, parts))
+    cells = {n: days for got, _ in results for n, days in got.items()}
+    weeks = assemble_weeks(brief, calendar, outline, cells)
+    warnings = draft_warnings(brief, calendar, outline, weeks)
+    return {"weeks": weeks, "warnings": warnings,
+            "calls": sum(t[0] for _, t in results),
+            "input_tokens": sum(t[1] for _, t in results),
+            "output_tokens": sum(t[2] for _, t in results)}
+
+
+# ── План из черновика (#69) ───────────────────────────────────────────────────
+# Черновик становится планом только по действию спортсмена. Один черновик —
+# не больше одного плана: признак — ai_source в карточке плана, а проверка и
+# добавление идут одной условной записью реестра.
+
+AI_PLAN_REASON = "ИИ-тренер: новый план"
+AI_PLAN_EDIT_REASON = "Правка черновика ИИ-тренера"
+
+
+class PlanAlreadyCreated(Exception):
+    """Из этого черновика план уже создан (already_created)."""
+
+    def __init__(self, plan_id):
+        super().__init__(plan_id)
+        self.plan_id = plan_id
+
+
+class PlanDraftInvalid(ValueError):
+    """Правленые недели черновика не прошли проверку (validation_failed)."""
+
+    def __init__(self, errors):
+        super().__init__("validation_failed")
+        self.errors = errors
+
+
+def plan_card_from_brief(brief):
+    """Карточка плана по брифу: у общего плана нет даты старта и цели."""
+    card = {"race_name": brief["title"], "race_date": "", "target_time": "",
+            "plan_start": brief["start_date"]}
+    if brief.get("type") == "race":
+        card.update(race_date=brief["race_date"],
+                    target_time=target_label(brief.get("target_time") or ""))
+    return card
+
+
+def _draft_plan(index, thread_id, msg_id):
+    return next((p for p in index.get("plans", [])
+                 if (p.get("ai_source") or {}).get("message_id") == msg_id
+                 and (p.get("ai_source") or {}).get("thread_id") == thread_id), None)
+
+
+def create_plan_from_draft(bucket, sub, thread_id, msg_id, make_active, weeks=None,
+                           created_by="api"):
+    """План из черновика реплики: версия 1 — черновик ИИ, версия 2 — правки
+    спортсмена, если он прислал недели, отличные от черновика.
+
+    None — реплики нет. AICoachError("no_plan_draft") — в реплике нет
+    черновика; PlanDraftInvalid — правленые недели не прошли проверку
+    (тогда ничего не создано); PlanAlreadyCreated — план из этого черновика
+    уже есть.
+
+    План мог появиться в реестре без недель (сбой между двумя записями):
+    тогда повтор не отвечает already_created, а дописывает недели.
+    """
+    message = read_ai_message(bucket, sub, thread_id, msg_id)
+    if not message:
+        return None
+    draft = message.get("plan_draft")
+    if not draft:
+        raise AICoachError("no_plan_draft")
+    draft_weeks, _ = clean_plan_weeks(draft["weeks"])
+    edited = None
+    if weeks is not None:
+        edited, errors = clean_plan_weeks(weeks)
+        if errors:
+            raise PlanDraftInvalid(errors)
+        if edited == draft_weeks:
+            edited = None
+
+    card = plan_card_from_brief(draft["brief"])
+    source = {"thread_id": thread_id, "message_id": msg_id}
+
+    def add(index):
+        existing = _draft_plan(index, thread_id, msg_id)
+        if existing:
+            raise PlanAlreadyCreated(existing["id"])
+        plan = {**_new_plan_card(card, plan_author("ai", sub)), "ai_source": source}
+        index["plans"].append(plan)
+        if make_active or not index.get("active_plan_id"):
+            index["active_plan_id"] = plan["id"]
+        return plan
+
+    try:
+        plan = _update_plans_index(bucket, sub, add)
+    except PlanAlreadyCreated as e:
+        if read_plan_manifest(bucket, sub, e.plan_id):
+            raise
+        plan = find_plan(read_plans_index(bucket, sub), e.plan_id)
+    try:
+        saved = save_plan_weeks(bucket, sub, plan["id"], draft_weeks, AI_PLAN_REASON,
+                                created_by, base_version=0, author=plan_author("ai", sub))
+        if edited:
+            saved = save_plan_weeks(bucket, sub, plan["id"], edited, AI_PLAN_EDIT_REASON,
+                                    created_by, base_version=saved["version"],
+                                    author=plan_author("athlete", sub))
+    except PlanStale:
+        # Недели успел дописать параллельный запрос того же черновика.
+        raise PlanAlreadyCreated(plan["id"])
+    return {"plan": plan, "version": saved["version"],
+            "active_plan_id": read_plans_index(bucket, sub).get("active_plan_id")}
+
+
+def mark_draft_states(bucket, sub, thread_id, messages):
+    """Проставляет репликам с черновиком plan_draft_state: created (с plan_id)
+    или open. Состояние — свойство реестра планов, в реплике не хранится."""
+    drafts = [m for m in messages if m.get("plan_draft")]
+    if not drafts:
+        return messages
+    index = read_plans_index(bucket, sub)
+    for message in drafts:
+        plan = _draft_plan(index, thread_id, message["id"])
+        message["plan_draft_state"] = "created" if plan else "open"
+        if plan:
+            message["plan_id"] = plan["id"]
+    return messages
+
+
 def build_ai_turn(bucket, sub, thread, messages, run=None):
     """Всё, что уходит модели на очередной ход, кроме самого вопроса.
 
@@ -3626,23 +3941,35 @@ def build_ai_turn(bucket, sub, thread, messages, run=None):
     разбора. Прошлые разборы модель видит по их кратким содержаниям.
     """
     ctx = build_llm_context(bucket, sub)
-    own = {r.get("id"): r for r in read_runs(bucket, sub) if not r.get("deleted", False)}
+    all_runs = read_runs(bucket, sub)
+    own = {r.get("id"): r for r in all_runs if not r.get("deleted", False)}
     focus_ids = [rid for rid in ai_focus_run_ids(thread, messages, run and run["id"])
                  if rid in own]       # скрытая после разбора пробежка выпадает молча
     blocks = [format_run_focus(build_run_focus(bucket, sub, own[rid], ctx))
               for rid in focus_ids]
-    window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
     memory, memory_version = read_ai_memory(bucket, sub)
     summary = latest_thread_summary(messages)
     cut = ai_history_start(messages, AI_HISTORY_CHARS) > 0
-    instructions = coach_chat_instructions(with_proposals=bool(window))
-    data = coach_chat_data(format_context_for_llm(ctx), blocks,
-                           format_plan_window(window) if window else "",
+    builder = None
+    if thread.get("kind") == "plan":
+        # Разбор нового плана (#69): окна правок текущего плана нет — предмет
+        # разговора черновик нового. Вместо окна — бриф, оценка цели и каркас.
+        window = []
+        builder = plan_builder_turn(ctx, messages, list(own.values()),
+                                    [r for r in read_races(bucket, sub) if not r.get("deleted")])
+        instructions = plan_builder_instructions()
+        side_text = builder["text"]
+    else:
+        window = ai_plan_window(ctx["plan_weeks"], ctx["plan_start"], ctx["week_idx"])
+        instructions = coach_chat_instructions(with_proposals=bool(window))
+        side_text = format_plan_window(window) if window else ""
+    data = coach_chat_data(format_context_for_llm(ctx), blocks, side_text,
                            format_memory_block(memory_facts(memory)),
                            format_past_threads(past_ai_threads(bucket, sub, thread.get("id"))),
                            format_thread_start(summary) if cut else "")
     return {
         "ctx": ctx,
+        "plan_builder": builder,
         "memory": memory,
         "memory_version": memory_version,
         "thread_summary": summary,

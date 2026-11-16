@@ -24,6 +24,15 @@ MAX_PENDING = 50            # защита от наполнения реест�
 DAILY_AI_COACH_LIMIT = 30
 ADMIN_DAILY_AI_COACH_LIMIT = 300
 
+# Новый план с ИИ (#69). План к старту — не длиннее AI_PLAN_WEEKS_MAX недель:
+# генерация кусками по AI_PLAN_CHUNK_WEEKS даёт столько параллельных вызовов
+# модели, а каркас всех недель должен помещаться в ответ хода. Общий план без
+# старта — короткий, до AI_PLAN_GENERAL_WEEKS_MAX недель.
+AI_PLAN_WEEKS_MAX = 30
+AI_PLAN_GENERAL_WEEKS_MAX = 16
+AI_PLAN_CHUNK_WEEKS = 4
+AI_PLAN_PARALLEL = 8
+
 # Пределы размера тела запроса (#53). JSON здесь — пробежка, план, сообщение:
 # мегабайта хватает с большим запасом. FIT долгой тренировки — единицы мегабайт.
 MAX_JSON_BODY_BYTES = 1024 * 1024
