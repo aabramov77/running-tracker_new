@@ -3,7 +3,7 @@
 - Issue: https://github.com/aabramov77/running-tracker_new/issues/69
 - Ветка: `Dev`
 - Коммиты: `feat: #69 …`
-- PR: — (`Dev → main`, `Closes #69`)
+- PR: https://github.com/aabramov77/running-tracker_new/pull/93 (`Dev → main`, `Closes #69`, смержен 2026-11-16)
 - OpenSpec: change `ai-plan-builder` —
   `openspec/changes/ai-plan-builder/` (proposal, design, дельты
   `ai-plan-builder`, `ai-coach-dialog`, `ai-plan-proposals`,
