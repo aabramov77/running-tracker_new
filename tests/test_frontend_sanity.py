@@ -844,11 +844,14 @@ def test_gated_menu_items_are_handled_by_apply_role():
     html = INDEX.read_text(encoding="utf-8")
     js = APP_JS.read_text(encoding="utf-8")
     body = _js_section(js, "function applyRole(", "\n}\n")
-    gates = set(re.findall(r'data-gate="(\w+)"', html))
-    assert gates == {"admin", "coach"}
+    gates = set(re.findall(r'data-gate="([\w-]+)"', html))
+    assert gates == {"admin", "coach", "coach-self"}
     for gate in gates:
         assert f"gate('{gate}'" in body, gate
-        assert html.count(f'data-gate="{gate}"') == 2, "пункт должен быть и в меню, и в «Ещё»"
+    # справка (#64) скрывает по тем же гейтам свои разделы — их считаем отдельно
+    menus = html.replace(_help_html(), "")
+    for gate in ("admin", "coach"):
+        assert menus.count(f'data-gate="{gate}"') == 2, "пункт должен быть и в меню, и в «Ещё»"
 
 
 def test_plan_week_list_sits_right_before_the_table():
@@ -1722,3 +1725,133 @@ def test_week_chart_is_hidden_for_runs_without_a_plan():
     assert "const showWeeks = runScope !== 'none';" in charts
     # карточку показываем до new Chart: в скрытой у графика нулевой размер
     assert charts.index("week-chart-card") < charts.index("new Chart(document.getElementById('weekChart')")
+
+
+# ── Справка (#64) ─────────────────────────────────────────────────────────────
+
+def _help_html():
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index('<div id="tab-help" class="tab">')
+    return html[start:html.index('<div id="tab-more" class="tab">', start)]
+
+
+def test_help_tab_is_wired():
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    assert html.count('id="tab-help"') == 1
+    assert "help: 'more'," in _js_section(js, "const TAB_GROUP = {", "};")
+    # «❓ Справка» — последняя кнопка меню, после пунктов по ролям
+    start = html.index('<nav class="nav">')
+    nav = html[start:html.index("</nav>", start)]
+    buttons = re.findall(r'<button class="nav-btn[^"]*"[^>]*>', nav)
+    assert 'data-tab="help"' in buttons[-1]
+    # на телефоне — пункт в «Ещё»
+    more = html[html.index('<div id="tab-more" class="tab">'):]
+    assert "onclick=\"showTab('help')\"" in more[:more.index("signOut()")]
+
+
+def test_help_toc_links_point_at_sections():
+    help_html = _help_html()
+    toc = help_html[help_html.index('<ul class="help-toc">'):help_html.index("</ul>")]
+    links = re.findall(r'href="#help-([\w-]+)" onclick="showHelp\(\'([\w-]+)\'\); return false"', toc)
+    assert len(links) == 11
+    for href, anchor in links:
+        assert href == anchor
+        assert f'<section class="card help-section" id="help-{anchor}"' in help_html, anchor
+
+
+def test_help_ids_are_unique():
+    html = INDEX.read_text(encoding="utf-8")
+    ids = re.findall(r'id="(help-[\w-]+)"', html)
+    assert len(ids) == len(set(ids)), sorted(i for i in ids if ids.count(i) > 1)
+
+
+def test_help_role_parts_are_gated():
+    help_html = _help_html()
+    assert re.search(r'<li data-gate="admin" style="display:none"><a href="#help-admin"', help_html)
+    assert re.search(r'id="help-admin" data-gate="admin" style="display:none"', help_html)
+    assert re.search(r'id="help-coach-side" [^>]*data-gate="coach-self" style="display:none"', help_html)
+    assert "gate('coach-self', currentIsCoach);" in _fn(APP_JS.read_text(encoding="utf-8"), "applyRole")
+
+
+def test_help_back_is_reset_by_the_menu():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "if(name==='help')setHelpReturn(null);" in _fn(js, "showTab")
+    show = _fn(js, "showHelp")
+    # сначала вкладка (она сбросит «Назад»), потом запоминаем, откуда пришли
+    assert show.index("showTab('help')") < show.index("setHelpReturn(from || null)")
+
+
+# Термины, на которые ведут «ⓘ» и ссылки внутри справки (design.md, решение 2)
+_HELP_TERMS = ("rtss", "trimp", "cost", "threshold", "zones", "ai-memory", "plan-stale", "coach-side")
+
+
+def test_help_text_is_for_users_not_developers():
+    text = re.sub(r"<[^>]+>", " ", _help_html())          # только видимый текст
+    assert "TODO" not in text
+    assert not re.search(r"#\d", text), "номера тикетов — для разработчика"
+    assert not re.search(r"/[a-z]", text), "маршруты API и пути — для разработчика"
+
+
+def test_help_term_anchors_exist():
+    html = _help_html()
+    for term in _HELP_TERMS:
+        assert f'id="help-{term}"' in html, term
+
+
+def test_help_links_point_at_existing_anchors():
+    """«ⓘ» и ссылки оглавления ведут на id="help-<якорь>"; опечатка в якоре
+    молча откроет справку сверху."""
+    html = INDEX.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    anchors = set(re.findall(r"showHelp\('([\w-]+)'", html + js))
+    # «ⓘ», которые рисует app.js: якоря — в LOAD_AXES и в вызовах infoLinkHtml
+    anchors |= set(re.findall(r"help: '([\w-]+)', term:", js))
+    anchors |= set(re.findall(r"infoLinkHtml\('([\w-]+)'", js))
+    assert {"rtss", "trimp", "cost", "threshold", "zones", "ai-memory"} <= anchors
+    for anchor in anchors:
+        assert f'id="help-{anchor}"' in html, anchor
+
+
+def test_info_buttons_are_named_buttons():
+    html = INDEX.read_text(encoding="utf-8")
+    buttons = re.findall(r'<button[^>]*class="info-link"[^>]*>', html)
+    assert len(buttons) == 3
+    for b in buttons:
+        assert 'type="button"' in b and 'aria-label="Справка: ' in b and ", event)" in b, b
+    link = _fn(APP_JS.read_text(encoding="utf-8"), "infoLinkHtml")
+    assert 'type="button" class="info-link" aria-label="Справка: ${term}"' in link
+    assert "showHelp('${anchor}', event)" in link
+    assert "if (event) event.stopPropagation();" in _fn(APP_JS.read_text(encoding="utf-8"), "showHelp")
+
+
+def test_stale_plan_messages_point_at_help():
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "const PLAN_STALE_HELP = ' Подробнее — в «❓ Справке», раздел «Планы».';" in js
+    assert "PLAN_STALE_HELP" not in _js_section(js, "const PLAN_STALE_TEXT", ";")
+    # каждое сообщение об отказе по plan_stale заканчивается подсказкой
+    for call in re.findall(r"alert\(([^;]*?)\);", js, re.S):
+        if "STALE" in call or "Внесите её заново" in call:
+            assert "PLAN_STALE_HELP" in call, call
+    assert "alert(e.message + PLAN_STALE_HELP)" in js        # правка дня, неделю убрали
+    for note in re.findall(r"Сохраните ещё раз, чтобы заменить\.`[^;]*", js):
+        assert "+ PLAN_STALE_HELP" in note, note
+
+
+def test_help_float_buttons_are_wired():
+    """Закреплённые «‹ Назад» и «↑ Оглавление» (#64, замечание с dev-стенда):
+    внутри вкладки справки — у неактивной вкладки скрыты вместе с ней."""
+    help_html = _help_html()
+    block = help_html[help_html.index('<div class="help-float" id="help-float">'):]
+    assert 'id="help-float-back" onclick="helpBack()" style="display:none"' in block
+    assert 'onclick="helpToTop()">↑ Оглавление</button>' in block
+    js = APP_JS.read_text(encoding="utf-8")
+    ret = _fn(js, "setHelpReturn")
+    assert "['help-back', 'help-float-back']" in ret and "updateHelpFloat();" in ret
+    upd = _fn(js, "updateHelpFloat")
+    assert "head.getBoundingClientRect().bottom < 0" in upd
+    assert "window.addEventListener('scroll', updateHelpFloat, { passive: true });" in js
+    assert "updateHelpFloat();" in _fn(js, "showHelp")
+    assert "updateHelpFloat();" in _fn(js, "helpToTop")
+    css = STYLE.read_text(encoding="utf-8")
+    assert ".help-float.shown { display: flex; }" in css

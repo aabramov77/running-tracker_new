@@ -968,3 +968,64 @@ table.plan tr.wx-row:hover td { background: var(--bg-card); }
 }
 .city-option span { font-size: 12px; color: var(--text-muted); }
 .location-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+
+/* ── Справка (#64) ── */
+.help-back { margin-bottom: 10px; }
+.help-toc {
+  list-style: none;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px;
+}
+.help-toc a {
+  display: block; padding: 8px 10px;
+  border: 0.5px solid var(--border); border-radius: 8px;
+  background: var(--bg-metric); color: var(--text); text-decoration: none;
+}
+.help-toc a:hover { border-color: var(--c-accent); color: var(--c-accent); }
+.help-section { line-height: 1.6; scroll-margin-top: 12px; }
+.help-section h2 { font-size: 16px; font-weight: 500; margin-bottom: 8px; }
+.help-section h3 { font-size: 14px; font-weight: 500; margin: 14px 0 4px; scroll-margin-top: 12px; }
+.help-section p { margin-bottom: 8px; }
+.help-section ul, .help-section ol { margin: 0 0 8px 20px; display: grid; gap: 4px; }
+.help-section a { color: var(--c-accent); }
+.help-role {
+  margin-top: 12px; padding: 8px 12px;
+  border-left: 3px solid var(--c-accent); border-radius: 0 8px 8px 0;
+  background: var(--bg-metric);
+}
+.help-role h3 { margin-top: 0; }
+.help-faq dt { font-weight: 500; margin-top: 10px; }
+.help-faq dt:first-child { margin-top: 0; }
+.help-faq dd { margin: 2px 0 0; }
+/* Кнопка «ⓘ» у термина: 20×20, область нажатия шире за счёт ::after */
+.info-link {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; margin-left: 4px;
+  border: none; border-radius: 50%; background: none;
+  color: var(--text-muted); font: inherit; font-size: 14px; line-height: 1;
+  text-transform: none; letter-spacing: normal; vertical-align: middle; cursor: pointer;
+}
+.info-link::after { content: ''; position: absolute; inset: -8px; }
+.info-link:hover { color: var(--c-accent); }
+.help-toc a:focus-visible, .info-link:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 2px; }
+/* Закреплённые «‹ Назад» и «↑ Оглавление»: видны, пока оглавление за верхом
+   экрана. Внутри #tab-help — у неактивной вкладки скрыты вместе с ней. */
+#tab-help { padding-bottom: 56px; }        /* конец последнего раздела не под кнопками */
+.help-float {
+  display: none; gap: 6px;
+  position: fixed; right: 16px; bottom: 16px; z-index: 40;
+}
+.help-float.shown { display: flex; }
+.help-float-btn {
+  min-height: 40px; padding: 8px 14px;
+  border: 0.5px solid var(--border); border-radius: 999px;
+  background: var(--bg-card); color: var(--text); font: inherit; font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15); cursor: pointer;
+}
+.help-float-btn:hover { color: var(--c-accent); border-color: var(--c-accent); }
+.help-float-btn:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 2px; }
+@media (max-width: 600px) {
+  .help-toc { grid-template-columns: 1fr; }
+  /* над нижней панелью, на высоте DEV-бейджа (он слева) */
+  .help-float { right: 12px; bottom: calc(68px + env(safe-area-inset-bottom)); }
+}
