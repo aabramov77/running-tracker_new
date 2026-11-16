@@ -1836,3 +1836,22 @@ def test_stale_plan_messages_point_at_help():
     assert "alert(e.message + PLAN_STALE_HELP)" in js        # правка дня, неделю убрали
     for note in re.findall(r"Сохраните ещё раз, чтобы заменить\.`[^;]*", js):
         assert "+ PLAN_STALE_HELP" in note, note
+
+
+def test_help_float_buttons_are_wired():
+    """Закреплённые «‹ Назад» и «↑ Оглавление» (#64, замечание с dev-стенда):
+    внутри вкладки справки — у неактивной вкладки скрыты вместе с ней."""
+    help_html = _help_html()
+    block = help_html[help_html.index('<div class="help-float" id="help-float">'):]
+    assert 'id="help-float-back" onclick="helpBack()" style="display:none"' in block
+    assert 'onclick="helpToTop()">↑ Оглавление</button>' in block
+    js = APP_JS.read_text(encoding="utf-8")
+    ret = _fn(js, "setHelpReturn")
+    assert "['help-back', 'help-float-back']" in ret and "updateHelpFloat();" in ret
+    upd = _fn(js, "updateHelpFloat")
+    assert "head.getBoundingClientRect().bottom < 0" in upd
+    assert "window.addEventListener('scroll', updateHelpFloat, { passive: true });" in js
+    assert "updateHelpFloat();" in _fn(js, "showHelp")
+    assert "updateHelpFloat();" in _fn(js, "helpToTop")
+    css = STYLE.read_text(encoding="utf-8")
+    assert ".help-float.shown { display: flex; }" in css

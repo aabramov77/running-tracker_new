@@ -13,7 +13,7 @@
 <meta property="og:title" content="Running Tracker — план, журнал и ИИ-тренер для бегуна">
 <meta property="og:description" content="План к забегу, журнал пробежек из Garmin, нагрузка по темпу и пульсу и ИИ-тренер, который видит ваши данные.">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&family=Oswald:wght@500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=39">
+<link rel="stylesheet" href="style.css?v=40">
 <link rel="stylesheet" href="landing.css?v=1">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
@@ -1389,6 +1389,12 @@
         <li>Лимит сообщений ИИ-тренеру у администратора — 300 в сутки.</li>
       </ul>
     </section>
+
+    <!-- Закреплённые кнопки: видны, пока оглавление за верхом экрана (updateHelpFloat) -->
+    <div class="help-float" id="help-float">
+      <button type="button" class="help-float-btn" id="help-float-back" onclick="helpBack()" style="display:none">‹ Назад</button>
+      <button type="button" class="help-float-btn" onclick="helpToTop()">↑ Оглавление</button>
+    </div>
   </div>
 
   <!-- ЕЩЁ (#48): разделы, которым не хватило места в нижней панели -->
@@ -1534,6 +1540,6 @@
   </button>
 </nav>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="app.js?v=60"></script>
+<script src="app.js?v=61"></script>
 </body>
 </html>

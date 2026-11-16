@@ -4809,7 +4809,27 @@ let helpReturnTab = null;            // вкладка, откуда пришл�
 
 function setHelpReturn(tab) {
   helpReturnTab = tab;
-  document.getElementById('help-back').style.display = tab ? '' : 'none';
+  // «‹ Назад» две: вверху справки и в закреплённых кнопках внизу
+  ['help-back', 'help-float-back'].forEach(id => {
+    document.getElementById(id).style.display = tab ? '' : 'none';
+  });
+  updateHelpFloat();
+}
+
+// Закреплённые «‹ Назад» и «↑ Оглавление» — только пока карточка оглавления
+// за верхом экрана: иначе до них рукой подать. Неактивная вкладка прячет
+// блок сама (он внутри #tab-help).
+function updateHelpFloat() {
+  const tab = document.getElementById('tab-help');
+  if (!tab.classList.contains('active')) return;
+  const head = tab.querySelector('.help-head');
+  document.getElementById('help-float').classList.toggle('shown', head.getBoundingClientRect().bottom < 0);
+}
+window.addEventListener('scroll', updateHelpFloat, { passive: true });
+
+function helpToTop() {
+  window.scrollTo(0, 0);     // на широком экране видно и меню вкладок, на телефоне — «‹ Ещё»
+  updateHelpFloat();
 }
 
 // Кнопка «ⓘ» и оглавление. С другой вкладки — запоминаем её для «‹ Назад»;
@@ -4826,6 +4846,7 @@ function showHelp(anchor, event) {
   // Скрытое по роли или неизвестное — к началу справки
   if (target && target.offsetParent !== null) target.scrollIntoView({ block: 'start' });
   else window.scrollTo(0, 0);
+  updateHelpFloat();
 }
 
 function helpBack() {
